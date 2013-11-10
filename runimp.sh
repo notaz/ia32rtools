@@ -2,7 +2,8 @@
 
 grep 'extrn ' StarCraft.asm | awk '{print $2}' | awk -F: '{print $1}' > implist
 
-echo -n "" > tramp.s
+echo ".data" > tramp.s
+echo ".align 4" >> tramp.s
 
 cat implist | while read i; do
   rm -f tmpsym
@@ -15,7 +16,7 @@ cat implist | while read i; do
     ;;
   esac
 
-  grep "\<_$si\>" /usr/i586-mingw32msvc/lib/lib* | awk '{print $3}' | \
+  grep "\<_$si\>" /usr/i586-mingw32msvc/lib/lib* *.lib | awk '{print $3}' | \
     while read f; do
       sym=`i586-mingw32msvc-nm $f | grep "\<_$si\>" | grep ' T ' | awk '{print $3}'`
       if test -n "$sym"; then
@@ -31,6 +32,6 @@ cat implist | while read i; do
 
   echo ".globl $i" >> tramp.s
   echo "$i:" >> tramp.s
-  echo "  jmp $sym" >> tramp.s
+  echo "  .long $sym" >> tramp.s
   echo >> tramp.s
 done
