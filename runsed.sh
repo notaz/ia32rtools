@@ -18,14 +18,20 @@ s/\<fldcw\>\t\[esp+4+var_4\]/fldcw\tword ptr \[esp\]/;\
 s/\<large \(.*fs:\)/\1/;\
 s/lea\t\(e.[px]\), \[\1+0\]/align 10h/;\
 s/\[\(e..\)+\(e.p\)\]/\[\2+\1\]/;\
-s/\(\<word_.*\), 0FFFFh/\1, word ptr 0FFFFh/;\
+s/\<lea\t\(e..\), \[\(e.p\)+\(e.x\)+/lea\t\1, \[\3+\2+/;\
+s/\[\(e.p\)+\(e.i\)+/\[\2+\1+/;\
+s/\<pushf\>/pushfd/;\
+s/\<popf\>/popfd/;\
 s/\(\<j[mn]\?[abceglopszp]e\?\>\)\tloc_/\1\tnear ptr loc_/;\
+s/\<jmp\tsub_/jmp\tnear ptr sub_/;\
 ' StarCraft.asm" >> $f
 . $f
 
 # manual fixup:
-# = 'end start' -> 'end'
+# - 'end start' -> 'end'
 # - 'lea     ecx, [ecx+0]' -> align
 # - add 'near ptr' to some jumps
 # - 'cmp     [ebp+edx+0], cl' -> 'cmp     [edx+ebp+0], cl'
-# - 0FFFFh constant - masm treats a byte, sometimes prefix with 'word ptr'
+# - 0FFxxh constants - masm treats a byte, ONLY sometimes prefix with 'word ptr'
+# - jmp near:
+#   - jmp _strchr
