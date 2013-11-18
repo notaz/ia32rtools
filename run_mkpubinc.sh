@@ -1,8 +1,9 @@
 #!/bin/sh
+set -e
 
-echo -n > public.inc
+echo -n > $2
 
-cat StarCraft.asm | fromdos | sed -e \
+cat $1 | fromdos | sed -e \
 '1,/^_rdata.*segment/d;/^_data_last/q;/^[[:blank:];]/d;/^;/d;/^_r\?data\>/d;' | awk '{print $1}' | \
 while read a; do
   test -z "$a" && continue
@@ -14,5 +15,5 @@ while read a; do
     ;;
   esac
 
-  echo "PUBLIC $a" >> public.inc
+  echo "PUBLIC $a" >> $2
 done

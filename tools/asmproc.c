@@ -38,7 +38,8 @@ static char *next_word(char *w, size_t wsize, char *s)
 
 struct sl_item {
 	char *name;
-	int is_replace;
+	unsigned int is_replace:1;
+	unsigned int found:1;
 };
 
 static int cmp_sym(const void *p1_, const void *p2_)
@@ -46,6 +47,12 @@ static int cmp_sym(const void *p1_, const void *p2_)
 	const struct sl_item *p1 = p1_, *p2 = p2_;
 	const char *s1 = p1->name, *s2 = p2->name;
 	int i;
+
+	// replace is with syms from C with '_' prepended
+	if (p1->is_replace)
+		s1++;
+	if (p2->is_replace)
+		s2++;
 
 	for (i = 0; ; i++) {
 		if (s1[i] == s2[i])
@@ -94,12 +101,14 @@ void read_list(struct sl_item **sl_in, int *cnt, int *alloc, FILE *f, int is_rep
 
 		sl[c].name = strdup(word);
 		sl[c].is_replace = is_repl;
+		sl[c].found = 0;
 		c++;
 
 		if (c >= *alloc) {
 			*alloc *= 2;
 			sl = realloc(sl, *alloc * sizeof(sl[0]));
 			my_assert_not(sl, NULL);
+			memset(sl + c, 0, (*alloc - c) * sizeof(sl[0]));
 		}
 	}
 
@@ -107,9 +116,24 @@ void read_list(struct sl_item **sl_in, int *cnt, int *alloc, FILE *f, int is_rep
 	*cnt = c;
 }
 
+const char *sym_use(const struct sl_item *sym)
+{
+	static char buf[256+3];
+	int ret;
+
+	ret = snprintf(buf, sizeof(buf), "%s%s",
+		sym->is_replace ? "" : "rm_", sym->name);
+	if (ret >= sizeof(buf)) {
+		printf("truncation detected: '%s'\n", buf);
+		exit(1);
+	}
+
+	return buf;
+}
+
 int main(int argc, char *argv[])
 {
-	struct sl_item *symlist, *sym, ssym;
+	struct sl_item *symlist, *sym, ssym = { NULL, };
 	FILE *fout, *fin, *f;
 	int symlist_alloc;
 	int symlist_cnt;
@@ -119,6 +143,7 @@ int main(int argc, char *argv[])
 	char word3[256];
 	char word4[256];
 	char *p;
+	int i;
 
 	if (argc != 5) {
 		// rmlist - prefix func with 'rm_', callsites with '_'
@@ -130,7 +155,7 @@ int main(int argc, char *argv[])
 
 	symlist_alloc = 16;
 	symlist_cnt = 0;
-	symlist = malloc(symlist_alloc * sizeof(symlist[0]));
+	symlist = calloc(symlist_alloc, sizeof(symlist[0]));
 	my_assert_not(symlist, NULL);
 
 	f = fopen(argv[3], "r");
@@ -145,10 +170,11 @@ int main(int argc, char *argv[])
 
 	qsort(symlist, symlist_cnt, sizeof(symlist[0]), cmp_sym_sort);
 
-printf("symlist:\n");
-int i;
-for (i = 0; i < symlist_cnt; i++)
- printf("%d '%s'\n", symlist[i].is_replace, symlist[i].name);
+#if 0
+	printf("symlist:\n");
+	for (i = 0; i < symlist_cnt; i++)
+		printf("%d '%s'\n", symlist[i].is_replace, symlist[i].name);
+#endif
 
 	fin = fopen(argv[2], "r");
 	my_assert_not(fin, NULL);
@@ -173,6 +199,7 @@ for (i = 0; i < symlist_cnt; i++)
 			sym = bsearch(&ssym, symlist, symlist_cnt,
 				sizeof(symlist[0]), cmp_sym);
 			if (sym != NULL) {
+				sym->found = 1;
 				fprintf(fout, "rm_%s\t%s%s", word, word2, p);
 				continue;
 			}
@@ -183,8 +210,8 @@ for (i = 0; i < symlist_cnt; i++)
 			sym = bsearch(&ssym, symlist, symlist_cnt,
 				sizeof(symlist[0]), cmp_sym);
 			if (sym != NULL) {
-				fprintf(fout, "\t\t%s\t%s%s%s", word,
-					sym->is_replace ? "_" : "rm_", word2, p);
+				fprintf(fout, "\t\t%s\t%s%s", word,
+					sym_use(sym), p);
 				continue;
 			}
 		}
@@ -200,7 +227,8 @@ for (i = 0; i < symlist_cnt; i++)
 			sym = bsearch(&ssym, symlist, symlist_cnt,
 				sizeof(symlist[0]), cmp_sym);
 			if (sym != NULL) {
-				fprintf(fout, "\t\tdd offset %s%s", word3, p);
+				fprintf(fout, "\t\tdd offset %s%s",
+					sym_use(sym), p);
 				continue;
 			}
 		}
@@ -216,14 +244,19 @@ for (i = 0; i < symlist_cnt; i++)
 			sym = bsearch(&ssym, symlist, symlist_cnt,
 				sizeof(symlist[0]), cmp_sym);
 			if (sym != NULL) {
-				fprintf(fout, "%s\tdd offset %s%s%s", word,
-					sym->is_replace ? "_" : "rm_", word4, p);
+				fprintf(fout, "%s\tdd offset %s%s", word,
+					sym_use(sym), p);
 				continue;
 			}
 		}
 
 pass:
 		fwrite(line, 1, strlen(line), fout);
+	}
+
+	for (i = 0; i < symlist_cnt; i++) {
+		if (!symlist[i].found)
+			printf("warning: sym '%s' not found\n", symlist[i].name);
 	}
 
 	fclose(fin);
