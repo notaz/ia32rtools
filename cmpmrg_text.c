@@ -47,6 +47,29 @@ typedef struct {
   unsigned short r_type;    /* type of relocation         */
 } __attribute__((packed)) RELOC;
 
+typedef struct {
+  union {
+    char e_name[E_SYMNMLEN];
+    struct {
+      unsigned int e_zeroes;
+      unsigned int e_offset;
+    } e;
+  } e;
+  unsigned int e_value;
+  short e_scnum;
+  unsigned short e_type;
+  unsigned char e_sclass;
+  unsigned char e_numaux;
+} __attribute__((packed)) SYMENT;
+
+#define C_EXT 2
+
+struct my_symtab {
+  unsigned int addr;
+  unsigned int fpos; // for patching
+  char *name;
+};
+
 static void my_assert_(int line, const char *name, long v, long expect, int is_eq)
 {
 	int ok;
@@ -67,19 +90,40 @@ static void my_assert_(int line, const char *name, long v, long expect, int is_e
 #define my_assert_not(v, exp) \
 	my_assert_(__LINE__, #v, (long)(v), (long)(exp), 0)
 
+static int symt_cmp(const void *p1_, const void *p2_)
+{
+	const struct my_symtab *p1 = p1_, *p2 = p2_;
+	return p1->addr - p2->addr;
+}
+
 void parse_headers(FILE *f, unsigned int *base_out,
 	long *sect_ofs, uint8_t **sect_data, long *sect_sz,
-	RELOC **relocs, long *reloc_cnt)
+	RELOC **relocs, long *reloc_cnt,
+	struct my_symtab **symtab_out, long *sym_cnt)
 {
+	struct my_symtab *symt_o = NULL;
+	char *stringtab = NULL;
 	unsigned int base = 0;
+	int text_scnum = 0;
+	long filesize;
+	char symname[9];
 	long opthdr_pos;
 	long reloc_size;
 	FILHDR hdr;
 	AOUTHDR opthdr;
 	SCNHDR scnhdr;
-	int s, val;
+	SYMENT syment;
+	int i, s, val;
 	int ret;
 	
+	ret = fseek(f, 0, SEEK_END);
+	my_assert(ret, 0);
+
+	filesize = ftell(f);
+
+	ret = fseek(f, 0, SEEK_SET);
+	my_assert(ret, 0);
+
 	ret = fread(&hdr, 1, sizeof(hdr), f);
 	my_assert(ret, sizeof(hdr));
 
@@ -125,18 +169,22 @@ void parse_headers(FILE *f, unsigned int *base_out,
 		my_assert(ret, 0);
 	}
 
+	// note: assuming first non-empty one is .text ..
 	for (s = 0; s < hdr.f_nscns; s++) {
 		ret = fread(&scnhdr, 1, sizeof(scnhdr), f);
 		my_assert(ret, sizeof(scnhdr));
 
-		if (scnhdr.s_size != 0)
+		if (scnhdr.s_size != 0) {
+			text_scnum = s + 1;
 			break;
+		}
 	}
 
+	printf("f_nsyms:  %x\n", hdr.f_nsyms);
 	printf("s_name:   '%s'\n", scnhdr.s_name);
 	printf("s_vaddr:  %x\n", scnhdr.s_vaddr);
 	printf("s_size:   %x\n", scnhdr.s_size);
-	printf("s_scnptr: %x\n", scnhdr.s_scnptr);
+	//printf("s_scnptr: %x\n", scnhdr.s_scnptr);
 	printf("s_nreloc: %x\n", scnhdr.s_nreloc);
 	printf("--\n");
 
@@ -151,6 +199,7 @@ void parse_headers(FILE *f, unsigned int *base_out,
 	*sect_ofs = scnhdr.s_scnptr;
 	*sect_sz = scnhdr.s_size;
 
+	// relocs
 	ret = fseek(f, scnhdr.s_relptr, SEEK_SET);
 	my_assert(ret, 0);
 
@@ -162,7 +211,66 @@ void parse_headers(FILE *f, unsigned int *base_out,
 
 	*reloc_cnt = scnhdr.s_nreloc;
 
-	if (base != 0)
+	// symtab
+	if (hdr.f_nsyms != 0) {
+		symname[8] = 0;
+
+		symt_o = malloc(hdr.f_nsyms * sizeof(symt_o[0]) + 1);
+		my_assert_not(symt_o, NULL);
+
+		ret = fseek(f, hdr.f_symptr
+				+ hdr.f_nsyms * sizeof(syment), SEEK_SET);
+		my_assert(ret, 0);
+		ret = fread(&i, 1, sizeof(i), f);
+		my_assert(ret, sizeof(i));
+		my_assert((unsigned int)i < filesize, 1);
+
+		stringtab = malloc(i);
+		my_assert_not(stringtab, NULL);
+		memset(stringtab, 0, 4);
+		ret = fread(stringtab + 4, 1, i - 4, f);
+		my_assert(ret, i - 4);
+
+		ret = fseek(f, hdr.f_symptr, SEEK_SET);
+		my_assert(ret, 0);
+	}
+
+	for (i = s = 0; i < hdr.f_nsyms; i++) {
+		long pos = ftell(f);
+
+		ret = fread(&syment, 1, sizeof(syment), f);
+		my_assert(ret, sizeof(syment));
+
+		strncpy(symname, syment.e.e_name, 8);
+		//printf("%3d %2d %08x '%s'\n", syment.e_sclass,
+		//	syment.e_scnum, syment.e_value, symname);
+
+		if (syment.e_scnum != text_scnum || syment.e_sclass != C_EXT)
+			continue;
+
+		symt_o[s].addr = syment.e_value;
+		symt_o[s].fpos = pos;
+		if (syment.e.e.e_zeroes == 0)
+			symt_o[s].name = stringtab + syment.e.e.e_offset;
+		else
+			symt_o[s].name = strdup(symname);
+		s++;
+
+		if (syment.e_numaux) {
+			ret = fseek(f, syment.e_numaux * sizeof(syment),
+				    SEEK_CUR);
+			my_assert(ret, 0);
+			i += syment.e_numaux;
+		}
+	}
+
+	if (symt_o != NULL)
+		qsort(symt_o, s, sizeof(symt_o[0]), symt_cmp);
+
+	*sym_cnt = s;
+	*symtab_out = symt_o;
+
+	if (base != 0 && base_out != NULL)
 		*base_out = base + scnhdr.s_vaddr;
 }
 
@@ -352,16 +460,18 @@ int main(int argc, char *argv[])
 	long text_ofs_obj, text_ofs_exe;
 	long sztext_obj, sztext_exe, sztext_cmn;
 	RELOC *relocs_obj, *relocs_exe;
-	long reloc_cnt_obj, reloc_cnt_exe, reloc_cnt_cmn;
-	unsigned int base = 0;
+	long reloc_cnt_obj, reloc_cnt_exe;
+	struct my_symtab *syms_obj, *syms_exe;
+	long sym_cnt_obj, sym_cnt_exe;
 	uint8_t *d_obj, *d_exe;
+	unsigned int base = 0;
 	int retval = 1;
 	int left;
 	int ret;
 	int i;
 
 	if (argc != 3) {
-		printf("usage:\n%s <obj> <exe>\n", argv[0]);
+		printf("usage:\n%s <a_obj> <exe>\n", argv[0]);
 		return 1;
 	}
 
@@ -374,22 +484,19 @@ int main(int argc, char *argv[])
 
 	f_exe = fopen(argv[2], "r");
 	if (f_exe == NULL) {
-		fprintf(stderr, "%s", argv[1]);
+		fprintf(stderr, "%s", argv[2]);
 		perror("");
 		return 1;
 	}
 
-	parse_headers(f_obj, &base, &text_ofs_obj, &d_obj, &sztext_obj,
-		&relocs_obj, &reloc_cnt_obj);
+	parse_headers(f_obj, NULL, &text_ofs_obj, &d_obj, &sztext_obj,
+		&relocs_obj, &reloc_cnt_obj, &syms_obj, &sym_cnt_obj);
 	parse_headers(f_exe, &base, &text_ofs_exe, &d_exe, &sztext_exe,
-		&relocs_exe, &reloc_cnt_exe);
+		&relocs_exe, &reloc_cnt_exe, &syms_exe, &sym_cnt_exe);
 
 	sztext_cmn = sztext_obj;
 	if (sztext_cmn > sztext_exe)
 		sztext_cmn = sztext_exe;
-	reloc_cnt_cmn = reloc_cnt_obj;
-	if (reloc_cnt_cmn > reloc_cnt_exe)
-		reloc_cnt_cmn = reloc_cnt_exe;
 
 	if (sztext_cmn == 0) {
 		printf("bad .text size(s): %ld, %ld\n",
@@ -397,7 +504,7 @@ int main(int argc, char *argv[])
 		return 1;
 	}
 
-	for (i = 0; i < reloc_cnt_obj; i++) // reloc_cnt_cmn
+	for (i = 0; i < reloc_cnt_obj; i++)
 	{
 		unsigned int a = relocs_obj[i].r_vaddr;
 		//printf("%04x %08x\n", relocs_obj[i].r_type, a);
