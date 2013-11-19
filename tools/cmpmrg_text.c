@@ -140,12 +140,12 @@ void parse_headers(FILE *f, unsigned int *base_out,
 		my_assert(ret, sizeof(opthdr));
 		my_assert(opthdr.magic, COFF_ZMAGIC);
 
-		printf("text_start: %x\n", opthdr.text_start);
+		//printf("text_start: %x\n", opthdr.text_start);
 
 		if (hdr.f_opthdr > sizeof(opthdr)) {
 			ret = fread(&base, 1, sizeof(base), f);
 			my_assert(ret, sizeof(base));
-			printf("base: %x\n", base);
+			//printf("base: %x\n", base);
 		}
 		ret = fseek(f, opthdr_pos + hdr.f_opthdr, SEEK_SET);
 		my_assert(ret, 0);
@@ -162,6 +162,7 @@ void parse_headers(FILE *f, unsigned int *base_out,
 		}
 	}
 
+#if 0
 	printf("f_nsyms:  %x\n", hdr.f_nsyms);
 	printf("s_name:   '%s'\n", scnhdr.s_name);
 	printf("s_vaddr:  %x\n", scnhdr.s_vaddr);
@@ -169,6 +170,7 @@ void parse_headers(FILE *f, unsigned int *base_out,
 	//printf("s_scnptr: %x\n", scnhdr.s_scnptr);
 	printf("s_nreloc: %x\n", scnhdr.s_nreloc);
 	printf("--\n");
+#endif
 
 	ret = fseek(f, scnhdr.s_scnptr, SEEK_SET);
 	my_assert(ret, 0);
@@ -251,6 +253,10 @@ void parse_headers(FILE *f, unsigned int *base_out,
 
 	*sym_cnt = s;
 	*symtab_out = symt_o;
+
+	// seek to .text start
+	ret = fseek(f, scnhdr.s_scnptr, SEEK_SET);
+	my_assert(ret, 0);
 
 	if (base != 0 && base_out != NULL)
 		*base_out = base + scnhdr.s_vaddr;
@@ -446,7 +452,7 @@ int main(int argc, char *argv[])
 	struct my_symtab *syms_obj, *syms_exe;
 	long sym_cnt_obj, sym_cnt_exe;
 	uint8_t *d_obj, *d_exe;
-	unsigned int base = 0;
+	unsigned int base = 0, addr, end;
 	int retval = 1;
 	int left;
 	int ret;
@@ -492,13 +498,15 @@ int main(int argc, char *argv[])
 		//printf("%04x %08x\n", relocs_obj[i].r_type, a);
 
 		switch (relocs_obj[i].r_type) {
-		case 0x06:
-			memset(d_obj + a, 0, 4);
-			memset(d_exe + a, 0, 4);
+		case 0x06: // RELOC_ADDR32
+		case 0x14: // RELOC_REL32
+			// must preserve stored val,
+			// so trash d_exe so that cmp passes
+			memcpy(d_exe + a, d_obj + a, 4);
 			break;
 		default:
-			printf("unknown reloc %x @%08x\n",
-				relocs_obj[i].r_type, base + a);
+			printf("unknown reloc %x @%08x/%08x\n",
+				relocs_obj[i].r_type, a, base + a);
 			return 1;
 		}
 	}
@@ -525,6 +533,29 @@ int main(int argc, char *argv[])
 		goto out;
 	}
 
+	for (i = 0; i < sym_cnt_obj; i++) {
+		if (strncmp(syms_obj[i].name, "rm_", 3))
+			continue;
+
+		addr = syms_obj[i].addr;
+		end = (i < sym_cnt_obj - 1)
+			? syms_obj[i + 1].addr : sztext_obj;
+		if (addr >= sztext_obj || end > sztext_obj) {
+			printf("addr OOR: %x-%x '%s'\n", addr, end,
+				syms_obj[i].name);
+			goto out;
+		}
+		memset(d_obj + addr, 0xcc, end - addr);
+	}
+
+	// parse_headers has set pos to .text
+	ret = fwrite(d_obj, 1, sztext_obj, f_obj);
+	my_assert(ret, sztext_obj);
+
+	fclose(f_obj);
+	fclose(f_exe);
+
+	retval = 0;
 out:
 	return retval;
 }
