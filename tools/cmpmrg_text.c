@@ -72,6 +72,16 @@ struct my_symtab {
   char *name;
 };
 
+struct my_sect_info {
+	long scnhdr_fofs;
+	long sect_fofs;
+	long reloc_fofs;
+	uint8_t *data;
+	long size;
+	RELOC *relocs;
+	long reloc_cnt;
+};
+
 static int symt_cmp(const void *p1_, const void *p2_)
 {
 	const struct my_symtab *p1 = p1_, *p2 = p2_;
@@ -79,8 +89,7 @@ static int symt_cmp(const void *p1_, const void *p2_)
 }
 
 void parse_headers(FILE *f, unsigned int *base_out,
-	long *sect_ofs, uint8_t **sect_data, long *sect_sz,
-	RELOC **relocs, long *reloc_cnt,
+	struct my_sect_info *sect_i,
 	struct my_symtab **symtab_out, long *sym_cnt)
 {
 	struct my_symtab *symt_o = NULL;
@@ -153,6 +162,8 @@ void parse_headers(FILE *f, unsigned int *base_out,
 
 	// note: assuming first non-empty one is .text ..
 	for (s = 0; s < hdr.f_nscns; s++) {
+		sect_i->scnhdr_fofs = ftell(f);
+
 		ret = fread(&scnhdr, 1, sizeof(scnhdr), f);
 		my_assert(ret, sizeof(scnhdr));
 
@@ -161,6 +172,7 @@ void parse_headers(FILE *f, unsigned int *base_out,
 			break;
 		}
 	}
+	my_assert(s < hdr.f_nscns, 1);
 
 #if 0
 	printf("f_nsyms:  %x\n", hdr.f_nsyms);
@@ -175,25 +187,32 @@ void parse_headers(FILE *f, unsigned int *base_out,
 	ret = fseek(f, scnhdr.s_scnptr, SEEK_SET);
 	my_assert(ret, 0);
 
-	*sect_data = malloc(scnhdr.s_size);
-	my_assert_not(*sect_data, NULL);
-	ret = fread(*sect_data, 1, scnhdr.s_size, f);
+	sect_i->data = malloc(scnhdr.s_size);
+	my_assert_not(sect_i->data, NULL);
+	ret = fread(sect_i->data, 1, scnhdr.s_size, f);
 	my_assert(ret, scnhdr.s_size);
 
-	*sect_ofs = scnhdr.s_scnptr;
-	*sect_sz = scnhdr.s_size;
+	sect_i->sect_fofs = scnhdr.s_scnptr;
+	sect_i->size = scnhdr.s_size;
 
 	// relocs
 	ret = fseek(f, scnhdr.s_relptr, SEEK_SET);
 	my_assert(ret, 0);
 
-	reloc_size = scnhdr.s_nreloc * sizeof((*relocs)[0]);
-	*relocs = malloc(reloc_size + 1);
-	my_assert_not(*relocs, NULL);
-	ret = fread(*relocs, 1, reloc_size, f);
+	reloc_size = scnhdr.s_nreloc * sizeof(sect_i->relocs[0]);
+	sect_i->relocs = malloc(reloc_size + 1);
+	my_assert_not(sect_i->relocs, NULL);
+	ret = fread(sect_i->relocs, 1, reloc_size, f);
 	my_assert(ret, reloc_size);
 
-	*reloc_cnt = scnhdr.s_nreloc;
+	sect_i->reloc_cnt = scnhdr.s_nreloc;
+	sect_i->reloc_fofs = scnhdr.s_relptr;
+
+	if (base != 0 && base_out != NULL)
+		*base_out = base + scnhdr.s_vaddr;
+
+	if (symtab_out == NULL || sym_cnt == NULL)
+		return;
 
 	// symtab
 	if (hdr.f_nsyms != 0) {
@@ -253,13 +272,6 @@ void parse_headers(FILE *f, unsigned int *base_out,
 
 	*sym_cnt = s;
 	*symtab_out = symt_o;
-
-	// seek to .text start
-	ret = fseek(f, scnhdr.s_scnptr, SEEK_SET);
-	my_assert(ret, 0);
-
-	if (base != 0 && base_out != NULL)
-		*base_out = base + scnhdr.s_vaddr;
 }
 
 static int handle_pad(uint8_t *d_obj, uint8_t *d_exe, int maxlen)
@@ -442,17 +454,24 @@ static int check_equiv(uint8_t *d_obj, uint8_t *d_exe, int maxlen)
 	return -1;
 }
 
+static void fill_int3(unsigned char *d, int len)
+{
+	while (len-- > 0) {
+		if (*d == 0xcc)
+			break;
+		*d++ = 0xcc;
+	}
+}
+
 int main(int argc, char *argv[])
 {
+	struct my_sect_info s_text_obj, s_text_exe;
+	struct my_symtab *syms_obj = NULL;
+	long sym_cnt_obj;
 	FILE *f_obj, *f_exe;
-	long text_ofs_obj, text_ofs_exe;
-	long sztext_obj, sztext_exe, sztext_cmn;
-	RELOC *relocs_obj, *relocs_exe;
-	long reloc_cnt_obj, reloc_cnt_exe;
-	struct my_symtab *syms_obj, *syms_exe;
-	long sym_cnt_obj, sym_cnt_exe;
-	uint8_t *d_obj, *d_exe;
 	unsigned int base = 0, addr, end;
+	SCNHDR tmphdr;
+	long sztext_cmn;
 	int retval = 1;
 	int left;
 	int ret;
@@ -477,80 +496,119 @@ int main(int argc, char *argv[])
 		return 1;
 	}
 
-	parse_headers(f_obj, NULL, &text_ofs_obj, &d_obj, &sztext_obj,
-		&relocs_obj, &reloc_cnt_obj, &syms_obj, &sym_cnt_obj);
-	parse_headers(f_exe, &base, &text_ofs_exe, &d_exe, &sztext_exe,
-		&relocs_exe, &reloc_cnt_exe, &syms_exe, &sym_cnt_exe);
+	parse_headers(f_obj, NULL, &s_text_obj, &syms_obj, &sym_cnt_obj);
+	parse_headers(f_exe, &base, &s_text_exe, NULL, NULL);
 
-	sztext_cmn = sztext_obj;
-	if (sztext_cmn > sztext_exe)
-		sztext_cmn = sztext_exe;
+	sztext_cmn = s_text_obj.size;
+	if (sztext_cmn > s_text_exe.size)
+		sztext_cmn = s_text_exe.size;
 
 	if (sztext_cmn == 0) {
 		printf("bad .text size(s): %ld, %ld\n",
-			sztext_obj, sztext_exe);
+			s_text_obj.size, s_text_exe.size);
 		return 1;
 	}
 
-	for (i = 0; i < reloc_cnt_obj; i++)
+	for (i = 0; i < s_text_obj.reloc_cnt; i++)
 	{
-		unsigned int a = relocs_obj[i].r_vaddr;
-		//printf("%04x %08x\n", relocs_obj[i].r_type, a);
+		unsigned int a = s_text_obj.relocs[i].r_vaddr;
+		//printf("%04x %08x\n", s_text_obj.relocs[i].r_type, a);
 
-		switch (relocs_obj[i].r_type) {
+		switch (s_text_obj.relocs[i].r_type) {
 		case 0x06: // RELOC_ADDR32
 		case 0x14: // RELOC_REL32
 			// must preserve stored val,
-			// so trash d_exe so that cmp passes
-			memcpy(d_exe + a, d_obj + a, 4);
+			// so trash exe so that cmp passes
+			memcpy(s_text_exe.data + a, s_text_obj.data + a, 4);
 			break;
 		default:
 			printf("unknown reloc %x @%08x/%08x\n",
-				relocs_obj[i].r_type, a, base + a);
+				s_text_obj.relocs[i].r_type, a, base + a);
 			return 1;
 		}
 	}
 
 	for (i = 0; i < sztext_cmn; i++)
 	{
-		if (d_obj[i] == d_exe[i])
+		if (s_text_obj.data[i] == s_text_exe.data[i])
 			continue;
 
 		left = sztext_cmn - i;
 
-		if (d_exe[i] == 0xcc) { // padding
-			if (handle_pad(d_obj + i, d_exe + i, left))
+		if (s_text_exe.data[i] == 0xcc) { // padding
+			if (handle_pad(s_text_obj.data + i,
+			    s_text_exe.data + i, left))
 				continue;
 		}
 
-		ret = check_equiv(d_obj + i, d_exe + i, left);
+		ret = check_equiv(s_text_obj.data + i, s_text_exe.data + i, left);
 		if (ret >= 0) {
 			i += ret;
 			continue;
 		}
 
-		printf("%x: %02x vs %02x\n", base + i, d_obj[i], d_exe[i]);
+		printf("%x: %02x vs %02x\n", base + i,
+			s_text_obj.data[i], s_text_exe.data[i]);
 		goto out;
 	}
 
+	// fill removed funcs with 'int3'
 	for (i = 0; i < sym_cnt_obj; i++) {
 		if (strncmp(syms_obj[i].name, "rm_", 3))
 			continue;
 
 		addr = syms_obj[i].addr;
 		end = (i < sym_cnt_obj - 1)
-			? syms_obj[i + 1].addr : sztext_obj;
-		if (addr >= sztext_obj || end > sztext_obj) {
+			? syms_obj[i + 1].addr : s_text_obj.size;
+		if (addr >= s_text_obj.size || end > s_text_obj.size) {
 			printf("addr OOR: %x-%x '%s'\n", addr, end,
 				syms_obj[i].name);
 			goto out;
 		}
-		memset(d_obj + addr, 0xcc, end - addr);
+		fill_int3(s_text_obj.data + addr, end - addr);
 	}
 
-	// parse_headers has set pos to .text
-	ret = fwrite(d_obj, 1, sztext_obj, f_obj);
-	my_assert(ret, sztext_obj);
+	// remove relocs
+	for (i = 0; i < s_text_obj.reloc_cnt; i++) {
+		addr = s_text_obj.relocs[i].r_vaddr;
+		if (addr > s_text_obj.size - 4) {
+			printf("reloc addr OOR: %x\n", addr);
+			goto out;
+		}
+		if (*(unsigned int *)(s_text_obj.data + addr) == 0xcccccccc) {
+			memmove(&s_text_obj.relocs[i],
+				&s_text_obj.relocs[i + 1],
+				(s_text_obj.reloc_cnt - i - 1)
+				 * sizeof(s_text_obj.relocs[0]));
+			i--;
+			s_text_obj.reloc_cnt--;
+		}
+	}
+
+	// patch .text
+	ret = fseek(f_obj, s_text_obj.sect_fofs, SEEK_SET);
+	my_assert(ret, 0);
+	ret = fwrite(s_text_obj.data, 1, s_text_obj.size, f_obj);
+	my_assert(ret, s_text_obj.size);
+
+	// patch relocs
+	ret = fseek(f_obj, s_text_obj.reloc_fofs, SEEK_SET);
+	my_assert(ret, 0);
+	ret = fwrite(s_text_obj.relocs, sizeof(s_text_obj.relocs[0]),
+		s_text_obj.reloc_cnt, f_obj);
+	my_assert(ret, s_text_obj.reloc_cnt);
+
+	ret = fseek(f_obj, s_text_obj.scnhdr_fofs, SEEK_SET);
+	my_assert(ret, 0);
+	ret = fread(&tmphdr, 1, sizeof(tmphdr), f_obj);
+	my_assert(ret, sizeof(tmphdr));
+
+	tmphdr.s_nreloc = s_text_obj.reloc_cnt;
+
+	ret = fseek(f_obj, s_text_obj.scnhdr_fofs, SEEK_SET);
+	my_assert(ret, 0);
+	ret = fwrite(&tmphdr, 1, sizeof(tmphdr), f_obj);
+	my_assert(ret, sizeof(tmphdr));
 
 	fclose(f_obj);
 	fclose(f_exe);
