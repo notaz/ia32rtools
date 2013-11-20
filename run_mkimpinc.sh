@@ -14,5 +14,19 @@ echo "; '_' funcs" >> $3
 
 cat $2 | \
 while read a; do
+  case $a in
+  \#*)
+    continue
+    ;;
+  \;*)
+    continue
+    ;;
+  "")
+    continue
+    ;;
+  *)
+    ;;
+  esac
+
   echo "EXTRN $a:PROC" >> $3
 done

@@ -49,15 +49,15 @@ static int cmp_sym(const void *p1_, const void *p2_)
 	int i;
 
 	for (i = 0; ; i++) {
+		if ((s1[i] | s2[i]) == 0)
+			break;
+
 		if (s1[i] == s2[i])
 			continue;
 
-		if (s1[i] == 0) {
-			if (s2[i] == 0 || s2[i] == '@')
-				break;
-		}
-
-		if (s2[i] == 0 || s1[i] == '@')
+		if (s1[i] ==  0  && s2[i] == '@')
+			break;
+		if (s1[i] == '@' && s2[i] ==  0)
 			break;
 
 		return s1[i] - s2[i];
@@ -87,11 +87,10 @@ void read_list(struct sl_item **sl_in, int *cnt, int *alloc,
 	int c = *cnt;
 	char line[256];
 	char word[256];
-	char *r;
 
 	while (fgets(line, sizeof(line), f) != NULL) {
-		r = next_word(word, sizeof(word), line);
-		if (r == word)
+		next_word(word, sizeof(word), line);
+		if (word[0] == 0 || word[0] == ';' || word[0] == '#')
 			continue;
 
 		sl[c].name = strdup(word);
@@ -116,8 +115,7 @@ const char *sym_use(const struct sl_item *sym)
 	static char buf[256+3];
 	int ret;
 
-	ret = snprintf(buf, sizeof(buf), "%s%s",
-		sym->callsites ? "" : "rm_", sym->name);
+	ret = snprintf(buf, sizeof(buf), "rm_%s", sym->name);
 	if (ret >= sizeof(buf)) {
 		printf("truncation detected: '%s'\n", buf);
 		exit(1);
@@ -154,7 +152,7 @@ int main(int argc, char *argv[])
 	my_assert_not(symlist, NULL);
 
 	for (i = 3; i < argc; i++) {
-		if (!strcmp(argv[i], "-c")) {
+		if (strcmp(argv[i], "-c") == 0) {
 			patch_callsites = 1;
 			continue;
 		}
