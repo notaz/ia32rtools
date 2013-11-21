@@ -68,7 +68,8 @@ typedef struct {
 
 struct my_symtab {
   unsigned int addr;
-  unsigned int fpos; // for patching
+  //unsigned int fpos; // for patching
+  unsigned int is_text:1;
   char *name;
 };
 
@@ -90,9 +91,11 @@ static int symt_cmp(const void *p1_, const void *p2_)
 
 void parse_headers(FILE *f, unsigned int *base_out,
 	struct my_sect_info *sect_i,
-	struct my_symtab **symtab_out, long *sym_cnt)
+	struct my_symtab **symtab_out, long *sym_cnt,
+	struct my_symtab **raw_symtab_out, long *raw_sym_cnt)
 {
-	struct my_symtab *symt_o = NULL;
+	struct my_symtab *symt_txt = NULL;
+	struct my_symtab *symt_all = NULL;
 	char *stringtab = NULL;
 	unsigned int base = 0;
 	int text_scnum = 0;
@@ -218,8 +221,10 @@ void parse_headers(FILE *f, unsigned int *base_out,
 	if (hdr.f_nsyms != 0) {
 		symname[8] = 0;
 
-		symt_o = malloc(hdr.f_nsyms * sizeof(symt_o[0]) + 1);
-		my_assert_not(symt_o, NULL);
+		symt_txt = malloc(hdr.f_nsyms * sizeof(symt_txt[0]) + 1);
+		my_assert_not(symt_txt, NULL);
+		symt_all = malloc(hdr.f_nsyms * sizeof(symt_all[0]) + 1);
+		my_assert_not(symt_all, NULL);
 
 		ret = fseek(f, hdr.f_symptr
 				+ hdr.f_nsyms * sizeof(syment), SEEK_SET);
@@ -239,7 +244,7 @@ void parse_headers(FILE *f, unsigned int *base_out,
 	}
 
 	for (i = s = 0; i < hdr.f_nsyms; i++) {
-		long pos = ftell(f);
+		//long pos = ftell(f);
 
 		ret = fread(&syment, 1, sizeof(syment), f);
 		my_assert(ret, sizeof(syment));
@@ -248,16 +253,18 @@ void parse_headers(FILE *f, unsigned int *base_out,
 		//printf("%3d %2d %08x '%s'\n", syment.e_sclass,
 		//	syment.e_scnum, syment.e_value, symname);
 
-		if (syment.e_scnum != text_scnum || syment.e_sclass != C_EXT)
-			continue;
-
-		symt_o[s].addr = syment.e_value;
-		symt_o[s].fpos = pos;
+		symt_all[i].addr = syment.e_value;
+		//symt_all[i].fpos = pos;
 		if (syment.e.e.e_zeroes == 0)
-			symt_o[s].name = stringtab + syment.e.e.e_offset;
+			symt_all[i].name = stringtab + syment.e.e.e_offset;
 		else
-			symt_o[s].name = strdup(symname);
-		s++;
+			symt_all[i].name = strdup(symname);
+
+		symt_all[i].is_text = (syment.e_scnum == text_scnum);
+		if (symt_all[i].is_text && syment.e_sclass == C_EXT) {
+			symt_txt[s] = symt_all[i];
+			s++;
+		}
 
 		if (syment.e_numaux) {
 			ret = fseek(f, syment.e_numaux * sizeof(syment),
@@ -267,11 +274,13 @@ void parse_headers(FILE *f, unsigned int *base_out,
 		}
 	}
 
-	if (symt_o != NULL)
-		qsort(symt_o, s, sizeof(symt_o[0]), symt_cmp);
+	if (symt_txt != NULL)
+		qsort(symt_txt, s, sizeof(symt_txt[0]), symt_cmp);
 
 	*sym_cnt = s;
-	*symtab_out = symt_o;
+	*symtab_out = symt_txt;
+	*raw_sym_cnt = i;
+	*raw_symtab_out = symt_all;
 }
 
 static int handle_pad(uint8_t *d_obj, uint8_t *d_exe, int maxlen)
@@ -457,7 +466,7 @@ static int check_equiv(uint8_t *d_obj, uint8_t *d_exe, int maxlen)
 static void fill_int3(unsigned char *d, int len)
 {
 	while (len-- > 0) {
-		if (*d == 0xcc)
+		if (d[0] == 0xcc && d[1] == 0xcc)
 			break;
 		*d++ = 0xcc;
 	}
@@ -465,11 +474,12 @@ static void fill_int3(unsigned char *d, int len)
 
 int main(int argc, char *argv[])
 {
+	unsigned int base = 0, addr, addr2, end, sym, *t;
 	struct my_sect_info s_text_obj, s_text_exe;
+	struct my_symtab *raw_syms_obj = NULL;
 	struct my_symtab *syms_obj = NULL;
-	long sym_cnt_obj;
+	long sym_cnt_obj, raw_sym_cnt_obj;
 	FILE *f_obj, *f_exe;
-	unsigned int base = 0, addr, end;
 	SCNHDR tmphdr;
 	long sztext_cmn;
 	int retval = 1;
@@ -496,8 +506,9 @@ int main(int argc, char *argv[])
 		return 1;
 	}
 
-	parse_headers(f_obj, NULL, &s_text_obj, &syms_obj, &sym_cnt_obj);
-	parse_headers(f_exe, &base, &s_text_exe, NULL, NULL);
+	parse_headers(f_obj, NULL, &s_text_obj, &syms_obj, &sym_cnt_obj,
+		      &raw_syms_obj, &raw_sym_cnt_obj);
+	parse_headers(f_exe, &base, &s_text_exe, NULL, NULL, NULL, NULL);
 
 	sztext_cmn = s_text_obj.size;
 	if (sztext_cmn > s_text_exe.size)
@@ -571,17 +582,42 @@ int main(int argc, char *argv[])
 	// remove relocs
 	for (i = 0; i < s_text_obj.reloc_cnt; i++) {
 		addr = s_text_obj.relocs[i].r_vaddr;
+		sym = s_text_obj.relocs[i].r_symndx;
 		if (addr > s_text_obj.size - 4) {
 			printf("reloc addr OOR: %x\n", addr);
 			goto out;
 		}
-		if (*(unsigned int *)(s_text_obj.data + addr) == 0xcccccccc) {
+		if (sym >= raw_sym_cnt_obj) {
+			printf("reloc sym OOR: %d/%ld\n",
+				sym, raw_sym_cnt_obj);
+			goto out;
+		}
+#if 0
+		printf("r %08x -> %08x %s\n", base + addr,
+			raw_syms_obj[sym].addr,
+			raw_syms_obj[sym].name);
+#endif
+		t = (unsigned int *)(s_text_obj.data + addr);
+		if (t[0] == 0xcccccccc
+		 || t[-1] == 0xcccccccc) { // jumptab of a func?
+		 	t[0] = 0xcccccccc;
 			memmove(&s_text_obj.relocs[i],
 				&s_text_obj.relocs[i + 1],
 				(s_text_obj.reloc_cnt - i - 1)
 				 * sizeof(s_text_obj.relocs[0]));
 			i--;
 			s_text_obj.reloc_cnt--;
+		}
+		// note: branches/calls already linked,
+		// so only useful for dd refs
+		else if (raw_syms_obj[sym].is_text) {
+			addr2 = raw_syms_obj[sym].addr;
+			if (s_text_obj.data[addr2] == 0xcc) {
+				printf("warning: reloc %08x -> %08x "
+					"points to rm'd target '%s'\n",
+					base + addr, base + addr2,
+					raw_syms_obj[sym].name);
+			}
 		}
 	}
 
