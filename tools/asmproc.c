@@ -124,6 +124,10 @@ const char *sym_use(const struct sl_item *sym)
 	return buf;
 }
 
+#define IS(w, y) !strcasecmp(w, y)
+#define IS_OR2(w, x, y) (IS(w, x) || IS(w, y))
+#define IS_OR3(w, x, y, z) (IS(w, x) || IS(w, y) || IS(w, z))
+
 int main(int argc, char *argv[])
 {
 	struct sl_item *symlist, *sym, ssym = { NULL, };
@@ -136,6 +140,8 @@ int main(int argc, char *argv[])
 	char word2[256];
 	char word3[256];
 	char word4[256];
+	char word5[256];
+	char word6[256];
 	char *p;
 	int i;
 
@@ -192,7 +198,7 @@ int main(int argc, char *argv[])
 
 		p = next_word(word2, sizeof(word2), p);
 
-		if (!strcasecmp(word2, "proc") || !strcasecmp(word2, "endp")) {
+		if (IS_OR2(word2, "proc", "endp")) {
 			ssym.name = word;
 			sym = bsearch(&ssym, symlist, symlist_cnt,
 				sizeof(symlist[0]), cmp_sym);
@@ -203,7 +209,7 @@ int main(int argc, char *argv[])
 			}
 		}
 
-		if (!strcasecmp(word, "call") || !strcasecmp(word, "jmp")) {
+		if (IS_OR3(word, "call", "jmp", "public")) {
 			ssym.name = word2;
 			sym = bsearch(&ssym, symlist, symlist_cnt,
 				sizeof(symlist[0]), cmp_sym);
@@ -220,13 +226,17 @@ int main(int argc, char *argv[])
 
 		p = next_word(word3, sizeof(word3), p);
 
-		if (!strcasecmp(word, "dd") && !strcasecmp(word2, "offset")) {
+		// dd offset <sym>
+		// push offset <sym>
+		// jcc short <sym>
+		if ( (IS_OR2(word, "dd", "push") && IS(word2, "offset"))
+		  || (word[0] == 'j' && IS(word2, "short")) ) {
 			ssym.name = word3;
 			sym = bsearch(&ssym, symlist, symlist_cnt,
 				sizeof(symlist[0]), cmp_sym);
 			if (sym != NULL && sym->callsites) {
-				fprintf(fout, "\t\tdd offset %s%s",
-					sym_use(sym), p);
+				fprintf(fout, "\t\t%s %s %s%s",
+					word, word2, sym_use(sym), p);
 				continue;
 			}
 		}
@@ -237,13 +247,54 @@ int main(int argc, char *argv[])
 
 		p = next_word(word4, sizeof(word4), p);
 
-		if (!strcasecmp(word2, "dd") && !strcasecmp(word3, "offset")) {
+		// <name> dd offset <sym>
+		if (IS(word2, "dd") && IS(word3, "offset")) {
 			ssym.name = word4;
 			sym = bsearch(&ssym, symlist, symlist_cnt,
 				sizeof(symlist[0]), cmp_sym);
 			if (sym != NULL && sym->callsites) {
 				fprintf(fout, "%s\tdd offset %s%s", word,
 					sym_use(sym), p);
+				continue;
+			}
+		}
+
+		// mov <something>, offset <sym>
+		// jcc <some> ptr <sym>
+		if ( (IS(word, "mov") && IS(word3, "offset"))
+		  || (word[0] == 'j' && IS(word3, "ptr")) ) {
+			ssym.name = word4;
+			sym = bsearch(&ssym, symlist, symlist_cnt,
+				sizeof(symlist[0]), cmp_sym);
+			if (sym != NULL && sym->callsites) {
+				fprintf(fout, "\t\t%s\t%s %s %s%s",
+					word, word2, word3,
+					sym_use(sym), p);
+				continue;
+			}
+		}
+
+		p = sskip(p);
+		if (*p == 0 || *p == ';')
+			goto pass; // need at least 5 words
+
+		p = next_word(word5, sizeof(word5), p);
+
+		p = sskip(p);
+		if (*p == 0 || *p == ';')
+			goto pass; // need at least 6 words
+
+		p = next_word(word6, sizeof(word6), p);
+
+		// <op> dword ptr <something>, offset <sym>
+		if ( IS(word2, "dword") && IS(word3, "ptr")
+		  && IS(word5, "offset") ) {
+			ssym.name = word6;
+			sym = bsearch(&ssym, symlist, symlist_cnt,
+				sizeof(symlist[0]), cmp_sym);
+			if (sym != NULL && sym->callsites) {
+				fprintf(fout, "\t\t%s\tdword ptr %s offset %s%s",
+					word, word4, sym_use(sym), p);
 				continue;
 			}
 		}
