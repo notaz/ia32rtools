@@ -1,6 +1,8 @@
 CFLAGS += -Wall -ggdb
 
-all: asmproc cmpmrg_text
+T = asmproc cmpmrg_text mkbridge
+
+all: $(T)
 
 clean:
-	$(RM) asmproc cmpmrg_text
+	$(RM) $(T)

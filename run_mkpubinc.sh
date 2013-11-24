@@ -23,6 +23,7 @@ echo "; funcs called from C" >> $3
 
 cat $2 | \
 while read a; do
-  echo "_$a equ $a" >> $3
-  echo "PUBLIC _$a" >> $3
+#  echo "_$a equ $a" >> $3
+#  echo "PUBLIC _$a" >> $3
+  echo "PUBLIC $a" >> $3
 done
