@@ -238,8 +238,8 @@ static void out_toasm_x86(FILE *f, char *sym, char *reg_list[], int reg_cnt,
 		must_save |= is_x86_reg_saved(reg_list[i]);
 	}
 
-	fprintf(f, ".global _asm_%s\n", sym);
-	fprintf(f, "_asm_%s:\n", sym);
+	fprintf(f, ".global _%s\n", sym);
+	fprintf(f, "_%s:\n", sym);
 
 	if (!have_regs && !is_stdcall) {
 		fprintf(f, "\tjmp %s\n\n", sym);
@@ -288,7 +288,7 @@ static void out_toasm_x86(FILE *f, char *sym, char *reg_list[], int reg_cnt,
 	fprintf(f, "\tcall %s\n\n", sym);
 
 	if (args_repushed && !is_stdcall)
-		fprintf(f, "\tadd %d,%%esp\n", args_repushed * 4);
+		fprintf(f, "\tadd $%d,%%esp\n", args_repushed * 4);
 
 	// restore regs
 	for (i = reg_cnt - 1; i >= 0; i--) {
@@ -348,7 +348,7 @@ static void out_fromasm_x86(FILE *f, char *sym, char *reg_list[], int reg_cnt,
 	fprintf(f, "\n\tcall _%s\n\n", sym);
 
 	if (sarg_ofs > 2)
-		fprintf(f, "\tadd %d,%%esp\n", (sarg_ofs - 2) * 4);
+		fprintf(f, "\tadd $%d,%%esp\n", (sarg_ofs - 2) * 4);
 
 	fprintf(f, "\tpopl %%edx\n");
 
