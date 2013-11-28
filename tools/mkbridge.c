@@ -6,6 +6,7 @@
 #include "my_str.h"
 
 #define ARRAY_SIZE(x) (sizeof(x) / sizeof(x[0]))
+#define IS(w, y) !strcmp(w, y)
 
 static int find_protostr(char *dst, size_t dlen, FILE *fhdr,
 	const char *sym, int *pline)
@@ -53,11 +54,19 @@ static int get_regparm(char *dst, size_t dlen, char *p)
 
 // hmh..
 static const char *known_types[] = {
-	"char",
+	"const void *",
+	"void *",
+	"char *",
+	"FILE *",
 	"unsigned __int8",
-	"int",
-	"signed int",
+	"unsigned __int16",
 	"unsigned int",
+	"signed int",
+	"char",
+	"__int8",
+	"__int16",
+	"int",
+	"bool",
 	"void",
 	"BYTE",
 	"WORD",
@@ -67,9 +76,6 @@ static const char *known_types[] = {
 	"HWND",
 	"LPCSTR",
 	"size_t",
-	"void *",
-	"const void *",
-	"FILE *",
 };
 
 static int check_type(const char *name)
@@ -85,6 +91,25 @@ static int check_type(const char *name)
 	return 0;
 }
 
+/* args are always expanded to 32bit */
+static const char *map_reg(const char *reg)
+{
+	const char *regs_f[] = { "eax", "ebx", "ecx", "edx", "esi", "edi" };
+	const char *regs_w[] = { "ax",  "bx",  "cx",  "dx",  "si",  "di" };
+	const char *regs_b[] = { "al",  "bl",  "cl",  "dl" };
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(regs_w); i++)
+		if (IS(reg, regs_w[i]))
+			return regs_f[i];
+
+	for (i = 0; i < ARRAY_SIZE(regs_b); i++)
+		if (IS(reg, regs_b[i]))
+			return regs_f[i];
+
+	return reg;
+}
+
 static const char *hdrfn;
 static int pline = 0;
 
@@ -93,6 +118,7 @@ static int parse_protostr(char *protostr, char **reglist, int *cnt_out,
 {
 	char regparm[16];
 	char buf[256];
+	char cconv[32];
 	int xarg = 0;
 	int ret;
 	char *p;
@@ -112,25 +138,28 @@ static int parse_protostr(char *protostr, char **reglist, int *cnt_out,
 	p += ret;
 	p = sskip(p);
 
-	p = next_word(buf, sizeof(buf), p);
+	p = next_word(cconv, sizeof(cconv), p);
 	p = sskip(p);
-	if (buf[0] == 0) {
+	if (cconv[0] == 0) {
 		printf("%s:%d:%ld: cconv missing\n",
 			hdrfn, pline, (p - protostr) + 1);
 		return 1;
 	}
-	if      (strcmp(buf, "__cdecl") == 0)
+	if      (IS(cconv, "__cdecl"))
 		*is_stdcall = 0;
-	else if (strcmp(buf, "__stdcall") == 0)
+	else if (IS(cconv, "__stdcall"))
 		*is_stdcall = 1;
-	else if (strcmp(buf, "__userpurge") == 0)
+	else if (IS(cconv, "__fastcall"))
+		*is_stdcall = 1;
+	else if (IS(cconv, "__thiscall"))
+		*is_stdcall = 1;
+	else if (IS(cconv, "__userpurge"))
 		*is_stdcall = 1; // in all cases seen..
-	else if (strcmp(buf, "__usercall") == 0)
+	else if (IS(cconv, "__usercall"))
 		*is_stdcall = 0; // ..or is it?
 	else {
-		// TODO: __thiscall needs special handling (arg1~ecx)
 		printf("%s:%d:%ld: unhandled cconv: '%s'\n",
-			hdrfn, pline, (p - protostr) + 1, buf);
+			hdrfn, pline, (p - protostr) + 1, cconv);
 		return 1;
 	}
 
@@ -144,8 +173,8 @@ static int parse_protostr(char *protostr, char **reglist, int *cnt_out,
 
 	ret = get_regparm(regparm, sizeof(regparm), p);
 	if (ret > 0) {
-		if (strcmp(regparm, "eax") && strcmp(regparm, "ax")
-		    && strcmp(regparm, "al"))
+		if (!IS(regparm, "eax") && !IS(regparm, "ax")
+		 && !IS(regparm, "al"))
 		{
 			printf("%s:%d:%ld: bad regparm: %s\n",
 				hdrfn, pline, (p - protostr) + 1, regparm);
@@ -196,8 +225,24 @@ static int parse_protostr(char *protostr, char **reglist, int *cnt_out,
 			p += ret;
 			p = sskip(p);
 
-			reglist[xarg - 1] = strdup(regparm);
+			reglist[xarg - 1] = strdup(map_reg(regparm));
 		}
+	}
+
+	if (xarg > 0 && (IS(cconv, "__fastcall") || IS(cconv, "__thiscall"))) {
+		if (reglist[0] != NULL) {
+			printf("%s:%d: %s with arg1 spec %s?\n",
+				hdrfn, pline, cconv, reglist[0]);
+		}
+		reglist[0] = strdup("ecx");
+	}
+
+	if (xarg > 1 && IS(cconv, "__fastcall")) {
+		if (reglist[1] != NULL) {
+			printf("%s:%d: %s with arg2 spec %s?\n",
+				hdrfn, pline, cconv, reglist[1]);
+		}
+		reglist[1] = strdup("edx");
 	}
 
 	*cnt_out = xarg;
@@ -321,7 +366,7 @@ static void out_fromasm_x86(FILE *f, char *sym, char *reg_list[], int reg_cnt,
 	fprintf(f, ".global %s\n", sym);
 	fprintf(f, "%s:\n", sym);
 
-	if (!have_regs) {
+	if (!have_regs && !is_stdcall) {
 		fprintf(f, "\tjmp _%s\n\n", sym);
 		return;
 	}
@@ -356,6 +401,18 @@ static void out_fromasm_x86(FILE *f, char *sym, char *reg_list[], int reg_cnt,
 		fprintf(f, "\tret $%d\n\n", have_normal * 4);
 	else
 		fprintf(f, "\tret\n\n");
+}
+
+static void free_reglist(char *reg_list[], int reg_cnt)
+{
+	int i;
+
+	for (i = 0; i < reg_cnt; i++) {
+		if (reg_list[i] == NULL) {
+			free(reg_list[i]);
+			reg_list[i] = NULL;
+		}
+	}
 }
 
 int main(int argc, char *argv[])
@@ -410,6 +467,7 @@ int main(int argc, char *argv[])
 			goto out;
 
 		out_toasm_x86(fout, sym, reg_list, reg_cnt, is_stdcall);
+		free_reglist(reg_list, reg_cnt);
 	}
 
 	fprintf(fout, "# from asm\n\n");
@@ -433,6 +491,7 @@ int main(int argc, char *argv[])
 			goto out;
 
 		out_fromasm_x86(fout, sym, reg_list, reg_cnt, is_stdcall);
+		free_reglist(reg_list, reg_cnt);
 	}
 
 	ret = 0;
