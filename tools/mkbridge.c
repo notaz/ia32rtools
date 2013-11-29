@@ -8,247 +8,7 @@
 #define ARRAY_SIZE(x) (sizeof(x) / sizeof(x[0]))
 #define IS(w, y) !strcmp(w, y)
 
-static int find_protostr(char *dst, size_t dlen, FILE *fhdr,
-	const char *sym, int *pline)
-{
-	int line = 0;
-	char *p;
-
-	rewind(fhdr);
-
-	while (fgets(dst, dlen, fhdr))
-	{
-		line++;
-		if (strstr(dst, sym) != NULL)
-			break;
-	}
-	*pline = line;
-
-	if (feof(fhdr))
-		return -1;
-
-	p = dst + strlen(dst);
-	for (p--; p > dst && my_isblank(*p); --p)
-		*p = 0;
-
-	return 0;
-}
-
-static int get_regparm(char *dst, size_t dlen, char *p)
-{
-	int i, o;
-
-	if (*p != '<')
-		return 0;
-
-	for (o = 0, i = 1; o < dlen; i++) {
-		if (p[i] == 0)
-			return 0;
-		if (p[i] == '>')
-			break;
-		dst[o++] = p[i];
-	}
-	dst[o] = 0;
-	return i + 1;
-}
-
-// hmh..
-static const char *known_types[] = {
-	"const void *",
-	"void *",
-	"char *",
-	"FILE *",
-	"unsigned __int8",
-	"unsigned __int16",
-	"unsigned int",
-	"signed int",
-	"char",
-	"__int8",
-	"__int16",
-	"int",
-	"bool",
-	"void",
-	"BYTE",
-	"WORD",
-	"DWORD",
-	"HMODULE",
-	"HANDLE",
-	"HWND",
-	"LPCSTR",
-	"size_t",
-};
-
-static int check_type(const char *name)
-{
-	int i, l;
-
-	for (i = 0; i < ARRAY_SIZE(known_types); i++) {
-		l = strlen(known_types[i]);
-		if (strncmp(known_types[i], name, l) == 0)
-			return l;
-	}
-
-	return 0;
-}
-
-/* args are always expanded to 32bit */
-static const char *map_reg(const char *reg)
-{
-	const char *regs_f[] = { "eax", "ebx", "ecx", "edx", "esi", "edi" };
-	const char *regs_w[] = { "ax",  "bx",  "cx",  "dx",  "si",  "di" };
-	const char *regs_b[] = { "al",  "bl",  "cl",  "dl" };
-	int i;
-
-	for (i = 0; i < ARRAY_SIZE(regs_w); i++)
-		if (IS(reg, regs_w[i]))
-			return regs_f[i];
-
-	for (i = 0; i < ARRAY_SIZE(regs_b); i++)
-		if (IS(reg, regs_b[i]))
-			return regs_f[i];
-
-	return reg;
-}
-
-static const char *hdrfn;
-static int pline = 0;
-
-static int parse_protostr(char *protostr, char **reglist, int *cnt_out,
-	int *is_stdcall)
-{
-	char regparm[16];
-	char buf[256];
-	char cconv[32];
-	int xarg = 0;
-	int ret;
-	char *p;
-
-	p = protostr;
-	if (p[0] == '/' && p[1] == '/') {
-		//printf("warning: decl for sym '%s' is commented out\n", sym);
-		p = sskip(p + 2);
-	}
-
-	ret = check_type(p);
-	if (ret <= 0) {
-		printf("%s:%d:%ld: unhandled return in '%s'\n",
-				hdrfn, pline, (p - protostr) + 1, protostr);
-		return 1;
-	}
-	p += ret;
-	p = sskip(p);
-
-	p = next_word(cconv, sizeof(cconv), p);
-	p = sskip(p);
-	if (cconv[0] == 0) {
-		printf("%s:%d:%ld: cconv missing\n",
-			hdrfn, pline, (p - protostr) + 1);
-		return 1;
-	}
-	if      (IS(cconv, "__cdecl"))
-		*is_stdcall = 0;
-	else if (IS(cconv, "__stdcall"))
-		*is_stdcall = 1;
-	else if (IS(cconv, "__fastcall"))
-		*is_stdcall = 1;
-	else if (IS(cconv, "__thiscall"))
-		*is_stdcall = 1;
-	else if (IS(cconv, "__userpurge"))
-		*is_stdcall = 1; // in all cases seen..
-	else if (IS(cconv, "__usercall"))
-		*is_stdcall = 0; // ..or is it?
-	else {
-		printf("%s:%d:%ld: unhandled cconv: '%s'\n",
-			hdrfn, pline, (p - protostr) + 1, cconv);
-		return 1;
-	}
-
-	p = next_idt(buf, sizeof(buf), p);
-	p = sskip(p);
-	if (buf[0] == 0) {
-		printf("%s:%d:%ld: func name missing\n",
-				hdrfn, pline, (p - protostr) + 1);
-		return 1;
-	}
-
-	ret = get_regparm(regparm, sizeof(regparm), p);
-	if (ret > 0) {
-		if (!IS(regparm, "eax") && !IS(regparm, "ax")
-		 && !IS(regparm, "al"))
-		{
-			printf("%s:%d:%ld: bad regparm: %s\n",
-				hdrfn, pline, (p - protostr) + 1, regparm);
-			return 1;
-		}
-		p += ret;
-		p = sskip(p);
-	}
-
-	if (*p != '(') {
-		printf("%s:%d:%ld: '(' expected, got '%c'\n",
-				hdrfn, pline, (p - protostr) + 1, *p);
-		return 1;
-	}
-	p++;
-
-	while (1) {
-		p = sskip(p);
-		if (*p == ')')
-			break;
-		if (*p == ',')
-			p = sskip(p + 1);
-
-		xarg++;
-
-		ret = check_type(p);
-		if (ret <= 0) {
-			printf("%s:%d:%ld: unhandled type for arg%d\n",
-					hdrfn, pline, (p - protostr) + 1, xarg);
-			return 1;
-		}
-		p += ret;
-		p = sskip(p);
-
-		p = next_idt(buf, sizeof(buf), p);
-		p = sskip(p);
-#if 0
-		if (buf[0] == 0) {
-			printf("%s:%d:%ld: idt missing for arg%d\n",
-					hdrfn, pline, (p - protostr) + 1, xarg);
-			return 1;
-		}
-#endif
-		reglist[xarg - 1] = NULL;
-
-		ret = get_regparm(regparm, sizeof(regparm), p);
-		if (ret > 0) {
-			p += ret;
-			p = sskip(p);
-
-			reglist[xarg - 1] = strdup(map_reg(regparm));
-		}
-	}
-
-	if (xarg > 0 && (IS(cconv, "__fastcall") || IS(cconv, "__thiscall"))) {
-		if (reglist[0] != NULL) {
-			printf("%s:%d: %s with arg1 spec %s?\n",
-				hdrfn, pline, cconv, reglist[0]);
-		}
-		reglist[0] = strdup("ecx");
-	}
-
-	if (xarg > 1 && IS(cconv, "__fastcall")) {
-		if (reglist[1] != NULL) {
-			printf("%s:%d: %s with arg2 spec %s?\n",
-				hdrfn, pline, cconv, reglist[1]);
-		}
-		reglist[1] = strdup("edx");
-	}
-
-	*cnt_out = xarg;
-
-	return 0;
-}
+#include "protoparse.h"
 
 static int is_x86_reg_saved(const char *reg)
 {
@@ -263,55 +23,47 @@ static int is_x86_reg_saved(const char *reg)
 	return !nosave;
 }
 
-static void out_toasm_x86(FILE *f, char *sym, char *reg_list[], int reg_cnt,
-	int is_stdcall)
+static void out_toasm_x86(FILE *f, char *sym, struct parsed_proto *pp)
 {
-	int have_normal = 0; // normal args
-	int have_regs = 0;
 	int must_save = 0;
 	int sarg_ofs = 1; // stack offset to args, in DWORDs
 	int args_repushed = 0;
 	int i;
 
-	for (i = 0; i < reg_cnt; i++) {
-		if (reg_list[i] == NULL) {
-			have_normal++;
-			continue;
-		}
-
-		have_regs++;
-		must_save |= is_x86_reg_saved(reg_list[i]);
+	for (i = 0; i < pp->argc; i++) {
+		if (pp->arg[i].reg != NULL)
+			must_save |= is_x86_reg_saved(pp->arg[i].reg);
 	}
 
 	fprintf(f, ".global _%s\n", sym);
 	fprintf(f, "_%s:\n", sym);
 
-	if (!have_regs && !is_stdcall) {
+	if (pp->argc_reg == 0 && !pp->is_stdcall) {
 		fprintf(f, "\tjmp %s\n\n", sym);
 		return;
 	}
 
-	if (!have_normal && !must_save && !is_stdcall) {
+	if (pp->argc_stack == 0 && !must_save && !pp->is_stdcall) {
 		// load arg regs
-		for (i = 0; i < reg_cnt; i++) {
+		for (i = 0; i < pp->argc; i++) {
 			fprintf(f, "\tmovl %d(%%esp), %%%s\n",
-				(i + sarg_ofs) * 4, reg_list[i]);
+				(i + sarg_ofs) * 4, pp->arg[i].reg);
 		}
 		fprintf(f, "\tjmp %s\n\n", sym);
 		return;
 	}
 
 	// save the regs
-	for (i = 0; i < reg_cnt; i++) {
-		if (reg_list[i] != NULL && is_x86_reg_saved(reg_list[i])) {
-			fprintf(f, "\tpushl %%%s\n", reg_list[i]);
+	for (i = 0; i < pp->argc; i++) {
+		if (pp->arg[i].reg != NULL && is_x86_reg_saved(pp->arg[i].reg)) {
+			fprintf(f, "\tpushl %%%s\n", pp->arg[i].reg);
 			sarg_ofs++;
 		}
 	}
 
 	// reconstruct arg stack
-	for (i = reg_cnt - 1; i >= 0; i--) {
-		if (reg_list[i] == NULL) {
+	for (i = pp->argc - 1; i >= 0; i--) {
+		if (pp->arg[i].reg == NULL) {
 			fprintf(f, "\tmovl %d(%%esp), %%eax\n",
 				(i + sarg_ofs) * 4);
 			fprintf(f, "\tpushl %%eax\n");
@@ -319,54 +71,42 @@ static void out_toasm_x86(FILE *f, char *sym, char *reg_list[], int reg_cnt,
 			args_repushed++;
 		}
 	}
-	my_assert(args_repushed, have_normal);
+	my_assert(args_repushed, pp->argc_stack);
 
 	// load arg regs
-	for (i = 0; i < reg_cnt; i++) {
-		if (reg_list[i] != NULL) {
+	for (i = 0; i < pp->argc; i++) {
+		if (pp->arg[i].reg != NULL) {
 			fprintf(f, "\tmovl %d(%%esp), %%%s\n",
-				(i + sarg_ofs) * 4, reg_list[i]);
+				(i + sarg_ofs) * 4, pp->arg[i].reg);
 		}
 	}
 
-	fprintf(f, "\n\t# %s\n", is_stdcall ? "__stdcall" : "__cdecl");
+	fprintf(f, "\n\t# %s\n", pp->is_stdcall ? "__stdcall" : "__cdecl");
 	fprintf(f, "\tcall %s\n\n", sym);
 
-	if (args_repushed && !is_stdcall)
+	if (args_repushed && !pp->is_stdcall)
 		fprintf(f, "\tadd $%d,%%esp\n", args_repushed * 4);
 
 	// restore regs
-	for (i = reg_cnt - 1; i >= 0; i--) {
-		if (reg_list[i] != NULL && is_x86_reg_saved(reg_list[i]))
-			fprintf(f, "\tpopl %%%s\n", reg_list[i]);
+	for (i = pp->argc - 1; i >= 0; i--) {
+		if (pp->arg[i].reg != NULL && is_x86_reg_saved(pp->arg[i].reg))
+			fprintf(f, "\tpopl %%%s\n", pp->arg[i].reg);
 	}
 
 	fprintf(f, "\tret\n\n");
 }
 
-static void out_fromasm_x86(FILE *f, char *sym, char *reg_list[], int reg_cnt,
-	int is_stdcall)
+static void out_fromasm_x86(FILE *f, char *sym, struct parsed_proto *pp)
 {
-	int have_normal = 0; // normal args
-	int have_regs = 0;
 	int sarg_ofs = 1; // stack offset to args, in DWORDs
 	int stack_args;
 	int i;
 
-	for (i = 0; i < reg_cnt; i++) {
-		if (reg_list[i] == NULL) {
-			have_normal++;
-			continue;
-		}
-
-		have_regs++;
-	}
-
-	fprintf(f, "# %s\n", is_stdcall ? "__stdcall" : "__cdecl");
+	fprintf(f, "# %s\n", pp->is_stdcall ? "__stdcall" : "__cdecl");
 	fprintf(f, ".global %s\n", sym);
 	fprintf(f, "%s:\n", sym);
 
-	if (!have_regs && !is_stdcall) {
+	if (pp->argc_reg == 0 && !pp->is_stdcall) {
 		fprintf(f, "\tjmp _%s\n\n", sym);
 		return;
 	}
@@ -375,16 +115,16 @@ static void out_fromasm_x86(FILE *f, char *sym, char *reg_list[], int reg_cnt,
 	sarg_ofs++;
 
 	// construct arg stack
-	stack_args = have_normal;
-	for (i = reg_cnt - 1; i >= 0; i--) {
-		if (reg_list[i] == NULL) {
+	stack_args = pp->argc_stack;
+	for (i = pp->argc - 1; i >= 0; i--) {
+		if (pp->arg[i].reg == NULL) {
 			fprintf(f, "\tmovl %d(%%esp), %%edx\n",
 				(sarg_ofs + stack_args - 1) * 4);
 			fprintf(f, "\tpushl %%edx\n");
 			stack_args--;
 		}
 		else {
-			fprintf(f, "\tpushl %%%s\n", reg_list[i]);
+			fprintf(f, "\tpushl %%%s\n", pp->arg[i].reg);
 		}
 		sarg_ofs++;
 	}
@@ -397,33 +137,18 @@ static void out_fromasm_x86(FILE *f, char *sym, char *reg_list[], int reg_cnt,
 
 	fprintf(f, "\tpopl %%edx\n");
 
-	if (is_stdcall && have_normal)
-		fprintf(f, "\tret $%d\n\n", have_normal * 4);
+	if (pp->is_stdcall && pp->argc_stack)
+		fprintf(f, "\tret $%d\n\n", pp->argc_stack * 4);
 	else
 		fprintf(f, "\tret\n\n");
-}
-
-static void free_reglist(char *reg_list[], int reg_cnt)
-{
-	int i;
-
-	for (i = 0; i < reg_cnt; i++) {
-		if (reg_list[i] == NULL) {
-			free(reg_list[i]);
-			reg_list[i] = NULL;
-		}
-	}
 }
 
 int main(int argc, char *argv[])
 {
 	FILE *fout, *fsyms_to, *fsyms_from, *fhdr;
-	char protostr[256];
+	struct parsed_proto pp;
 	char line[256];
 	char sym[256];
-	char *reg_list[16];
-	int is_stdcall = 0;
-	int reg_cnt = 0;
 	int ret;
 
 	if (argc != 5) {
@@ -454,20 +179,12 @@ int main(int argc, char *argv[])
 		if (sym[0] == 0 || sym[0] == ';' || sym[0] == '#')
 			continue;
 
-		ret = find_protostr(protostr, sizeof(protostr), fhdr,
-			sym, &pline);
-		if (ret != 0) {
-			printf("%s: sym '%s' is missing\n",
-				hdrfn, sym);
-			goto out;
-		}
-
-		ret = parse_protostr(protostr, reg_list, &reg_cnt, &is_stdcall);
+		ret = proto_parse(fhdr, sym, &pp);
 		if (ret)
 			goto out;
 
-		out_toasm_x86(fout, sym, reg_list, reg_cnt, is_stdcall);
-		free_reglist(reg_list, reg_cnt);
+		out_toasm_x86(fout, sym, &pp);
+		proto_release(&pp);
 	}
 
 	fprintf(fout, "# from asm\n\n");
@@ -478,20 +195,12 @@ int main(int argc, char *argv[])
 		if (sym[0] == 0 || sym[0] == ';' || sym[0] == '#')
 			continue;
 
-		ret = find_protostr(protostr, sizeof(protostr), fhdr,
-			sym, &pline);
-		if (ret != 0) {
-			printf("%s: sym '%s' is missing\n",
-				hdrfn, sym);
-			goto out;
-		}
-
-		ret = parse_protostr(protostr, reg_list, &reg_cnt, &is_stdcall);
+		ret = proto_parse(fhdr, sym, &pp);
 		if (ret)
 			goto out;
 
-		out_fromasm_x86(fout, sym, reg_list, reg_cnt, is_stdcall);
-		free_reglist(reg_list, reg_cnt);
+		out_fromasm_x86(fout, sym, &pp);
+		proto_release(&pp);
 	}
 
 	ret = 0;

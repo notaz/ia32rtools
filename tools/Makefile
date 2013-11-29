@@ -1,6 +1,6 @@
 CFLAGS += -Wall -ggdb
 
-T = asmproc cmpmrg_text mkbridge
+T = asmproc cmpmrg_text mkbridge translate
 
 all: $(T)
 
