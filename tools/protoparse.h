@@ -3,6 +3,7 @@ struct parsed_proto {
 	struct {
 		char *reg;
 		const char *type;
+		void *datap;
 	} arg[16];
 	const char *ret_type;
 	int is_stdcall;
@@ -76,6 +77,7 @@ static const char *known_types[] = {
 	"BYTE",
 	"WORD",
 	"DWORD",
+	"_DWORD",
 	"HMODULE",
 	"HANDLE",
 	"HWND",
