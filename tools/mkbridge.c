@@ -124,6 +124,11 @@ static void out_fromasm_x86(FILE *f, char *sym, struct parsed_proto *pp)
 			stack_args--;
 		}
 		else {
+			if (IS(pp->arg[i].reg, "edx"))
+				// must reload original edx
+				fprintf(f, "\tmovl %d(%%esp), %%edx\n",
+					(sarg_ofs - 2) * 4);
+
 			fprintf(f, "\tpushl %%%s\n", pp->arg[i].reg);
 		}
 		sarg_ofs++;

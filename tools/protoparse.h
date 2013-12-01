@@ -64,6 +64,7 @@ static const char *known_types[] = {
 	"void *",
 	"char *",
 	"FILE *",
+	"int *",
 	"unsigned __int8",
 	"unsigned __int16",
 	"unsigned int",
