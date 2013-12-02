@@ -20,14 +20,12 @@ static int asmln;
 	exit(1); \
 } while (0)
 
-enum op_class {
-	OPC_UNSPEC,
-	OPC_RMD,        /* removed or optimized out */
-	OPC_DATA,       /* data processing */
-	OPC_DATA_FLAGS, /* data processing + sets flags */
-	OPC_JMP,        /* .. and call */
-	OPC_JCC,        /* conditional jump */
-	OPC_SCC,        /* conditionel set */
+enum op_flags {
+	OPF_RMD    = (1 << 0), /* removed or optimized out */
+	OPF_DATA   = (1 << 1), /* data processing - writes to dst opr */
+	OPF_FLAGS  = (1 << 2), /* sets flags */
+	OPF_JMP    = (1 << 3), /* branches, ret and call */
+	OPF_CC     = (1 << 4), /* uses flags */
 };
 
 enum op_op {
@@ -48,6 +46,7 @@ enum op_op {
 	OP_SHL,
 	OP_SHR,
 	OP_SAR,
+	OP_ADC,
 	OP_SBB,
 	OP_INC,
 	OP_DEC,
@@ -102,13 +101,20 @@ struct parsed_opr {
 };
 
 struct parsed_op {
-  enum op_class cls;
   enum op_op op;
   struct parsed_opr operand[MAX_OPERANDS];
+  unsigned int flags;
   int operand_cnt;
-  int regmask;        // all referensed regs
+  int regmask_src;        // all referensed regs
+  int regmask_dst;
+  int pfomask;            // parsed_flag_op that can't be delayed
   void *datap;
 };
+
+// datap:
+// OP_PUSH - arg number if arg is altered before call
+// OP_CALL - ptr to parsed_proto
+// (OPF_CC) - point to corresponding (OPF_FLAGS)
 
 struct parsed_equ {
   char name[64];
@@ -141,6 +147,22 @@ const char *regs_r8l[] = { "al", "bl", "cl", "dl" };
 const char *regs_r8h[] = { "ah", "bh", "ch", "dh" };
 
 enum x86_regs { xUNSPEC = -1, xAX, xBX, xCX, xDX, xSI, xDI, xBP, xSP };
+
+// possible basic comparison types (without inversion)
+enum parsed_flag_op {
+  PFO_O,  // 0 OF=1
+  PFO_C,  // 2 CF=1
+  PFO_Z,  // 4 ZF=1
+  PFO_BE, // 6 CF=1||ZF=1
+  PFO_S,  // 8 SF=1
+  PFO_P,  // a PF=1
+  PFO_L,  // c SF!=OF
+  PFO_LE, // e ZF=1||SF!=OF
+};
+
+static const char *parsed_flag_op_names[] = {
+  "o", "c", "z", "be", "s", "p", "l", "le"
+};
 
 static int char_array_i(const char *array[], size_t len, const char *s)
 {
@@ -250,8 +272,9 @@ static int guess_lmod_from_name(struct parsed_opr *opr)
   return 0;
 }
 
-static int parse_operand(struct parsed_opr *opr, int *regmask,
-	char words[16][256], int wordc, int w, enum op_class cls)
+static int parse_operand(struct parsed_opr *opr,
+  int *regmask, int *regmask_indirect,
+	char words[16][256], int wordc, int w, unsigned int op_flags)
 {
   enum opr_lenmod tmplmod;
   int tmpreg;
@@ -272,7 +295,7 @@ static int parse_operand(struct parsed_opr *opr, int *regmask,
 		}
 	}
 
-	if (cls == OPC_JMP || cls == OPC_JCC) {
+	if (op_flags & OPF_JMP) {
 		const char *label;
 
 		if (wordc - w == 3 && IS(words[w + 1], "ptr"))
@@ -320,7 +343,7 @@ static int parse_operand(struct parsed_opr *opr, int *regmask,
     if (ret != 1)
       aerr("[] parse failure\n");
     // only need the regmask
-    parse_reg(&tmpreg, &tmplmod, regmask, opr->name);
+    parse_reg(&tmpreg, &tmplmod, regmask_indirect, opr->name);
     return wordc;
   }
   else if (strchr(words[w], '[')) {
@@ -328,7 +351,8 @@ static int parse_operand(struct parsed_opr *opr, int *regmask,
     opr->type = OPT_REGMEM;
     if (opr->lmod == OPLM_UNSPEC)
       guess_lmod_from_name(opr);
-    parse_reg(&tmpreg, &tmplmod, regmask, strchr(words[w], '['));
+    parse_reg(&tmpreg, &tmplmod, regmask_indirect,
+      strchr(words[w], '['));
     return wordc;
   }
   else if (('0' <= words[w][0] && words[w][0] <= '9')
@@ -360,102 +384,109 @@ static int parse_operand(struct parsed_opr *opr, int *regmask,
 static const struct {
   const char *name;
   enum op_op op;
-  enum op_class cls;
-  int minopr;
-  int maxopr;
+  unsigned int minopr;
+  unsigned int maxopr;
+  unsigned int flags;
 } op_table[] = {
-  { "push", OP_PUSH,   OPC_DATA,       1, 1 },
-  { "pop",  OP_POP,    OPC_DATA,       1, 1 },
-  { "mov" , OP_MOV,    OPC_DATA,       2, 2 },
-  { "lea",  OP_LEA,    OPC_DATA,       2, 2 },
-  { "movzx",OP_MOVZX,  OPC_DATA,       2, 2 },
-  { "movsx",OP_MOVSX,  OPC_DATA,       2, 2 },
-  { "not",  OP_NOT,    OPC_DATA,       1, 1 },
-  { "add",  OP_ADD,    OPC_DATA_FLAGS, 2, 2 },
-  { "sub",  OP_SUB,    OPC_DATA_FLAGS, 2, 2 },
-  { "and",  OP_AND,    OPC_DATA_FLAGS, 2, 2 },
-  { "or",   OP_OR,     OPC_DATA_FLAGS, 2, 2 },
-  { "xor",  OP_XOR,    OPC_DATA_FLAGS, 2, 2 },
-  { "shl",  OP_SHL,    OPC_DATA_FLAGS, 2, 2 },
-  { "shr",  OP_SHR,    OPC_DATA_FLAGS, 2, 2 },
-  { "sal",  OP_SHL,    OPC_DATA_FLAGS, 2, 2 },
-  { "sar",  OP_SAR,    OPC_DATA_FLAGS, 2, 2 },
-  { "sbb",  OP_SBB,    OPC_DATA_FLAGS, 2, 2 },
-  { "inc",  OP_INC,    OPC_DATA_FLAGS, 1, 1 },
-  { "dec",  OP_DEC,    OPC_DATA_FLAGS, 1, 1 },
-  { "mul",  OP_MUL,    OPC_DATA_FLAGS, 1, 1 },
-  { "imul", OP_IMUL,   OPC_DATA_FLAGS, 1, 3 },
-  { "test", OP_TEST,   OPC_DATA_FLAGS, 2, 2 },
-  { "cmp",  OP_CMP,    OPC_DATA_FLAGS, 2, 2 },
-  { "retn", OP_RET,    OPC_JMP,        0, 1 },
-  { "call", OP_CALL,   OPC_JMP,        1, 1 },
-  { "jmp",  OP_JMP,    OPC_JMP,        1, 1 },
-  { "jo",   OP_JO,     OPC_JCC,        1, 1 }, // 70 OF=1
-  { "jno",  OP_JNO,    OPC_JCC,        1, 1 }, // 71 OF=0
-  { "jc",   OP_JC,     OPC_JCC,        1, 1 }, // 72 CF=1
-  { "jb",   OP_JC,     OPC_JCC,        1, 1 }, // 72
-  { "jnc",  OP_JNC,    OPC_JCC,        1, 1 }, // 73 CF=0
-  { "jae",  OP_JNC,    OPC_JCC,        1, 1 }, // 73
-  { "jz",   OP_JZ,     OPC_JCC,        1, 1 }, // 74 ZF=1
-  { "je",   OP_JZ,     OPC_JCC,        1, 1 }, // 74
-  { "jnz",  OP_JNZ,    OPC_JCC,        1, 1 }, // 75 ZF=0
-  { "jne",  OP_JNZ,    OPC_JCC,        1, 1 }, // 75
-  { "jbe",  OP_JBE,    OPC_JCC,        1, 1 }, // 76 CF=1 || ZF=1
-  { "jna",  OP_JBE,    OPC_JCC,        1, 1 }, // 76
-  { "ja",   OP_JA,     OPC_JCC,        1, 1 }, // 77 CF=0 && ZF=0
-  { "jnbe", OP_JA,     OPC_JCC,        1, 1 }, // 77
-  { "js",   OP_JS,     OPC_JCC,        1, 1 }, // 78 SF=1
-  { "jns",  OP_JNS,    OPC_JCC,        1, 1 }, // 79 SF=0
-  { "jp",   OP_JP,     OPC_JCC,        1, 1 }, // 7a PF=1
-  { "jpe",  OP_JP,     OPC_JCC,        1, 1 }, // 7a
-  { "jnp",  OP_JNP,    OPC_JCC,        1, 1 }, // 7b PF=0
-  { "jpo",  OP_JNP,    OPC_JCC,        1, 1 }, // 7b
-  { "jl",   OP_JL,     OPC_JCC,        1, 1 }, // 7c SF!=OF
-  { "jnge", OP_JL,     OPC_JCC,        1, 1 }, // 7c
-  { "jge",  OP_JGE,    OPC_JCC,        1, 1 }, // 7d SF=OF
-  { "jnl",  OP_JGE,    OPC_JCC,        1, 1 }, // 7d
-  { "jle",  OP_JLE,    OPC_JCC,        1, 1 }, // 7e ZF=1 || SF!=OF
-  { "jng",  OP_JLE,    OPC_JCC,        1, 1 }, // 7e
-  { "jg",   OP_JG,     OPC_JCC,        1, 1 }, // 7f ZF=0 && SF=OF
-  { "jnle", OP_JG,     OPC_JCC,        1, 1 }, // 7f
-  };
+  { "push", OP_PUSH,   1, 1, 0 },
+  { "pop",  OP_POP,    1, 1, OPF_DATA },
+  { "mov" , OP_MOV,    2, 2, OPF_DATA },
+  { "lea",  OP_LEA,    2, 2, OPF_DATA },
+  { "movzx",OP_MOVZX,  2, 2, OPF_DATA },
+  { "movsx",OP_MOVSX,  2, 2, OPF_DATA },
+  { "not",  OP_NOT,    1, 1, OPF_DATA },
+  { "add",  OP_ADD,    2, 2, OPF_DATA|OPF_FLAGS },
+  { "sub",  OP_SUB,    2, 2, OPF_DATA|OPF_FLAGS },
+  { "and",  OP_AND,    2, 2, OPF_DATA|OPF_FLAGS },
+  { "or",   OP_OR,     2, 2, OPF_DATA|OPF_FLAGS },
+  { "xor",  OP_XOR,    2, 2, OPF_DATA|OPF_FLAGS },
+  { "shl",  OP_SHL,    2, 2, OPF_DATA|OPF_FLAGS },
+  { "shr",  OP_SHR,    2, 2, OPF_DATA|OPF_FLAGS },
+  { "sal",  OP_SHL,    2, 2, OPF_DATA|OPF_FLAGS },
+  { "sar",  OP_SAR,    2, 2, OPF_DATA|OPF_FLAGS },
+//  { "adc",  OP_ADC,    2, 2, OPF_DATA|OPF_FLAGS|OPF_CC },
+  { "sbb",  OP_SBB,    2, 2, OPF_DATA|OPF_FLAGS|OPF_CC },
+  { "inc",  OP_INC,    1, 1, OPF_DATA|OPF_FLAGS },
+  { "dec",  OP_DEC,    1, 1, OPF_DATA|OPF_FLAGS },
+//  { "mul",  OP_MUL,    1, 1, OPF_DATA|OPF_FLAGS },
+  { "imul", OP_IMUL,   1, 3, OPF_DATA|OPF_FLAGS },
+  { "test", OP_TEST,   2, 2, OPF_FLAGS },
+  { "cmp",  OP_CMP,    2, 2, OPF_FLAGS },
+  { "retn", OP_RET,    0, 1, OPF_JMP },
+  { "call", OP_CALL,   1, 1, OPF_JMP },
+  { "jmp",  OP_JMP,    1, 1, OPF_JMP },
+  { "jo",   OP_JO,     1, 1, OPF_JMP|OPF_CC }, // 70 OF=1
+  { "jno",  OP_JNO,    1, 1, OPF_JMP|OPF_CC }, // 71 OF=0
+  { "jc",   OP_JC,     1, 1, OPF_JMP|OPF_CC }, // 72 CF=1
+  { "jb",   OP_JC,     1, 1, OPF_JMP|OPF_CC }, // 72
+  { "jnc",  OP_JNC,    1, 1, OPF_JMP|OPF_CC }, // 73 CF=0
+  { "jae",  OP_JNC,    1, 1, OPF_JMP|OPF_CC }, // 73
+  { "jz",   OP_JZ,     1, 1, OPF_JMP|OPF_CC }, // 74 ZF=1
+  { "je",   OP_JZ,     1, 1, OPF_JMP|OPF_CC }, // 74
+  { "jnz",  OP_JNZ,    1, 1, OPF_JMP|OPF_CC }, // 75 ZF=0
+  { "jne",  OP_JNZ,    1, 1, OPF_JMP|OPF_CC }, // 75
+  { "jbe",  OP_JBE,    1, 1, OPF_JMP|OPF_CC }, // 76 CF=1 || ZF=1
+  { "jna",  OP_JBE,    1, 1, OPF_JMP|OPF_CC }, // 76
+  { "ja",   OP_JA,     1, 1, OPF_JMP|OPF_CC }, // 77 CF=0 && ZF=0
+  { "jnbe", OP_JA,     1, 1, OPF_JMP|OPF_CC }, // 77
+  { "js",   OP_JS,     1, 1, OPF_JMP|OPF_CC }, // 78 SF=1
+  { "jns",  OP_JNS,    1, 1, OPF_JMP|OPF_CC }, // 79 SF=0
+  { "jp",   OP_JP,     1, 1, OPF_JMP|OPF_CC }, // 7a PF=1
+  { "jpe",  OP_JP,     1, 1, OPF_JMP|OPF_CC }, // 7a
+  { "jnp",  OP_JNP,    1, 1, OPF_JMP|OPF_CC }, // 7b PF=0
+  { "jpo",  OP_JNP,    1, 1, OPF_JMP|OPF_CC }, // 7b
+  { "jl",   OP_JL,     1, 1, OPF_JMP|OPF_CC }, // 7c SF!=OF
+  { "jnge", OP_JL,     1, 1, OPF_JMP|OPF_CC }, // 7c
+  { "jge",  OP_JGE,    1, 1, OPF_JMP|OPF_CC }, // 7d SF=OF
+  { "jnl",  OP_JGE,    1, 1, OPF_JMP|OPF_CC }, // 7d
+  { "jle",  OP_JLE,    1, 1, OPF_JMP|OPF_CC }, // 7e ZF=1 || SF!=OF
+  { "jng",  OP_JLE,    1, 1, OPF_JMP|OPF_CC }, // 7e
+  { "jg",   OP_JG,     1, 1, OPF_JMP|OPF_CC }, // 7f ZF=0 && SF=OF
+  { "jnle", OP_JG,     1, 1, OPF_JMP|OPF_CC }, // 7f
+};
 
 static void parse_op(struct parsed_op *op, char words[16][256], int wordc)
 {
+  int regmask_ind;
+  int regmask;
   int opr = 0;
   int w = 1;
   int i;
 
   for (i = 0; i < ARRAY_SIZE(op_table); i++) {
-    if (!IS(words[0], op_table[i].name))
-      continue;
-
-    op->regmask = 0;
-
-    for (opr = 0; opr < op_table[i].minopr; opr++) {
-      w = parse_operand(&op->operand[opr], &op->regmask,
-        words, wordc, w, op_table[i].cls);
-    }
-
-    for (; w < wordc && opr < op_table[i].maxopr; opr++) {
-      w = parse_operand(&op->operand[opr], &op->regmask,
-        words, wordc, w, op_table[i].cls);
-    }
-
-    goto done;
+    if (IS(words[0], op_table[i].name))
+      break;
   }
 
-  aerr("unhandled op: '%s'\n", words[0]);
+  if (i == ARRAY_SIZE(op_table))
+    aerr("unhandled op: '%s'\n", words[0]);
 
-done:
+  op->op = op_table[i].op;
+  op->flags = op_table[i].flags;
+  op->regmask_src = op->regmask_dst = 0;
+
+  for (opr = 0; opr < op_table[i].minopr; opr++) {
+    regmask = regmask_ind = 0;
+    w = parse_operand(&op->operand[opr], &regmask, &regmask_ind,
+      words, wordc, w, op->flags);
+
+    if (opr == 0 && (op->flags & OPF_DATA))
+      op->regmask_dst = regmask;
+    // for now, mark dst as src too
+    op->regmask_src |= regmask | regmask_ind;
+  }
+
+  for (; w < wordc && opr < op_table[i].maxopr; opr++) {
+    w = parse_operand(&op->operand[opr],
+      &op->regmask_src, &op->regmask_src,
+      words, wordc, w, op->flags);
+  }
+
+  op->operand_cnt = opr;
+
   if (w < wordc)
     aerr("parse_op %s incomplete: %d/%d\n",
       words[0], w, wordc);
-
-  op->cls = op_table[i].cls;
-  op->op = op_table[i].op;
-  op->operand_cnt = opr;
-  return;
 }
 
 static const char *op_name(enum op_op op)
@@ -716,146 +747,178 @@ static char *out_dst_opr(char *buf, size_t buf_size,
   return buf;
 }
 
-static void split_cond(struct parsed_op *po, enum op_op *op, int *is_neg)
+static const char *lmod_cast_u(struct parsed_op *po,
+  enum opr_lenmod lmod)
+{
+  switch (lmod) {
+  case OPLM_DWORD:
+    return "";
+  case OPLM_WORD:
+    return "(u16)";
+  case OPLM_BYTE:
+    return "(u8)";
+  default:
+    ferr(po, "invalid lmod: %d\n", lmod);
+    return "(_invalid_)";
+  }
+}
+
+static const char *lmod_cast_s(struct parsed_op *po,
+  enum opr_lenmod lmod)
+{
+  switch (lmod) {
+  case OPLM_DWORD:
+    return "(s32)";
+  case OPLM_WORD:
+    return "(s16)";
+  case OPLM_BYTE:
+    return "(s8)";
+  default:
+    ferr(po, "invalid lmod: %d\n", lmod);
+    return "(_invalid_)";
+  }
+}
+
+static enum parsed_flag_op split_cond(struct parsed_op *po,
+  enum op_op op, int *is_neg)
 {
   *is_neg = 0;
 
-  switch (*op) {
-  case OP_JNO:
-    *op = OP_JO;
-    *is_neg = 1;
-    break;
-  case OP_JNC:
-    *op = OP_JC;
-    *is_neg = 1;
-    break;
-  case OP_JNZ:
-    *op = OP_JZ;
-    *is_neg = 1;
-    break;
-  case OP_JNS:
-    *op = OP_JS;
-    *is_neg = 1;
-    break;
-  case OP_JNP:
-    *op = OP_JP;
-    *is_neg = 1;
-    break;
-  case OP_JLE:
-    *op = OP_JG;
-    *is_neg = 1;
-    break;
-  case OP_JGE:
-    *op = OP_JL;
-    *is_neg = 1;
-    break;
-  case OP_JA:
-    *op = OP_JBE;
-    *is_neg = 1;
-    break;
+  switch (op) {
   case OP_JO:
+    return PFO_O;
   case OP_JC:
+    return PFO_C;
   case OP_JZ:
-  case OP_JS:
-  case OP_JP:
-  case OP_JG:
-  case OP_JL:
+    return PFO_Z;
   case OP_JBE:
-    break;
-    //break;
+    return PFO_BE;
+  case OP_JS:
+    return PFO_S;
+  case OP_JP:
+    return PFO_P;
+  case OP_JL:
+    return PFO_L;
+  case OP_JLE:
+    return PFO_LE;
+
+  case OP_JNO:
+    *is_neg = 1;
+    return PFO_O;
+  case OP_JNC:
+    *is_neg = 1;
+    return PFO_C;
+  case OP_JNZ:
+    *is_neg = 1;
+    return PFO_Z;
+  case OP_JA:
+    *is_neg = 1;
+    return PFO_BE;
+  case OP_JNS:
+    *is_neg = 1;
+    return PFO_S;
+  case OP_JNP:
+    *is_neg = 1;
+    return PFO_P;
+  case OP_JGE:
+    *is_neg = 1;
+    return PFO_L;
+  case OP_JG:
+    *is_neg = 1;
+    return PFO_LE;
+
+  case OP_ADC:
+  case OP_SBB:
+    return PFO_C;
+
   default:
-    ferr(po, "split_cond: bad op %d\n", *op);
-    break;
+    ferr(po, "split_cond: bad op %d\n", op);
+    return -1;
   }
 }
 
 static void out_test_for_cc(char *buf, size_t buf_size,
-  struct parsed_op *po, enum op_op op, enum opr_lenmod lmod,
-  const char *expr)
+  struct parsed_op *po, enum parsed_flag_op pfo, int is_neg,
+  enum opr_lenmod lmod, const char *expr)
 {
-  const char *cast = "";
-  int is_neg = 0;
+  const char *cast, *scast;
 
-  split_cond(po, &op, &is_neg);
-  switch (op) {
-  case OP_JZ:
-    switch (lmod) {
-    case OPLM_DWORD:
-      break;
-    case OPLM_WORD:
-      cast = "(u16)";
-      break;
-    case OPLM_BYTE:
-      cast = "(u8)";
-      break;
-    default:
-      ferr(po, "%s: invalid lmod for JZ: %d\n", __func__, lmod);
-    }
+  cast = lmod_cast_u(po, lmod);
+  scast = lmod_cast_s(po, lmod);
+
+  switch (pfo) {
+  case PFO_Z:
     snprintf(buf, buf_size, "(%s%s %s 0)",
       cast, expr, is_neg ? "!=" : "==");
     break;
 
-  case OP_JG: // ZF=0 && SF=OF; OF=0 after test
-    switch (lmod) {
-    case OPLM_DWORD:
-      snprintf(buf, buf_size, "((int)%s %s 0)", expr, is_neg ? "<=" : ">");
-      break;
-    default:
-      ferr(po, "%s: unhandled lmod for JG: %d\n", __func__, lmod);
-    }
+  case PFO_LE: // ZF=1||SF!=OF; OF=0 after test
+    snprintf(buf, buf_size, "(%s%s %s 0)",
+      scast, expr, is_neg ? ">" : "<=");
     break;
 
   default:
-    ferr(po, "%s: unhandled op: %d\n", __func__, op);
+    ferr(po, "%s: unhandled parsed_flag_op: %d\n", __func__, pfo);
   }
 }
 
 static void out_cmp_for_cc(char *buf, size_t buf_size,
-  struct parsed_op *po, enum op_op op, enum opr_lenmod lmod,
-  const char *expr1, const char *expr2)
+  struct parsed_op *po, enum parsed_flag_op pfo, int is_neg,
+  enum opr_lenmod lmod, const char *expr1, const char *expr2)
 {
-  const char *cast = "";
-  const char *scast = "";
-  int is_neg = 0;
+  const char *cast, *scast;
 
-  switch (lmod) {
-  case OPLM_DWORD:
-    scast = "(s32)";
-    break;
-  case OPLM_WORD:
-    cast = "(u16)";
-    scast = "(s16)";
-    break;
-  case OPLM_BYTE:
-    cast = "(u8)";
-    scast = "(s8)";
-    break;
-  default:
-    ferr(po, "%s: invalid lmod: %d\n", __func__, lmod);
-  }
+  cast = lmod_cast_u(po, lmod);
+  scast = lmod_cast_s(po, lmod);
 
-  split_cond(po, &op, &is_neg);
-  switch (op) {
-  case OP_JZ:
+  switch (pfo) {
+  case PFO_Z:
     snprintf(buf, buf_size, "(%s%s %s %s%s)",
       cast, expr1, is_neg ? "!=" : "==", cast, expr2);
     break;
 
-  case OP_JC:
+  case PFO_C:
     // note: must be unsigned compare
     snprintf(buf, buf_size, "(%s%s %s %s%s)",
       cast, expr1, is_neg ? ">=" : "<", cast, expr2);
     break;
 
-  case OP_JL:
-    // note: must be unsigned compare
+  case PFO_L:
+    // note: must be signed compare
     snprintf(buf, buf_size, "(%s%s %s %s%s)",
       scast, expr1, is_neg ? ">=" : "<", scast, expr2);
     break;
 
   default:
-    ferr(po, "%s: unhandled op: %d\n", __func__, op);
+    ferr(po, "%s: unhandled parsed_flag_op: %d\n", __func__, pfo);
   }
+}
+
+static void out_cmp_test(char *buf, size_t buf_size,
+  struct parsed_op *po, enum parsed_flag_op pfo, int is_neg)
+{
+  char buf1[256], buf2[256], buf3[256];
+
+  if (po->op == OP_TEST) {
+    if (IS(opr_name(po, 0), opr_name(po, 1))) {
+      out_src_opr(buf3, sizeof(buf3), po, &po->operand[0], 0);
+    }
+    else {
+      out_src_opr(buf1, sizeof(buf1), po, &po->operand[0], 0);
+      out_src_opr(buf2, sizeof(buf2), po, &po->operand[1], 0);
+      snprintf(buf3, sizeof(buf3), "(%s & %s)", buf1, buf2);
+    }
+    out_test_for_cc(buf, buf_size, po, pfo, is_neg,
+      po->operand[0].lmod, buf3);
+  }
+  else if (po->op == OP_CMP) {
+    out_src_opr(buf2, sizeof(buf2), po, &po->operand[0], 0);
+    out_src_opr(buf3, sizeof(buf3), po, &po->operand[1], 0);
+    out_cmp_for_cc(buf, buf_size, po, pfo, is_neg,
+      po->operand[0].lmod, buf2, buf3);
+  }
+  else
+    ferr(po, "%s: unhandled op: %d\n", __func__, po->op);
 }
 
 static void propagate_lmod(struct parsed_op *po, struct parsed_opr *popr1,
@@ -915,11 +978,10 @@ static const char *op_to_c(struct parsed_op *po)
 static int scan_for_pop(int i, int opcnt, const char *reg)
 {
   for (; i < opcnt; i++) {
-    if (ops[i].cls == OPC_RMD)
+    if (ops[i].flags & OPF_RMD)
       continue;
 
-    if (ops[i].cls == OPC_JMP || ops[i].cls == OPC_JCC
-        || g_labels[i][0] != 0)
+    if ((ops[i].flags & OPF_JMP) || g_labels[i][0] != 0)
       return -1;
 
     if (ops[i].op == OP_POP && ops[i].operand[0].type == OPT_REG
@@ -930,7 +992,7 @@ static int scan_for_pop(int i, int opcnt, const char *reg)
   return -1;
 }
 
-// scan for pop starting from ret
+// scan for pop starting from 'ret' op (all paths)
 static int scan_for_pop_ret(int i, int opcnt, const char *reg, int do_patch)
 {
   int found = 0;
@@ -941,7 +1003,9 @@ static int scan_for_pop_ret(int i, int opcnt, const char *reg, int do_patch)
       continue;
 
     for (j = i - 1; j >= 0; j--) {
-      if (ops[j].cls == OPC_JMP || ops[j].cls == OPC_JCC)
+      if (ops[j].flags & OPF_RMD)
+        continue;
+      if (ops[j].flags & OPF_JMP)
         return -1;
 
       if (ops[j].op == OP_POP && ops[j].operand[0].type == OPT_REG
@@ -949,7 +1013,7 @@ static int scan_for_pop_ret(int i, int opcnt, const char *reg, int do_patch)
       {
         found = 1;
         if (do_patch)
-          ops[j].cls = OPC_RMD;
+          ops[j].flags |= OPF_RMD;
         break;
       }
 
@@ -961,18 +1025,64 @@ static int scan_for_pop_ret(int i, int opcnt, const char *reg, int do_patch)
   return found ? 0 : -1;
 }
 
+// is operand opr modified by parsed_op po?
+static int is_opr_modified(struct parsed_opr *opr,
+  const struct parsed_op *po)
+{
+  if ((po->flags & OPF_RMD) || !(po->flags & OPF_DATA))
+    return 0;
+
+  if (opr->type == OPT_REG && po->operand[0].type == OPT_REG) {
+    if (po->regmask_dst & (1 << opr->reg))
+      return 1;
+    else
+      return 0;
+  }
+
+  return IS(po->operand[0].name, opr->name);
+}
+
+// scan for provided opr modification in range given
+static int scan_for_mod(struct parsed_opr *opr, int i, int opcnt)
+{
+  for (; i < opcnt; i++) {
+    if (is_opr_modified(opr, &ops[i]))
+      return i;
+  }
+
+  return -1;
+}
+
+static int scan_for_flag_set(int i, int opcnt)
+{
+  for (; i >= 0; i--) {
+    if (ops[i].flags & OPF_FLAGS)
+      return i;
+
+    if ((ops[i].flags & OPF_JMP) && !(ops[i].flags & OPF_CC))
+      return -1;
+    if (g_labels[i][0] != 0)
+      return -1;
+  }
+
+  return -1;
+}
+
 static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
 {
-  struct parsed_op *po, *delayed_op = NULL, *tmp_op;
+  struct parsed_op *po, *delayed_flag_op = NULL, *tmp_op;
   struct parsed_opr *last_arith_dst = NULL;
   char buf1[256], buf2[256], buf3[256];
   struct parsed_proto *pp;
   const char *tmpname;
+  int save_arg_vars = 0;
+  int cmp_result_vars = 0;
   int had_decl = 0;
   int regmask_arg = 0;
   int regmask = 0;
-  int special_sbb;
+  int special_sbb = 0;
   int no_output;
+  int dummy;
   int arg;
   int i, j;
   int reg;
@@ -1000,12 +1110,12 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
       && IS(opr_name(&ops[1], 1), "esp"))
   {
     g_bp_frame = 1;
-    ops[0].cls = OPC_RMD;
-    ops[1].cls = OPC_RMD;
+    ops[0].flags |= OPF_RMD;
+    ops[1].flags |= OPF_RMD;
 
     if (ops[2].op == OP_SUB && IS(opr_name(&ops[2], 0), "esp")) {
       g_bp_stack = opr_const(&ops[2], 1);
-      ops[2].cls = OPC_RMD;
+      ops[2].flags |= OPF_RMD;
     }
 
     i = 2;
@@ -1015,7 +1125,7 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
           break;
       if (ops[i - 1].op != OP_POP || !IS(opr_name(&ops[i - 1], 0), "ebp"))
         ferr(&ops[i - 1], "'pop ebp' expected\n");
-      ops[i - 1].cls = OPC_RMD;
+      ops[i - 1].flags |= OPF_RMD;
 
       if (g_bp_stack != 0) {
         if (ops[i - 2].op != OP_MOV
@@ -1024,67 +1134,99 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
         {
           ferr(&ops[i - 2], "esp restore expected\n");
         }
-        ops[i - 2].cls = OPC_RMD;
+        ops[i - 2].flags |= OPF_RMD;
       }
       i++;
     } while (i < opcnt);
   }
 
   // pass2:
-  // - scan for all used registers
-  // - process calls
   // - find POPs for PUSHes, rm both
+  // - scan for all used registers
+  // - find flag set ops for their users
+  // - process calls
   for (i = 0; i < opcnt; i++) {
-    if (ops[i].cls == OPC_RMD)
+    po = &ops[i];
+    if (po->flags & OPF_RMD)
       continue;
 
-    if (ops[i].op == OP_PUSH && ops[i].operand[0].type == OPT_REG) {
-      if (ops[i].operand[0].reg < 0)
-        ferr(&ops[i], "reg not set for push?\n");
-      if (!(regmask & (1 << ops[i].operand[0].reg))) { // reg save
-        ret = scan_for_pop(i + 1, opcnt, ops[i].operand[0].name);
+    if (po->op == OP_PUSH && po->operand[0].type == OPT_REG) {
+      if (po->operand[0].reg < 0)
+        ferr(po, "reg not set for push?\n");
+      if (!(regmask & (1 << po->operand[0].reg))) { // reg save
+        ret = scan_for_pop(i + 1, opcnt, po->operand[0].name);
         if (ret >= 0) {
-          ops[i].cls = ops[ret].cls = OPC_RMD;
+          po->flags |= OPF_RMD;
+          ops[ret].flags |= OPF_RMD;
           continue;
         }
-        ret = scan_for_pop_ret(i + 1, opcnt, ops[i].operand[0].name, 0);
+        ret = scan_for_pop_ret(i + 1, opcnt, po->operand[0].name, 0);
         if (ret == 0) {
-          ops[i].cls = OPC_RMD;
-          scan_for_pop_ret(i + 1, opcnt, ops[i].operand[0].name, 1);
+          po->flags |= OPF_RMD;
+          scan_for_pop_ret(i + 1, opcnt, po->operand[0].name, 1);
           continue;
         }
       }
     }
 
-    regmask |= ops[i].regmask;
+    regmask |= po->regmask_src | po->regmask_dst;
 
-    if (ops[i].op == OP_CALL) {
+    if (po->flags & OPF_CC)
+    {
+      ret = scan_for_flag_set(i - 1, opcnt);
+      if (ret < 0)
+        ferr(po, "unable to trace flag setter\n");
+
+      tmp_op = &ops[ret]; // flag setter
+      for (j = 0; j < tmp_op->operand_cnt; j++) {
+        ret = scan_for_mod(&tmp_op->operand[j], tmp_op - ops + 1, i);
+        if (ret >= 0) {
+          ret = 1 << split_cond(po, po->op, &dummy);
+          tmp_op->pfomask |= ret;
+          cmp_result_vars |= ret;
+          po->datap = tmp_op;
+        }
+      }
+    }
+    else if (po->op == OP_CALL)
+    {
       pp = malloc(sizeof(*pp));
       my_assert_not(pp, NULL);
       tmpname = opr_name(&ops[i], 0);
       ret = proto_parse(fhdr, tmpname, pp);
       if (ret)
-        ferr(&ops[i], "proto_parse failed for '%s'\n", tmpname);
+        ferr(po, "proto_parse failed for '%s'\n", tmpname);
 
       for (arg = 0; arg < pp->argc; arg++)
         if (pp->arg[arg].reg == NULL)
           break;
 
       for (j = i - 1; j >= 0 && arg < pp->argc; j--) {
-        if (ops[j].cls == OPC_RMD)
+        if (ops[j].flags & OPF_RMD)
           continue;
         if (ops[j].op != OP_PUSH)
           continue;
+        if (g_labels[j + 1][0] != 0)
+          ferr(po, "arg search interrupted by '%s'\n", g_labels[j + 1]);
 
         pp->arg[arg].datap = &ops[j];
-        ops[j].cls = OPC_RMD;
+        ret = scan_for_mod(&ops[j].operand[0], j + 1, i);
+        if (ret >= 0) {
+          // mark this push as one that needs operand saving
+          ops[j].datap = (void *)(long)(arg + 1);
+          save_arg_vars |= 1 << arg;
+        }
+        else
+          ops[j].flags |= OPF_RMD;
+
+        // next arg
         for (arg++; arg < pp->argc; arg++)
           if (pp->arg[arg].reg == NULL)
             break;
       }
       if (arg < pp->argc)
-        ferr(&ops[i], "arg collect failed for '%s'\n", tmpname);
-      ops[i].datap = pp;
+        ferr(po, "arg collect failed for '%s'\n", tmpname);
+      po->datap = pp;
     }
   }
 
@@ -1126,88 +1268,111 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
     }
   }
 
+  if (save_arg_vars) {
+    for (reg = 0; reg < 32; reg++) {
+      if (save_arg_vars & (1 << reg)) {
+        fprintf(fout, "  u32 s_a%d;\n", reg + 1);
+        had_decl = 1;
+      }
+    }
+  }
+
+  if (cmp_result_vars) {
+    for (i = 0; i < 8; i++) {
+      if (cmp_result_vars & (1 << i)) {
+        fprintf(fout, "  u32 cond_%s;\n", parsed_flag_op_names[i]);
+        had_decl = 1;
+      }
+    }
+  }
+
   if (had_decl)
     fprintf(fout, "\n");
 
   // output ops
-  for (i = 0; i < opcnt; i++) {
+  for (i = 0; i < opcnt; i++)
+  {
     if (g_labels[i][0] != 0)
       fprintf(fout, "\n%s:\n", g_labels[i]);
 
-    if (ops[i].cls == OPC_RMD)
+    po = &ops[i];
+    if (po->flags & OPF_RMD)
       continue;
 
-    po = &ops[i];
     no_output = 0;
 
     #define assert_operand_cnt(n_) \
       if (po->operand_cnt != n_) \
         ferr(po, "operand_cnt is %d/%d\n", po->operand_cnt, n_)
 
-    if (last_arith_dst != NULL && po->operand_cnt > 0
-      && po->operand[0].type == OPT_REG)
-    {
-      if (IS(last_arith_dst->name, po->operand[0].name))
+    // see is delayed flag stuff is still valid
+    if (delayed_flag_op != NULL) {
+      if (po->regmask_dst & delayed_flag_op->regmask_src)
+        delayed_flag_op = NULL;
+      else {
+        for (j = 0; j < po->operand_cnt; j++) {
+          if (is_opr_modified(&delayed_flag_op->operand[0], po))
+            delayed_flag_op = NULL;
+        }
+      }
+    }
+
+    if (last_arith_dst != NULL) {
+      if (is_opr_modified(last_arith_dst, po))
         last_arith_dst = NULL;
     }
 
-    // conditional op?
-    special_sbb = 0;
-    if (po->op == OP_SBB && IS(opr_name(po, 0), opr_name(po, 1)))
-      special_sbb = 1;
-
-    if (po->cls == OPC_JCC || po->cls == OPC_SCC || special_sbb)
+    // conditional/flag using op?
+    if (po->flags & OPF_CC)
     {
-      enum op_op flag_op = po->op;
-      if (special_sbb)
-        flag_op = OP_JC;
+      enum parsed_flag_op pfo;
+      int is_neg = 0;
 
-      if (delayed_op != NULL)
+      pfo = split_cond(po, po->op, &is_neg);
+      special_sbb = 0;
+      if (po->op == OP_SBB && IS(opr_name(po, 0), opr_name(po, 1)))
+        special_sbb = 1;
+
+      // we go through all this trouble to avoid using parsed_flag_op,
+      // which makes generated code much nicer
+      if (delayed_flag_op != NULL)
       {
-        if (delayed_op->op == OP_TEST) {
-          if (IS(opr_name(delayed_op, 0), opr_name(delayed_op, 1))) {
-            out_src_opr(buf3, sizeof(buf3), delayed_op,
-              &delayed_op->operand[0], 0);
-          }
-          else {
-            out_src_opr(buf1, sizeof(buf1), delayed_op,
-              &delayed_op->operand[0], 0);
-            out_src_opr(buf2, sizeof(buf2), delayed_op,
-              &delayed_op->operand[1], 0);
-            snprintf(buf3, sizeof(buf3), "(%s & %s)", buf1, buf2);
-          }
-          out_test_for_cc(buf1, sizeof(buf1), po, flag_op,
-            delayed_op->operand[0].lmod, buf3);
-        }
-        else if (delayed_op->op == OP_CMP) {
-          out_src_opr(buf2, sizeof(buf2), delayed_op,
-            &delayed_op->operand[0], 0);
-          out_src_opr(buf3, sizeof(buf3), delayed_op,
-            &delayed_op->operand[1], 0);
-          out_cmp_for_cc(buf1, sizeof(buf1), po, flag_op,
-            delayed_op->operand[0].lmod, buf2, buf3);
-        }
+        out_cmp_test(buf1, sizeof(buf1), delayed_flag_op, pfo, is_neg);
       }
       else if (last_arith_dst != NULL
-        && (flag_op == OP_JZ || flag_op == OP_JNZ))
+        && (pfo == PFO_Z || pfo == PFO_S || pfo == PFO_P))
       {
         out_src_opr(buf3, sizeof(buf3), po, last_arith_dst, 0);
-        out_test_for_cc(buf1, sizeof(buf1), po, flag_op,
+        out_test_for_cc(buf1, sizeof(buf1), po, pfo, is_neg,
           last_arith_dst->lmod, buf3);
       }
-      else
-        ferr(po, "no delayed_op or last arith result before cond op\n");
+      else if (po->datap != NULL) {
+        // use preprocessed results
+        tmp_op = po->datap;
+        if (!tmp_op || !(tmp_op->pfomask & (1 << pfo)))
+          ferr(po, "not prepared for pfo %d\n", pfo);
+
+        // note: is_neg was not yet applied
+        snprintf(buf1, sizeof(buf1), "(%scond_%s)",
+          is_neg ? "!" : "", parsed_flag_op_names[pfo]);
+      }
+      else {
+        ferr(po, "all methods of finding comparison failed\n");
+      }
  
-      if (po->cls == OPC_JCC) {
+      if (po->flags & OPF_JMP) {
         fprintf(fout, "  if %s\n", buf1);
       }
       else if (special_sbb) {
         out_dst_opr(buf2, sizeof(buf2), po, &po->operand[0]);
         fprintf(fout, "  %s = %s * -1;", buf2, buf1);
       }
-      else {
+      else if (po->flags & OPF_JMP) { // setc
         out_dst_opr(buf2, sizeof(buf2), po, &po->operand[0]);
         fprintf(fout, "  %s = %s;", buf2, buf1);
+      }
+      else {
+        ferr(po, "unhandled conditional op\n");
       }
     }
 
@@ -1276,7 +1441,7 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
             op_to_c(po),
             out_src_opr(buf2, sizeof(buf2), po, &po->operand[1], 0));
         last_arith_dst = &po->operand[0];
-        delayed_op = NULL;
+        delayed_flag_op = NULL;
         break;
 
       case OP_SAR:
@@ -1299,7 +1464,7 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
         fprintf(fout, "  %s = %s%s >> %s;", buf1, buf3, buf1,
             out_src_opr(buf2, sizeof(buf2), po, &po->operand[1], 0));
         last_arith_dst = &po->operand[0];
-        delayed_op = NULL;
+        delayed_flag_op = NULL;
         break;
 
       case OP_SBB:
@@ -1325,7 +1490,7 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
           ferr(po, "invalid dst lmod: %d\n", po->operand[0].lmod);
         }
         last_arith_dst = &po->operand[0];
-        delayed_op = NULL;
+        delayed_flag_op = NULL;
         break;
 
       case OP_IMUL:
@@ -1333,20 +1498,32 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
           goto dualop_arith;
         ferr(po, "TODO imul\n");
         last_arith_dst = &po->operand[0];
-        delayed_op = NULL;
+        delayed_flag_op = NULL;
         break;
 
       case OP_TEST:
       case OP_CMP:
         propagate_lmod(po, &po->operand[0], &po->operand[1]);
-        delayed_op = po;
-        no_output = 1;
+        if (po->pfomask != 0) {
+          for (j = 0; j < 8; j++) {
+            if (po->pfomask & (1 << j)) {
+              out_cmp_test(buf1, sizeof(buf1), po, j, 0);
+              fprintf(fout, "  cond_%s = %s;",
+                parsed_flag_op_names[j], buf1);
+            }
+          }
+        }
+        else
+          no_output = 1;
+        delayed_flag_op = po;
         break;
 
-      // note: we reuse OP_Jcc for SETcc, only cls differs
+      // note: we reuse OP_Jcc for SETcc, only flags differ
       case OP_JO ... OP_JG:
-        if (po->cls == OPC_JCC)
+        if (po->flags & OPF_CC)
           fprintf(fout, "    goto %s;", po->operand[0].name);
+        else
+          ferr(po, "TODO SETcc\n");
         break;
 
       case OP_JMP:
@@ -1377,8 +1554,14 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
           tmp_op = pp->arg[arg].datap;
           if (tmp_op == NULL)
             ferr(po, "parsed_op missing for arg%d\n", arg);
-          fprintf(fout, "%s",
-            out_src_opr(buf1, sizeof(buf1), tmp_op, &tmp_op->operand[0], 0));
+          if (tmp_op->datap) {
+            fprintf(fout, "s_a%ld", (long)tmp_op->datap);
+          }
+          else {
+            fprintf(fout, "%s",
+              out_src_opr(buf1, sizeof(buf1),
+                tmp_op, &tmp_op->operand[0], 0));
+          }
         }
         fprintf(fout, ");");
         break;
@@ -1391,6 +1574,12 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
         break;
 
       case OP_PUSH:
+        if (po->datap) {
+          // special case - saved func arg
+          fprintf(fout, "  s_a%ld = %s;", (long)po->datap,
+            out_src_opr(buf1, sizeof(buf1), po, &po->operand[0], 0));
+          break;
+        }
         ferr(po, "push encountered\n");
         break;
 
@@ -1400,8 +1589,8 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
 
       default:
         no_output = 1;
-        ferr(po, "unhandled op type %d, cls %d\n",
-          po->op, po->cls);
+        ferr(po, "unhandled op type %d, flags %x\n",
+          po->op, po->flags);
         break;
     }
 
