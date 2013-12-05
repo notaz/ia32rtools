@@ -13,10 +13,12 @@
 const char *asmfn;
 static int asmln;
 
+#define anote(fmt, ...) \
+	printf("%s:%d: note: " fmt, asmfn, asmln, ##__VA_ARGS__)
 #define awarn(fmt, ...) \
-	printf("warning:%s:%d: " fmt, asmfn, asmln, ##__VA_ARGS__)
+	printf("%s:%d: warning: " fmt, asmfn, asmln, ##__VA_ARGS__)
 #define aerr(fmt, ...) do { \
-	printf("error:%s:%d: " fmt, asmfn, asmln, ##__VA_ARGS__); \
+	printf("%s:%d: error: " fmt, asmfn, asmln, ##__VA_ARGS__); \
 	exit(1); \
 } while (0)
 
@@ -112,14 +114,15 @@ struct parsed_op {
   int operand_cnt;
   int regmask_src;        // all referensed regs
   int regmask_dst;
-  int pfomask;            // parsed_flag_op that can't be delayed
-  int cc_scratch;         // for storage during analysis
+  int pfomask;            // flagop: parsed_flag_op that can't be delayed
+  int argmask;            // push: args that are altered before call
+  int cc_scratch;         // scratch storage during analysis
   int bt_i;               // branch target (for branches)
+  struct parsed_op *lrl;  // label reference list entry
   void *datap;
 };
 
 // datap:
-// OP_PUSH - arg number if arg is altered before call
 // OP_CALL - ptr to parsed_proto
 // (OPF_CC) - point to corresponding (OPF_FLAGS)
 
@@ -135,6 +138,7 @@ static struct parsed_op ops[MAX_OPS];
 static struct parsed_equ *g_eqs;
 static int g_eqcnt;
 static char g_labels[MAX_OPS][32];
+static struct parsed_op *g_label_refs[MAX_OPS];
 static struct parsed_proto g_func_pp;
 static char g_func[256];
 static char g_comment[256];
@@ -938,9 +942,9 @@ static const char *lmod_cast(struct parsed_op *po,
 }
 
 static enum parsed_flag_op split_cond(struct parsed_op *po,
-  enum op_op op, int *is_neg)
+  enum op_op op, int *is_inv)
 {
-  *is_neg = 0;
+  *is_inv = 0;
 
   switch (op) {
   case OP_JO:
@@ -961,28 +965,28 @@ static enum parsed_flag_op split_cond(struct parsed_op *po,
     return PFO_LE;
 
   case OP_JNO:
-    *is_neg = 1;
+    *is_inv = 1;
     return PFO_O;
   case OP_JNC:
-    *is_neg = 1;
+    *is_inv = 1;
     return PFO_C;
   case OP_JNZ:
-    *is_neg = 1;
+    *is_inv = 1;
     return PFO_Z;
   case OP_JA:
-    *is_neg = 1;
+    *is_inv = 1;
     return PFO_BE;
   case OP_JNS:
-    *is_neg = 1;
+    *is_inv = 1;
     return PFO_S;
   case OP_JNP:
-    *is_neg = 1;
+    *is_inv = 1;
     return PFO_P;
   case OP_JGE:
-    *is_neg = 1;
+    *is_inv = 1;
     return PFO_L;
   case OP_JG:
-    *is_neg = 1;
+    *is_inv = 1;
     return PFO_LE;
 
   case OP_ADC:
@@ -996,7 +1000,7 @@ static enum parsed_flag_op split_cond(struct parsed_op *po,
 }
 
 static void out_test_for_cc(char *buf, size_t buf_size,
-  struct parsed_op *po, enum parsed_flag_op pfo, int is_neg,
+  struct parsed_op *po, enum parsed_flag_op pfo, int is_inv,
   enum opr_lenmod lmod, const char *expr)
 {
   const char *cast, *scast;
@@ -1008,18 +1012,18 @@ static void out_test_for_cc(char *buf, size_t buf_size,
   case PFO_Z:
   case PFO_BE: // CF=1||ZF=1; CF=0
     snprintf(buf, buf_size, "(%s%s %s 0)",
-      cast, expr, is_neg ? "!=" : "==");
+      cast, expr, is_inv ? "!=" : "==");
     break;
 
   case PFO_S:
   case PFO_L: // SF!=OF; OF=0
     snprintf(buf, buf_size, "(%s%s %s 0)",
-      scast, expr, is_neg ? ">=" : "<");
+      scast, expr, is_inv ? ">=" : "<");
     break;
 
   case PFO_LE: // ZF=1||SF!=OF; OF=0
     snprintf(buf, buf_size, "(%s%s %s 0)",
-      scast, expr, is_neg ? ">" : "<=");
+      scast, expr, is_inv ? ">" : "<=");
     break;
 
   default:
@@ -1028,7 +1032,7 @@ static void out_test_for_cc(char *buf, size_t buf_size,
 }
 
 static void out_cmp_for_cc(char *buf, size_t buf_size,
-  struct parsed_op *po, enum parsed_flag_op pfo, int is_neg,
+  struct parsed_op *po, enum parsed_flag_op pfo, int is_inv,
   enum opr_lenmod lmod, const char *expr1, const char *expr2)
 {
   const char *cast, *scast;
@@ -1040,34 +1044,34 @@ static void out_cmp_for_cc(char *buf, size_t buf_size,
   case PFO_C:
     // note: must be unsigned compare
     snprintf(buf, buf_size, "(%s%s %s %s%s)",
-      cast, expr1, is_neg ? ">=" : "<", cast, expr2);
+      cast, expr1, is_inv ? ">=" : "<", cast, expr2);
     break;
 
   case PFO_Z:
     snprintf(buf, buf_size, "(%s%s %s %s%s)",
-      cast, expr1, is_neg ? "!=" : "==", cast, expr2);
+      cast, expr1, is_inv ? "!=" : "==", cast, expr2);
     break;
 
   case PFO_BE: // !a
     // note: must be unsigned compare
     snprintf(buf, buf_size, "(%s%s %s %s%s)",
-      cast, expr1, is_neg ? ">" : "<=", cast, expr2);
+      cast, expr1, is_inv ? ">" : "<=", cast, expr2);
     break;
 
   // note: must be signed compare
   case PFO_S:
     snprintf(buf, buf_size, "(%s(%s - %s) %s 0)",
-      scast, expr1, expr2, is_neg ? ">=" : "<");
+      scast, expr1, expr2, is_inv ? ">=" : "<");
     break;
 
   case PFO_L: // !ge
     snprintf(buf, buf_size, "(%s%s %s %s%s)",
-      scast, expr1, is_neg ? ">=" : "<", scast, expr2);
+      scast, expr1, is_inv ? ">=" : "<", scast, expr2);
     break;
 
   case PFO_LE:
     snprintf(buf, buf_size, "(%s%s %s %s%s)",
-      scast, expr1, is_neg ? ">" : "<=", scast, expr2);
+      scast, expr1, is_inv ? ">" : "<=", scast, expr2);
     break;
 
   default:
@@ -1076,7 +1080,7 @@ static void out_cmp_for_cc(char *buf, size_t buf_size,
 }
 
 static void out_cmp_test(char *buf, size_t buf_size,
-  struct parsed_op *po, enum parsed_flag_op pfo, int is_neg)
+  struct parsed_op *po, enum parsed_flag_op pfo, int is_inv)
 {
   char buf1[256], buf2[256], buf3[256];
 
@@ -1089,13 +1093,13 @@ static void out_cmp_test(char *buf, size_t buf_size,
       out_src_opr(buf2, sizeof(buf2), po, &po->operand[1], 0);
       snprintf(buf3, sizeof(buf3), "(%s & %s)", buf1, buf2);
     }
-    out_test_for_cc(buf, buf_size, po, pfo, is_neg,
+    out_test_for_cc(buf, buf_size, po, pfo, is_inv,
       po->operand[0].lmod, buf3);
   }
   else if (po->op == OP_CMP) {
     out_src_opr(buf2, sizeof(buf2), po, &po->operand[0], 0);
     out_src_opr(buf3, sizeof(buf3), po, &po->operand[1], 0);
-    out_cmp_for_cc(buf, buf_size, po, pfo, is_neg,
+    out_cmp_for_cc(buf, buf_size, po, pfo, is_inv,
       po->operand[0].lmod, buf2, buf3);
   }
   else
@@ -1260,11 +1264,23 @@ static int is_any_opr_modified(const struct parsed_op *po_test,
   return 0;
 }
 
-// scan for po_test operand modification in range given
+// scan for any po_test operand modification in range given
 static int scan_for_mod(struct parsed_op *po_test, int i, int opcnt)
 {
   for (; i < opcnt; i++) {
     if (is_any_opr_modified(po_test, &ops[i]))
+      return i;
+  }
+
+  return -1;
+}
+
+// scan for po_test operand[0] modification in range given
+static int scan_for_mod_opr0(struct parsed_op *po_test,
+  int i, int opcnt)
+{
+  for (; i < opcnt; i++) {
+    if (is_opr_modified(&po_test->operand[0], &ops[i]))
       return i;
   }
 
@@ -1307,14 +1323,16 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
   struct parsed_op *po, *delayed_flag_op = NULL, *tmp_op;
   struct parsed_opr *last_arith_dst = NULL;
   char buf1[256], buf2[256], buf3[256];
-  struct parsed_proto *pp;
+  struct parsed_proto *pp, *pp_tmp;
   const char *tmpname;
+  enum parsed_flag_op pfo;
   int save_arg_vars = 0;
   int cmp_result_vars = 0;
   int need_mul_var = 0;
   int had_decl = 0;
   int regmask_arg = 0;
   int regmask = 0;
+  int pfomask = 0;
   int no_output;
   int dummy;
   int arg;
@@ -1406,6 +1424,8 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
     for (j = 0; j < opcnt; j++) {
       if (g_labels[j][0] && IS(po->operand[0].name, g_labels[j])) {
         po->bt_i = j;
+        po->lrl = g_label_refs[j];
+        g_label_refs[j] = po;
         break;
       }
     }
@@ -1455,11 +1475,24 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
         ferr(po, "unable to trace flag setter\n");
 
       tmp_op = &ops[ret]; // flag setter
-      ret = scan_for_mod(tmp_op, ret + 1, i);
-      if (ret >= 0) {
-        ret = 1 << split_cond(po, po->op, &dummy);
-        tmp_op->pfomask |= ret;
-        cmp_result_vars |= ret;
+      pfo = split_cond(po, po->op, &dummy);
+      pfomask = 0;
+
+      // to get nicer code, we try to delay test and cmp;
+      // if we can't because of operand modification, or if we
+      // have math op, make it calculate flags explicitly
+      if (tmp_op->op == OP_TEST || tmp_op->op == OP_CMP) {
+        if (scan_for_mod(tmp_op, ret + 1, i) >= 0)
+          pfomask = 1 << pfo;
+      }
+      else {
+        if ((pfo != PFO_Z && pfo != PFO_S && pfo != PFO_P)
+            || scan_for_mod_opr0(tmp_op, ret + 1, i) >= 0)
+          pfomask = 1 << pfo;
+      }
+      if (pfomask) {
+        tmp_op->pfomask |= pfomask;
+        cmp_result_vars |= pfomask;
         po->datap = tmp_op;
       }
 
@@ -1480,27 +1513,51 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
           break;
 
       for (j = i - 1; j >= 0 && arg < pp->argc; j--) {
-        if (ops[j].flags & OPF_RMD)
-          continue;
-        if (ops[j].op != OP_PUSH)
-          continue;
-        if (g_labels[j + 1][0] != 0)
-          ferr(po, "arg search interrupted by '%s'\n", g_labels[j + 1]);
-
-        pp->arg[arg].datap = &ops[j];
-        ret = scan_for_mod(&ops[j], j + 1, i);
-        if (ret >= 0) {
-          // mark this push as one that needs operand saving
-          ops[j].datap = (void *)(long)(arg + 1);
-          save_arg_vars |= 1 << arg;
+        if (ops[j].op == OP_CALL) {
+          pp_tmp = ops[j].datap;
+          if (pp_tmp == NULL)
+            ferr(po, "arg collect hit unparsed call\n");
+          if (pp_tmp->argc_stack > 0)
+            ferr(po, "arg collect hit '%s' with %d stack args\n",
+              opr_name(&ops[j], 0), pp_tmp->argc_stack);
         }
-        else
-          ops[j].flags |= OPF_RMD;
+        else if ((ops[j].flags & OPF_TAIL)
+            || (ops[j].flags & (OPF_JMP|OPF_CC)) == OPF_JMP)
+        {
+          break;
+        }
 
-        // next arg
-        for (arg++; arg < pp->argc; arg++)
-          if (pp->arg[arg].reg == NULL)
-            break;
+        if (ops[j].op == OP_PUSH) {
+          pp->arg[arg].datap = &ops[j];
+          ret = scan_for_mod(&ops[j], j + 1, i);
+          if (ret >= 0) {
+            // mark this push as one that needs operand saving
+            ops[j].argmask |= 1 << arg;
+            save_arg_vars |= 1 << arg;
+          }
+          else
+            ops[j].flags |= OPF_RMD;
+
+          // next arg
+          for (arg++; arg < pp->argc; arg++)
+            if (pp->arg[arg].reg == NULL)
+              break;
+        }
+
+        if (g_labels[j][0] != 0) {
+          if (j > 0 && ((ops[j - 1].flags & OPF_TAIL)
+            || (ops[j - 1].flags & (OPF_JMP|OPF_CC)) == OPF_JMP))
+          {
+            // follow the branch in reverse
+            if (g_label_refs[j] == NULL)
+              ferr(po, "no refs for '%s'?\n", g_labels[j]);
+            if (g_label_refs[j]->lrl != NULL)
+              ferr(po, "unhandled multiple fefs to '%s'\n", g_labels[j]);
+            j = (g_label_refs[j] - ops) + 1;
+            continue;
+          }
+          break;
+        }
       }
       if (arg < pp->argc)
         ferr(po, "arg collect failed for '%s'\n", tmpname);
@@ -1518,7 +1575,7 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
     fprintf(fout, "  union { u32 d[%d]; u16 w[%d]; u8 b[%d]; } sf;\n",
       (g_bp_stack + 3) / 4, (g_bp_stack + 1) / 2, g_bp_stack);
 
-  // instantiate arg-registers
+  // declare arg-registers
   for (i = 0; i < g_func_pp.argc; i++) {
     if (g_func_pp.arg[i].reg != NULL) {
       reg = char_array_i(regs_r32,
@@ -1533,7 +1590,7 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
     }
   }
 
-  // instantiate other regs - special case for eax
+  // declare other regs - special case for eax
   if (!((regmask | regmask_arg) & 1) && !IS(g_func_pp.ret_type, "void")) {
     fprintf(fout, "  u32 eax = 0;\n");
     had_decl = 1;
@@ -1596,23 +1653,25 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
     // conditional/flag using op?
     if (po->flags & OPF_CC)
     {
-      enum parsed_flag_op pfo;
-      int is_neg = 0;
+      int is_delayed = 0;
+      int is_inv = 0;
 
-      pfo = split_cond(po, po->op, &is_neg);
+      pfo = split_cond(po, po->op, &is_inv);
 
       // we go through all this trouble to avoid using parsed_flag_op,
       // which makes generated code much nicer
       if (delayed_flag_op != NULL)
       {
-        out_cmp_test(buf1, sizeof(buf1), delayed_flag_op, pfo, is_neg);
+        out_cmp_test(buf1, sizeof(buf1), delayed_flag_op, pfo, is_inv);
+        is_delayed = 1;
       }
       else if (last_arith_dst != NULL
         && (pfo == PFO_Z || pfo == PFO_S || pfo == PFO_P))
       {
         out_src_opr(buf3, sizeof(buf3), po, last_arith_dst, 0);
-        out_test_for_cc(buf1, sizeof(buf1), po, pfo, is_neg,
+        out_test_for_cc(buf1, sizeof(buf1), po, pfo, is_inv,
           last_arith_dst->lmod, buf3);
+        is_delayed = 1;
       }
       else if (po->datap != NULL) {
         // use preprocessed results
@@ -1620,9 +1679,9 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
         if (!tmp_op || !(tmp_op->pfomask & (1 << pfo)))
           ferr(po, "not prepared for pfo %d\n", pfo);
 
-        // note: is_neg was not yet applied
+        // note: is_inv was not yet applied
         snprintf(buf1, sizeof(buf1), "(%scond_%s)",
-          is_neg ? "!" : "", parsed_flag_op_names[pfo]);
+          is_inv ? "!" : "", parsed_flag_op_names[pfo]);
       }
       else {
         ferr(po, "all methods of finding comparison failed\n");
@@ -1632,7 +1691,9 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
         fprintf(fout, "  if %s\n", buf1);
       }
       else if (po->op == OP_ADC || po->op == OP_SBB) {
-        fprintf(fout, "  cond_%s = %s;\n", parsed_flag_op_names[pfo], buf1);
+        if (is_delayed)
+          fprintf(fout, "  cond_%s = %s;\n",
+            parsed_flag_op_names[pfo], buf1);
       }
       else if (po->flags & OPF_DATA) { // SETcc
         out_dst_opr(buf2, sizeof(buf2), po, &po->operand[0]);
@@ -1642,6 +1703,8 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
         ferr(po, "unhandled conditional op\n");
       }
     }
+
+    pfomask = po->pfomask;
 
     switch (po->op)
     {
@@ -1770,6 +1833,10 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
           lmod_cast_s(po, po->operand[0].lmod), buf2);
         last_arith_dst = &po->operand[0];
         delayed_flag_op = NULL;
+        if (pfomask & (1 << PFO_C)) {
+          fprintf(fout, "\n  cond_c = (%s != 0);", buf1);
+          pfomask &= ~(1 << PFO_C);
+        }
         break;
 
       case OP_IMUL:
@@ -1812,14 +1879,15 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
       case OP_TEST:
       case OP_CMP:
         propagate_lmod(po, &po->operand[0], &po->operand[1]);
-        if (po->pfomask != 0) {
+        if (pfomask != 0) {
           for (j = 0; j < 8; j++) {
-            if (po->pfomask & (1 << j)) {
+            if (pfomask & (1 << j)) {
               out_cmp_test(buf1, sizeof(buf1), po, j, 0);
               fprintf(fout, "  cond_%s = %s;",
                 parsed_flag_op_names[j], buf1);
             }
           }
+          pfomask = 0;
         }
         else
           no_output = 1;
@@ -1877,8 +1945,8 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
           tmp_op = pp->arg[arg].datap;
           if (tmp_op == NULL)
             ferr(po, "parsed_op missing for arg%d\n", arg);
-          if (tmp_op->datap) {
-            fprintf(fout, "s_a%ld", (long)tmp_op->datap);
+          if (tmp_op->argmask) {
+            fprintf(fout, "s_a%d", arg + 1);
           }
           else {
             fprintf(fout, "%s",
@@ -1905,10 +1973,14 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
         break;
 
       case OP_PUSH:
-        if (po->datap) {
+        if (po->argmask) {
           // special case - saved func arg
-          fprintf(fout, "  s_a%ld = %s;", (long)po->datap,
-            out_src_opr(buf1, sizeof(buf1), po, &po->operand[0], 0));
+          for (j = 0; j < 32; j++) {
+            if (po->argmask & (1 << j)) {
+              fprintf(fout, "  s_a%d = %s;", j + 1,
+                  out_src_opr(buf1, sizeof(buf1), po, &po->operand[0], 0));
+            }
+          }
           break;
         }
         ferr(po, "push encountered\n");
@@ -1932,6 +2004,9 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
     }
     if (!no_output)
       fprintf(fout, "\n");
+
+    if (pfomask != 0)
+        ferr(po, "missed flag calc, pfomask=%x\n", pfomask);
 
     // see is delayed flag stuff is still valid
     if (delayed_flag_op != NULL && delayed_flag_op != po) {
@@ -1966,6 +2041,7 @@ int main(int argc, char *argv[])
   char line[256];
   char words[16][256];
   int in_func = 0;
+  int skip_warned = 0;
   int eq_alloc;
   int pi = 0;
   int len;
@@ -2042,10 +2118,12 @@ int main(int argc, char *argv[])
           words[0], g_func);
       gen_func(fout, fhdr, g_func, pi);
       in_func = 0;
+      skip_warned = 0;
       g_func[0] = 0;
       if (pi != 0) {
         memset(&ops, 0, pi * sizeof(ops[0]));
         memset(g_labels, 0, pi * sizeof(g_labels[0]));
+        memset(g_label_refs, 0, pi * sizeof(g_label_refs[0]));
         pi = 0;
       }
       g_eqcnt = 0;
@@ -2097,10 +2175,17 @@ int main(int argc, char *argv[])
       continue;
     }
 
+    if (!in_func) {
+      if (!skip_warned && g_labels[pi][0] != 0) {
+        anote("skipping from '%s'\n", g_labels[pi]);
+        skip_warned = 1;
+      }
+      g_labels[pi][0] = 0;
+      continue;
+    }
+
     parse_op(&ops[pi], words, wordc);
     pi++;
-
-    (void)proto_parse;
   }
 
   fclose(fout);
