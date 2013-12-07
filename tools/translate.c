@@ -412,7 +412,9 @@ static int parse_operand(struct parsed_opr *opr,
       aerr("[] parse failure\n");
 
     parse_indmode(opr->name, regmask_indirect, 1);
-    if (opr->lmod == OPLM_UNSPEC && !strncmp(opr->name, "ebp+", 4)) {
+    if (opr->lmod == OPLM_UNSPEC && !strncmp(opr->name, "ebp+", 4)
+        && !('0' <= opr->name[4] && opr->name[4] <= '9'))
+    {
       // might be an equ
       struct parsed_equ *eq = equ_find(NULL, opr->name + 4);
       if (eq)
@@ -565,7 +567,7 @@ static const struct {
 
 static void parse_op(struct parsed_op *op, char words[16][256], int wordc)
 {
-  enum opr_lenmod lmod;
+  enum opr_lenmod lmod = OPLM_UNSPEC;
   int prefix_flags = 0;
   int regmask_ind;
   int regmask;
@@ -847,7 +849,9 @@ static char *out_src_opr(char *buf, size_t buf_size,
     break;
 
   case OPT_REGMEM:
-    if (g_bp_frame && !strncmp(popr->name, "ebp+", 4)) {
+    if (g_bp_frame && !strncmp(popr->name, "ebp+", 4)
+        && !('0' <= popr->name[4] && popr->name[4] <= '9'))
+    {
       bg_frame_access(po, popr->lmod, buf, buf_size,
         popr->name + 4, 1, is_lea);
       break;
@@ -937,13 +941,19 @@ static char *out_dst_opr(char *buf, size_t buf_size,
     break;
 
   case OPT_REGMEM:
-    if (g_bp_frame && !strncmp(popr->name, "ebp+", 4)) {
+    if (g_bp_frame && !strncmp(popr->name, "ebp+", 4)
+        && !('0' <= popr->name[4] && popr->name[4] <= '9'))
+    {
       bg_frame_access(po, popr->lmod, buf, buf_size,
         popr->name + 4, 0, 0);
       break;
     }
 
     return out_src_opr(buf, buf_size, po, popr, 0);
+
+  case OPT_LABEL:
+    snprintf(buf, buf_size, "%s", popr->name);
+    break;
 
   default:
     ferr(po, "invalid dst type: %d\n", popr->type);
@@ -2122,34 +2132,107 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
   proto_release(&g_func_pp);
 }
 
+// '=' needs special treatment..
+static char *next_word_s(char *w, size_t wsize, char *s)
+{
+	size_t i;
+
+	s = sskip(s);
+
+	for (i = 0; i < wsize - 1; i++) {
+		if (s[i] == 0 || my_isblank(s[i]) || (s[i] == '=' && i > 0))
+			break;
+		w[i] = s[i];
+	}
+	w[i] = 0;
+
+	if (s[i] != 0 && !my_isblank(s[i]) && s[i] != '=')
+		printf("warning: '%s' truncated\n", w);
+
+	return s + i;
+}
+
+static int cmpstringp(const void *p1, const void *p2)
+{
+  return strcmp(*(char * const *)p1, *(char * const *)p2);
+}
+
 int main(int argc, char *argv[])
 {
-  FILE *fout, *fasm, *fhdr;
+  FILE *fout, *fasm, *fhdr, *frlist;
   char line[256];
   char words[16][256];
   int in_func = 0;
+  int skip_func = 0;
   int skip_warned = 0;
   int eq_alloc;
+  char **rlist = NULL;
+  int rlist_len = 0;
+  int rlist_alloc = 0;
+  int verbose = 0;
+  int arg_out;
+  int arg = 1;
   int pi = 0;
   int len;
   char *p;
   int wordc;
 
-  if (argc != 4) {
-    printf("usage:\n%s <.c> <.asm> <hdrf>\n",
+  if (argv[1] && IS(argv[1], "-v")) {
+    verbose = 1;
+    arg++;
+  }
+
+  if (argc < arg + 3) {
+    printf("usage:\n%s [-v] <.c> <.asm> <hdrf> [rlist]*\n",
       argv[0]);
     return 1;
   }
 
-  hdrfn = argv[3];
-  fhdr = fopen(hdrfn, "r");
-  my_assert_not(fhdr, NULL);
+  arg_out = arg++;
 
-  asmfn = argv[2];
+  asmfn = argv[arg++];
   fasm = fopen(asmfn, "r");
   my_assert_not(fasm, NULL);
 
-  fout = fopen(argv[1], "w");
+  hdrfn = argv[arg++];
+  fhdr = fopen(hdrfn, "r");
+  my_assert_not(fhdr, NULL);
+
+  rlist_alloc = 64;
+  rlist = malloc(rlist_alloc * sizeof(rlist[0]));
+  my_assert_not(rlist, NULL);
+  // needs special handling..
+  rlist[rlist_len++] = "__alloca_probe";
+
+  for (; arg < argc; arg++) {
+    frlist = fopen(argv[arg], "r");
+    my_assert_not(frlist, NULL);
+
+    while (fgets(line, sizeof(line), frlist)) {
+      p = sskip(line);
+      if (*p == 0 || *p == ';' || *p == '#')
+        continue;
+
+      p = next_word(words[0], sizeof(words[0]), p);
+      if (words[0][0] == 0)
+        continue;
+
+      if (rlist_len >= rlist_alloc) {
+        rlist_alloc = rlist_alloc * 2 + 64;
+        rlist = realloc(rlist, rlist_alloc * sizeof(rlist[0]));
+        my_assert_not(rlist, NULL);
+      }
+      rlist[rlist_len++] = strdup(words[0]);
+    }
+
+    fclose(frlist);
+    frlist = NULL;
+  }
+
+  if (rlist_len > 0)
+    qsort(rlist, rlist_len, sizeof(rlist[0]), cmpstringp);
+
+  fout = fopen(argv[arg_out], "w");
   my_assert_not(fout, NULL);
 
   eq_alloc = 128;
@@ -2166,7 +2249,7 @@ int main(int argc, char *argv[])
 
     memset(words, 0, sizeof(words));
     for (wordc = 0; wordc < 16; wordc++) {
-      p = sskip(next_word(words[wordc], sizeof(words[0]), p));
+      p = sskip(next_word_s(words[wordc], sizeof(words[0]), p));
       if (*p == 0 || *p == ';') {
         wordc++;
         break;
@@ -2192,6 +2275,9 @@ int main(int argc, char *argv[])
       if (in_func)
         aerr("proc '%s' while in_func '%s'?\n",
           words[0], g_func);
+      p = words[0];
+      if (bsearch(&p, rlist, rlist_len, sizeof(rlist[0]), cmpstringp))
+        skip_func = 1;
       strcpy(g_func, words[0]);
       in_func = 1;
       continue;
@@ -2203,9 +2289,13 @@ int main(int argc, char *argv[])
       if (!IS(g_func, words[0]))
         aerr("endp '%s' while in_func '%s'?\n",
           words[0], g_func);
-      gen_func(fout, fhdr, g_func, pi);
+
+      if (in_func && !skip_func)
+        gen_func(fout, fhdr, g_func, pi);
+
       in_func = 0;
       skip_warned = 0;
+      skip_func = 0;
       g_func[0] = 0;
       if (pi != 0) {
         memset(&ops, 0, pi * sizeof(ops[0]));
@@ -2214,6 +2304,28 @@ int main(int argc, char *argv[])
         pi = 0;
       }
       g_eqcnt = 0;
+      continue;
+    }
+
+    p = strchr(words[0], ':');
+    if (p != NULL) {
+      len = p - words[0];
+      if (len > sizeof(g_labels[0]) - 1)
+        aerr("label too long: %d\n", len);
+      if (g_labels[pi][0] != 0)
+        aerr("dupe label?\n");
+      memcpy(g_labels[pi], words[0], len);
+      g_labels[pi][len] = 0;
+      continue;
+    }
+
+    if (!in_func || skip_func) {
+      if (!skip_warned && !skip_func && g_labels[pi][0] != 0) {
+        if (verbose)
+          anote("skipping from '%s'\n", g_labels[pi]);
+        skip_warned = 1;
+      }
+      g_labels[pi][0] = 0;
       continue;
     }
 
@@ -2249,27 +2361,6 @@ int main(int argc, char *argv[])
 
     if (pi >= ARRAY_SIZE(ops))
       aerr("too many ops\n");
-
-    p = strchr(words[0], ':');
-    if (p != NULL) {
-      len = p - words[0];
-      if (len > sizeof(g_labels[0]) - 1)
-        aerr("label too long: %d\n", len);
-      if (g_labels[pi][0] != 0)
-        aerr("dupe label?\n");
-      memcpy(g_labels[pi], words[0], len);
-      g_labels[pi][len] = 0;
-      continue;
-    }
-
-    if (!in_func) {
-      if (!skip_warned && g_labels[pi][0] != 0) {
-        anote("skipping from '%s'\n", g_labels[pi]);
-        skip_warned = 1;
-      }
-      g_labels[pi][0] = 0;
-      continue;
-    }
 
     parse_op(&ops[pi], words, wordc);
     pi++;
