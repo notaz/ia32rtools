@@ -32,6 +32,7 @@ enum op_flags {
   OPF_CC     = (1 << 4), /* uses flags */
   OPF_TAIL   = (1 << 5), /* ret or tail call */
   OPF_REP    = (1 << 6), /* prefixed by rep */
+  OPF_RSAVE  = (1 << 7), /* push/pop is local reg save/load */
 };
 
 enum op_op {
@@ -46,6 +47,7 @@ enum op_op {
 	OP_NOT,
 	OP_CDQ,
 	OP_STOS,
+	OP_MOVS,
 	OP_RET,
 	OP_ADD,
 	OP_SUB,
@@ -55,6 +57,8 @@ enum op_op {
 	OP_SHL,
 	OP_SHR,
 	OP_SAR,
+	OP_ROL,
+	OP_ROR,
 	OP_ADC,
 	OP_SBB,
 	OP_INC,
@@ -312,6 +316,42 @@ pass:
   return c;
 }
 
+static const char *parse_stack_el(const char *name)
+{
+  const char *p;
+  char buf[32];
+  int len;
+
+  if (!strncmp(name, "ebp+", 4)
+      && !('0' <= name[4] && name[4] <= '9'))
+  {
+    return name + 4;
+  }
+  if (strncmp(name, "esp+", 4) != 0)
+    return NULL;
+
+  p = strchr(name + 4, '+');
+  if (p) {
+    // must be a number after esp+
+    if (!('0' <= name[4] && name[4] <= '9'))
+      return NULL;
+    len = p - (name + 4);
+    if (len < sizeof(buf) - 1) {
+      strncpy(buf, name + 4, len);
+      buf[len] = 0;
+      parse_number(buf);
+    }
+    p++;
+  }
+  else
+    p = name + 4;
+
+  if ('0' <= *p && *p <= '9')
+    return NULL;
+
+  return p;
+}
+
 static int guess_lmod_from_name(struct parsed_opr *opr)
 {
   if (!strncmp(opr->name, "dword_", 6)) {
@@ -412,11 +452,10 @@ static int parse_operand(struct parsed_opr *opr,
       aerr("[] parse failure\n");
 
     parse_indmode(opr->name, regmask_indirect, 1);
-    if (opr->lmod == OPLM_UNSPEC && !strncmp(opr->name, "ebp+", 4)
-        && !('0' <= opr->name[4] && opr->name[4] <= '9'))
-    {
+    if (opr->lmod == OPLM_UNSPEC && parse_stack_el(opr->name)) {
       // might be an equ
-      struct parsed_equ *eq = equ_find(NULL, opr->name + 4);
+      struct parsed_equ *eq =
+        equ_find(NULL, parse_stack_el(opr->name));
       if (eq)
         opr->lmod = eq->lmod;
     }
@@ -483,6 +522,9 @@ static const struct {
   { "stosb",OP_STOS,   0, 0, OPF_DATA },
   { "stosw",OP_STOS,   0, 0, OPF_DATA },
   { "stosd",OP_STOS,   0, 0, OPF_DATA },
+  { "movsb",OP_MOVS,   0, 0, OPF_DATA },
+  { "movsw",OP_MOVS,   0, 0, OPF_DATA },
+  { "movsd",OP_MOVS,   0, 0, OPF_DATA },
   { "add",  OP_ADD,    2, 2, OPF_DATA|OPF_FLAGS },
   { "sub",  OP_SUB,    2, 2, OPF_DATA|OPF_FLAGS },
   { "and",  OP_AND,    2, 2, OPF_DATA|OPF_FLAGS },
@@ -492,6 +534,8 @@ static const struct {
   { "shr",  OP_SHR,    2, 2, OPF_DATA|OPF_FLAGS },
   { "sal",  OP_SHL,    2, 2, OPF_DATA|OPF_FLAGS },
   { "sar",  OP_SAR,    2, 2, OPF_DATA|OPF_FLAGS },
+  { "rol",  OP_ROL,    2, 2, OPF_DATA|OPF_FLAGS },
+  { "ror",  OP_ROR,    2, 2, OPF_DATA|OPF_FLAGS },
   { "adc",  OP_ADC,    2, 2, OPF_DATA|OPF_FLAGS|OPF_CC },
   { "sbb",  OP_SBB,    2, 2, OPF_DATA|OPF_FLAGS|OPF_CC },
   { "inc",  OP_INC,    1, 1, OPF_DATA|OPF_FLAGS },
@@ -647,9 +691,26 @@ static void parse_op(struct parsed_op *op, char words[16][256], int wordc)
     else if (IS(words[op_w], "stosd"))
       lmod = OPLM_DWORD;
     op->operand_cnt = 3;
-    setup_reg_opr(&op->operand[0], xDI, lmod, &op->regmask_dst);
-    setup_reg_opr(&op->operand[1], xCX, OPLM_DWORD, &op->regmask_dst);
+    setup_reg_opr(&op->operand[0], xDI, lmod, &op->regmask_src);
+    setup_reg_opr(&op->operand[1], xCX, OPLM_DWORD, &op->regmask_src);
+    op->regmask_dst = op->regmask_src;
     setup_reg_opr(&op->operand[2], xAX, OPLM_DWORD, &op->regmask_src);
+    break;
+
+  case OP_MOVS:
+    if (op->operand_cnt != 0)
+      break;
+    if      (IS(words[op_w], "movsb"))
+      lmod = OPLM_BYTE;
+    else if (IS(words[op_w], "movsw"))
+      lmod = OPLM_WORD;
+    else if (IS(words[op_w], "movsd"))
+      lmod = OPLM_DWORD;
+    op->operand_cnt = 3;
+    setup_reg_opr(&op->operand[0], xDI, lmod, &op->regmask_src);
+    setup_reg_opr(&op->operand[1], xSI, OPLM_DWORD, &op->regmask_src);
+    setup_reg_opr(&op->operand[2], xCX, OPLM_DWORD, &op->regmask_src);
+    op->regmask_dst = op->regmask_src;
     break;
 
   case OP_IMUL:
@@ -678,6 +739,8 @@ static void parse_op(struct parsed_op *op, char words[16][256], int wordc)
   case OP_SHL:
   case OP_SHR:
   case OP_SAR:
+  case OP_ROL:
+  case OP_ROR:
     if (op->operand[1].lmod == OPLM_UNSPEC)
       op->operand[1].lmod = OPLM_BYTE;
     break;
@@ -716,6 +779,77 @@ static const char *dump_op(struct parsed_op *po)
   }
 
   return out;
+}
+
+static const char *lmod_cast_u(struct parsed_op *po,
+  enum opr_lenmod lmod)
+{
+  switch (lmod) {
+  case OPLM_DWORD:
+    return "";
+  case OPLM_WORD:
+    return "(u16)";
+  case OPLM_BYTE:
+    return "(u8)";
+  default:
+    ferr(po, "invalid lmod: %d\n", lmod);
+    return "(_invalid_)";
+  }
+}
+
+static const char *lmod_cast_u_ptr(struct parsed_op *po,
+  enum opr_lenmod lmod)
+{
+  switch (lmod) {
+  case OPLM_DWORD:
+    return "*(u32 *)";
+  case OPLM_WORD:
+    return "*(u16 *)";
+  case OPLM_BYTE:
+    return "*(u8 *)";
+  default:
+    ferr(po, "invalid lmod: %d\n", lmod);
+    return "(_invalid_)";
+  }
+}
+
+static const char *lmod_cast_s(struct parsed_op *po,
+  enum opr_lenmod lmod)
+{
+  switch (lmod) {
+  case OPLM_DWORD:
+    return "(s32)";
+  case OPLM_WORD:
+    return "(s16)";
+  case OPLM_BYTE:
+    return "(s8)";
+  default:
+    ferr(po, "%s: invalid lmod: %d\n", __func__, lmod);
+    return "(_invalid_)";
+  }
+}
+
+static const char *lmod_cast(struct parsed_op *po,
+  enum opr_lenmod lmod, int is_signed)
+{
+  return is_signed ?
+    lmod_cast_s(po, lmod) :
+    lmod_cast_u(po, lmod);
+}
+
+static int lmod_bytes(struct parsed_op *po, enum opr_lenmod lmod)
+{
+  switch (lmod) {
+  case OPLM_DWORD:
+    return 4;
+  case OPLM_WORD:
+    return 2;
+  case OPLM_BYTE:
+    return 1;
+  default:
+    ferr(po, "%s: invalid lmod: %d\n", __func__, lmod);
+    return 0;
+  }
 }
 
 static const char *opr_name(struct parsed_op *po, int opr_num)
@@ -758,20 +892,30 @@ static struct parsed_equ *equ_find(struct parsed_op *po, const char *name)
 }
 
 static void bg_frame_access(struct parsed_op *po, enum opr_lenmod lmod,
-  char *buf, size_t buf_size, const char *bp_arg,
+  char *buf, size_t buf_size, const char *name,
   int is_src, int is_lea)
 {
   const char *prefix = "";
   struct parsed_equ *eq;
   int i, arg_i, arg_s;
+  const char *bp_arg;
+  int stack_ra = 0;
   int sf_ofs;
 
+  bp_arg = parse_stack_el(name);
   snprintf(g_comment, sizeof(g_comment), "%s", bp_arg);
-
   eq = equ_find(po, bp_arg);
+  if (eq == NULL)
+    ferr(po, "detected but missing eq\n");
 
-  if (eq->offset >= 0) {
-    arg_i = eq->offset / 4 - 2;
+  if (!strncmp(name, "ebp", 3))
+    stack_ra = 4;
+
+  if (stack_ra <= eq->offset && eq->offset < stack_ra + 4)
+    ferr(po, "reference to ra? %d %d\n", eq->offset, stack_ra);
+
+  if (eq->offset > stack_ra) {
+    arg_i = (eq->offset - stack_ra - 4) / 4;
     if (arg_i < 0 || arg_i >= g_func_pp.argc_stack)
       ferr(po, "offset %d doesn't map to any arg\n", eq->offset);
 
@@ -820,7 +964,6 @@ static void bg_frame_access(struct parsed_op *po, enum opr_lenmod lmod,
 static char *out_src_opr(char *buf, size_t buf_size,
 	struct parsed_op *po, struct parsed_opr *popr, int is_lea)
 {
-  const char *cast = "";
   char tmp1[256], tmp2[256];
   char expr[256];
   int ret;
@@ -849,11 +992,9 @@ static char *out_src_opr(char *buf, size_t buf_size,
     break;
 
   case OPT_REGMEM:
-    if (g_bp_frame && !strncmp(popr->name, "ebp+", 4)
-        && !('0' <= popr->name[4] && popr->name[4] <= '9'))
-    {
+    if (parse_stack_el(popr->name)) {
       bg_frame_access(po, popr->lmod, buf, buf_size,
-        popr->name + 4, 1, is_lea);
+        popr->name, 1, is_lea);
       break;
     }
 
@@ -872,20 +1013,8 @@ static char *out_src_opr(char *buf, size_t buf_size,
       break;
     }
 
-    switch (popr->lmod) {
-    case OPLM_DWORD:
-      cast = "*(u32 *)";
-      break;
-    case OPLM_WORD:
-      cast = "*(u16 *)";
-      break;
-    case OPLM_BYTE:
-      cast = "*(u8 *)";
-      break;
-    default:
-      ferr(po, "invalid lmod: %d\n", popr->lmod);
-    }
-    snprintf(buf, buf_size, "%s(%s)", cast, expr);
+    snprintf(buf, buf_size, "%s(%s)",
+      lmod_cast_u_ptr(po, popr->lmod), expr);
     break;
 
   case OPT_LABEL:
@@ -941,11 +1070,9 @@ static char *out_dst_opr(char *buf, size_t buf_size,
     break;
 
   case OPT_REGMEM:
-    if (g_bp_frame && !strncmp(popr->name, "ebp+", 4)
-        && !('0' <= popr->name[4] && popr->name[4] <= '9'))
-    {
+    if (parse_stack_el(popr->name)) {
       bg_frame_access(po, popr->lmod, buf, buf_size,
-        popr->name + 4, 0, 0);
+        popr->name, 0, 0);
       break;
     }
 
@@ -960,61 +1087,6 @@ static char *out_dst_opr(char *buf, size_t buf_size,
   }
 
   return buf;
-}
-
-static const char *lmod_cast_u(struct parsed_op *po,
-  enum opr_lenmod lmod)
-{
-  switch (lmod) {
-  case OPLM_DWORD:
-    return "";
-  case OPLM_WORD:
-    return "(u16)";
-  case OPLM_BYTE:
-    return "(u8)";
-  default:
-    ferr(po, "invalid lmod: %d\n", lmod);
-    return "(_invalid_)";
-  }
-}
-
-static const char *lmod_cast_s(struct parsed_op *po,
-  enum opr_lenmod lmod)
-{
-  switch (lmod) {
-  case OPLM_DWORD:
-    return "(s32)";
-  case OPLM_WORD:
-    return "(s16)";
-  case OPLM_BYTE:
-    return "(s8)";
-  default:
-    ferr(po, "%s: invalid lmod: %d\n", __func__, lmod);
-    return "(_invalid_)";
-  }
-}
-
-static const char *lmod_cast(struct parsed_op *po,
-  enum opr_lenmod lmod, int is_signed)
-{
-  return is_signed ?
-    lmod_cast_s(po, lmod) :
-    lmod_cast_u(po, lmod);
-}
-
-static int lmod_bytes(struct parsed_op *po, enum opr_lenmod lmod)
-{
-  switch (lmod) {
-  case OPLM_DWORD:
-    return 4;
-  case OPLM_WORD:
-    return 2;
-  case OPLM_BYTE:
-    return 1;
-  default:
-    ferr(po, "%s: invalid lmod: %d\n", __func__, lmod);
-    return 0;
-  }
 }
 
 static enum parsed_flag_op split_cond(struct parsed_op *po,
@@ -1224,8 +1296,19 @@ static const char *op_to_c(struct parsed_op *po)
   }
 }
 
+static void set_flag_no_dup(struct parsed_op *po, enum op_flags flag,
+  enum op_flags flag_check)
+{
+  if (po->flags & flag)
+    ferr(po, "flag %x already set\n", flag);
+  if (po->flags & flag_check)
+    ferr(po, "flag_check %x already set\n", flag_check);
+
+  po->flags |= flag;
+}
+
 static int scan_for_pop(int i, int opcnt, const char *reg,
-  int magic, int do_patch)
+  int magic, int depth, int *maxdepth, int do_flags)
 {
   struct parsed_op *po;
   int ret = 0;
@@ -1249,7 +1332,8 @@ static int scan_for_pop(int i, int opcnt, const char *reg,
       }
 
       if (po->flags & OPF_CC) {
-        ret |= scan_for_pop(po->bt_i, opcnt, reg, magic, do_patch);
+        ret |= scan_for_pop(po->bt_i, opcnt, reg, magic,
+                 depth, maxdepth, do_flags);
         if (ret < 0)
           return ret; // dead end
       }
@@ -1259,12 +1343,29 @@ static int scan_for_pop(int i, int opcnt, const char *reg,
       continue;
     }
 
-    if (po->op == OP_POP && po->operand[0].type == OPT_REG
+    if ((po->op == OP_POP || po->op == OP_PUSH)
+        && po->operand[0].type == OPT_REG
         && IS(po->operand[0].name, reg))
     {
-      if (do_patch)
-        po->flags |= OPF_RMD;
-      return 1;
+      if (po->op == OP_PUSH) {
+        depth++;
+        if (depth > *maxdepth)
+          *maxdepth = depth;
+        if (do_flags)
+          set_flag_no_dup(po, OPF_RSAVE, OPF_RMD);
+      }
+      else if (depth == 0) {
+        if (do_flags)
+          set_flag_no_dup(po, OPF_RMD, OPF_RSAVE);
+        return 1;
+      }
+      else {
+        depth--;
+        if (depth < 0) // should not happen
+          ferr(po, "fail with depth\n");
+        if (do_flags)
+          set_flag_no_dup(po, OPF_RSAVE, OPF_RMD);
+      }
     }
   }
 
@@ -1272,7 +1373,8 @@ static int scan_for_pop(int i, int opcnt, const char *reg,
 }
 
 // scan for pop starting from 'ret' op (all paths)
-static int scan_for_pop_ret(int i, int opcnt, const char *reg, int do_patch)
+static int scan_for_pop_ret(int i, int opcnt, const char *reg,
+  int flag_set)
 {
   int found = 0;
   int j;
@@ -1291,8 +1393,7 @@ static int scan_for_pop_ret(int i, int opcnt, const char *reg, int do_patch)
           && IS(ops[j].operand[0].name, reg))
       {
         found = 1;
-        if (do_patch)
-          ops[j].flags |= OPF_RMD;
+        ops[j].flags |= flag_set;
         break;
       }
 
@@ -1406,9 +1507,11 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
   int cmp_result_vars = 0;
   int need_mul_var = 0;
   int had_decl = 0;
+  int regmask_save = 0;
   int regmask_arg = 0;
   int regmask = 0;
   int pfomask = 0;
+  int depth = 0;
   int no_output;
   int dummy;
   int arg;
@@ -1514,70 +1617,13 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
   }
 
   // pass3:
-  // - find POPs for PUSHes, rm both
-  // - scan for all used registers
-  // - find flag set ops for their users
   // - process calls
   for (i = 0; i < opcnt; i++) {
     po = &ops[i];
     if (po->flags & OPF_RMD)
       continue;
 
-    if (po->op == OP_PUSH && po->operand[0].type == OPT_REG) {
-      if (po->operand[0].reg < 0)
-        ferr(po, "reg not set for push?\n");
-      if (!(regmask & (1 << po->operand[0].reg))) { // reg save
-        ret = scan_for_pop(i + 1, opcnt,
-                po->operand[0].name, i + opcnt, 0);
-        if (ret == 1) {
-          po->flags |= OPF_RMD;
-          scan_for_pop(i + 1, opcnt, po->operand[0].name,
-            i + opcnt * 2, 1);
-          continue;
-        }
-        ret = scan_for_pop_ret(i + 1, opcnt, po->operand[0].name, 0);
-        if (ret == 0) {
-          po->flags |= OPF_RMD;
-          scan_for_pop_ret(i + 1, opcnt, po->operand[0].name, 1);
-          continue;
-        }
-      }
-    }
-
-    regmask |= po->regmask_src | po->regmask_dst;
-
-    if (po->flags & OPF_CC)
-    {
-      ret = scan_for_flag_set(i - 1);
-      if (ret < 0)
-        ferr(po, "unable to trace flag setter\n");
-
-      tmp_op = &ops[ret]; // flag setter
-      pfo = split_cond(po, po->op, &dummy);
-      pfomask = 0;
-
-      // to get nicer code, we try to delay test and cmp;
-      // if we can't because of operand modification, or if we
-      // have math op, make it calculate flags explicitly
-      if (tmp_op->op == OP_TEST || tmp_op->op == OP_CMP) {
-        if (scan_for_mod(tmp_op, ret + 1, i) >= 0)
-          pfomask = 1 << pfo;
-      }
-      else {
-        if ((pfo != PFO_Z && pfo != PFO_S && pfo != PFO_P)
-            || scan_for_mod_opr0(tmp_op, ret + 1, i) >= 0)
-          pfomask = 1 << pfo;
-      }
-      if (pfomask) {
-        tmp_op->pfomask |= pfomask;
-        cmp_result_vars |= pfomask;
-        po->datap = tmp_op;
-      }
-
-      if (po->op == OP_ADC || po->op == OP_SBB)
-        cmp_result_vars |= 1 << PFO_C;
-    }
-    else if (po->op == OP_CALL)
+    if (po->op == OP_CALL)
     {
       pp = malloc(sizeof(*pp));
       my_assert_not(pp, NULL);
@@ -1641,6 +1687,86 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
         ferr(po, "arg collect failed for '%s'\n", tmpname);
       po->datap = pp;
     }
+  }
+
+  // pass4:
+  // - find POPs for PUSHes, rm both
+  // - scan for all used registers
+  // - find flag set ops for their users
+  for (i = 0; i < opcnt; i++) {
+    po = &ops[i];
+    if (po->flags & OPF_RMD)
+      continue;
+
+    if (po->op == OP_PUSH
+        && po->argmask == 0 && !(po->flags & OPF_RSAVE)
+        && po->operand[0].type == OPT_REG)
+    {
+      reg = po->operand[0].reg;
+      if (reg < 0)
+        ferr(po, "reg not set for push?\n");
+
+      depth = 0;
+      ret = scan_for_pop(i + 1, opcnt,
+              po->operand[0].name, i + opcnt, 0, &depth, 0);
+      if (ret == 1) {
+        if (depth > 1)
+          ferr(po, "too much depth: %d\n", depth);
+        if (depth > 0)
+          regmask_save |= 1 << reg;
+
+        po->flags |= OPF_RMD;
+        scan_for_pop(i + 1, opcnt, po->operand[0].name,
+          i + opcnt * 2, 0, &depth, 1);
+        continue;
+      }
+      ret = scan_for_pop_ret(i + 1, opcnt, po->operand[0].name, 0);
+      if (ret == 0) {
+        arg = OPF_RMD;
+        if (regmask & (1 << reg)) {
+          if (regmask_save & (1 << reg))
+            ferr(po, "%s already saved?\n", po->operand[0].name);
+          arg = OPF_RSAVE;
+        }
+        po->flags |= arg;
+        scan_for_pop_ret(i + 1, opcnt, po->operand[0].name, arg);
+        continue;
+      }
+    }
+
+    regmask |= po->regmask_src | po->regmask_dst;
+
+    if (po->flags & OPF_CC)
+    {
+      ret = scan_for_flag_set(i - 1);
+      if (ret < 0)
+        ferr(po, "unable to trace flag setter\n");
+
+      tmp_op = &ops[ret]; // flag setter
+      pfo = split_cond(po, po->op, &dummy);
+      pfomask = 0;
+
+      // to get nicer code, we try to delay test and cmp;
+      // if we can't because of operand modification, or if we
+      // have math op, make it calculate flags explicitly
+      if (tmp_op->op == OP_TEST || tmp_op->op == OP_CMP) {
+        if (scan_for_mod(tmp_op, ret + 1, i) >= 0)
+          pfomask = 1 << pfo;
+      }
+      else {
+        if ((pfo != PFO_Z && pfo != PFO_S && pfo != PFO_P)
+            || scan_for_mod_opr0(tmp_op, ret + 1, i) >= 0)
+          pfomask = 1 << pfo;
+      }
+      if (pfomask) {
+        tmp_op->pfomask |= pfomask;
+        cmp_result_vars |= pfomask;
+        po->datap = tmp_op;
+      }
+
+      if (po->op == OP_ADC || po->op == OP_SBB)
+        cmp_result_vars |= 1 << PFO_C;
+    }
     else if (po->op == OP_MUL
       || (po->op == OP_IMUL && po->operand_cnt == 1))
     {
@@ -1675,12 +1801,22 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
   }
 
   regmask &= ~regmask_arg;
+  regmask &= ~(1 << xSP);
   if (g_bp_frame)
     regmask &= ~(1 << xBP);
   if (regmask) {
     for (reg = 0; reg < 8; reg++) {
       if (regmask & (1 << reg)) {
         fprintf(fout, "  u32 %s;\n", regs_r32[reg]);
+        had_decl = 1;
+      }
+    }
+  }
+
+  if (regmask_save) {
+    for (reg = 0; reg < 8; reg++) {
+      if (regmask_save & (1 << reg)) {
+        fprintf(fout, "  u32 s_%s;\n", regs_r32[reg]);
         had_decl = 1;
       }
     }
@@ -1715,7 +1851,7 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
   // output ops
   for (i = 0; i < opcnt; i++)
   {
-    if (g_labels[i][0] != 0)
+    if (g_labels[i][0] != 0 && g_label_refs[i] != NULL)
       fprintf(fout, "\n%s:\n", g_labels[i]);
 
     po = &ops[i];
@@ -1847,13 +1983,35 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
         if (po->flags & OPF_REP) {
           fprintf(fout, "  for (; ecx != 0; ecx--, edi += %d)\n",
             lmod_bytes(po, po->operand[0].lmod));
-          fprintf(fout, "    *(u32 *)edi = eax;");
+          fprintf(fout, "    %sedi = eax;",
+            lmod_cast_u_ptr(po, po->operand[0].lmod));
           strcpy(g_comment, "rep stos");
         }
         else {
-          fprintf(fout, "    *(u32 *)edi = eax; edi += %d;",
+          fprintf(fout, "    %sedi = eax; edi += %d;",
+            lmod_cast_u_ptr(po, po->operand[0].lmod),
             lmod_bytes(po, po->operand[0].lmod));
           strcpy(g_comment, "stos");
+        }
+        break;
+
+      case OP_MOVS:
+        // assumes DF=0
+        assert_operand_cnt(3);
+        j = lmod_bytes(po, po->operand[0].lmod);
+        strcpy(buf1, lmod_cast_u_ptr(po, po->operand[0].lmod));
+        if (po->flags & OPF_REP) {
+          fprintf(fout,
+            "  for (; ecx != 0; ecx--, edi += %d, esi += %d)\n",
+            j, j);
+          fprintf(fout,
+            "    %sedi = %sesi;", buf1, buf1);
+          strcpy(g_comment, "rep movs");
+        }
+        else {
+          fprintf(fout, "    %sedi = %sesi; edi += %d; esi += %d;",
+            buf1, buf1, j, j);
+          strcpy(g_comment, "movs");
         }
         break;
 
@@ -1876,6 +2034,35 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
         delayed_flag_op = NULL;
         break;
 
+      case OP_SAR:
+        assert_operand_cnt(2);
+        out_dst_opr(buf1, sizeof(buf1), po, &po->operand[0]);
+        fprintf(fout, "  %s = %s%s >> %s;", buf1,
+          lmod_cast_s(po, po->operand[0].lmod), buf1,
+          out_src_opr(buf2, sizeof(buf2), po, &po->operand[1], 0));
+        last_arith_dst = &po->operand[0];
+        delayed_flag_op = NULL;
+        break;
+
+      case OP_ROL:
+      case OP_ROR:
+        assert_operand_cnt(2);
+        out_dst_opr(buf1, sizeof(buf1), po, &po->operand[0]);
+        if (po->operand[1].type == OPT_CONST) {
+          j = po->operand[1].val;
+          j %= lmod_bytes(po, po->operand[0].lmod) * 8;
+          fprintf(fout, po->op == OP_ROL ?
+            "  %s = (%s << %d) | (%s >> %d);" :
+            "  %s = (%s >> %d) | (%s << %d);",
+            buf1, buf1, j, buf1,
+            lmod_bytes(po, po->operand[0].lmod) * 8 - j);
+        }
+        else
+          ferr(po, "TODO\n");
+        last_arith_dst = &po->operand[0];
+        delayed_flag_op = NULL;
+        break;
+
       case OP_XOR:
         assert_operand_cnt(2);
         propagate_lmod(po, &po->operand[0], &po->operand[1]);
@@ -1888,16 +2075,6 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
           break;
         }
         goto dualop_arith;
-
-      case OP_SAR:
-        assert_operand_cnt(2);
-        out_dst_opr(buf1, sizeof(buf1), po, &po->operand[0]);
-        fprintf(fout, "  %s = %s%s >> %s;", buf1,
-          lmod_cast_s(po, po->operand[0].lmod), buf1,
-          out_src_opr(buf2, sizeof(buf2), po, &po->operand[1], 0));
-        last_arith_dst = &po->operand[0];
-        delayed_flag_op = NULL;
-        break;
 
       case OP_ADC:
       case OP_SBB:
@@ -2062,6 +2239,9 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
       case OP_RET:
         if (IS(g_func_pp.ret_type, "void"))
           fprintf(fout, "  return;");
+        else if (strchr(g_func_pp.ret_type, '*'))
+          fprintf(fout, "  return (%s)eax;",
+            g_func_pp.ret_type);
         else
           fprintf(fout, "  return eax;");
         break;
@@ -2069,19 +2249,28 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
       case OP_PUSH:
         if (po->argmask) {
           // special case - saved func arg
+          out_src_opr(buf1, sizeof(buf1), po, &po->operand[0], 0);
           for (j = 0; j < 32; j++) {
-            if (po->argmask & (1 << j)) {
-              fprintf(fout, "  s_a%d = %s;", j + 1,
-                  out_src_opr(buf1, sizeof(buf1), po, &po->operand[0], 0));
-            }
+            if (po->argmask & (1 << j))
+              fprintf(fout, "  s_a%d = %s;", j + 1, buf1);
           }
           break;
         }
-        ferr(po, "push encountered\n");
+        else if (po->flags & OPF_RSAVE) {
+          out_src_opr(buf1, sizeof(buf1), po, &po->operand[0], 0);
+          fprintf(fout, "  s_%s = %s;", buf1, buf1);
+          break;
+        }
+        ferr(po, "stray push encountered\n");
         break;
 
       case OP_POP:
-        ferr(po, "pop encountered\n");
+        if (po->flags & OPF_RSAVE) {
+          out_src_opr(buf1, sizeof(buf1), po, &po->operand[0], 0);
+          fprintf(fout, "  %s = s_%s;", buf1, buf1);
+          break;
+        }
+        ferr(po, "stray pop encountered\n");
         break;
 
       case OP_NOP:
@@ -2130,6 +2319,24 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
     }
   }
   proto_release(&g_func_pp);
+}
+
+static void set_label(int i, const char *name)
+{
+  const char *p;
+  int len;
+
+  len = strlen(name);
+  p = strchr(name, ':');
+  if (p != NULL)
+    len = p - name;
+
+  if (len > sizeof(g_labels[0]) - 1)
+    aerr("label '%s' too long: %d\n", name, len);
+  if (g_labels[i][0] != 0)
+    aerr("dupe label '%s'?\n", name);
+  memcpy(g_labels[i], name, len);
+  g_labels[i][len] = 0;
 }
 
 // '=' needs special treatment..
@@ -2279,6 +2486,7 @@ int main(int argc, char *argv[])
       if (bsearch(&p, rlist, rlist_len, sizeof(rlist[0]), cmpstringp))
         skip_func = 1;
       strcpy(g_func, words[0]);
+      set_label(0, words[0]);
       in_func = 1;
       continue;
     }
@@ -2309,13 +2517,7 @@ int main(int argc, char *argv[])
 
     p = strchr(words[0], ':');
     if (p != NULL) {
-      len = p - words[0];
-      if (len > sizeof(g_labels[0]) - 1)
-        aerr("label too long: %d\n", len);
-      if (g_labels[pi][0] != 0)
-        aerr("dupe label?\n");
-      memcpy(g_labels[pi], words[0], len);
-      g_labels[pi][len] = 0;
+      set_label(pi, words[0]);
       continue;
     }
 

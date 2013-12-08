@@ -111,6 +111,7 @@ int main(int argc, char *argv[])
 	char word4[256];
 	char word5[256];
 	char word6[256];
+	char func[256];
 	char *p;
 	int i;
 
@@ -168,6 +169,11 @@ int main(int argc, char *argv[])
 		p = next_word(word2, sizeof(word2), p);
 
 		if (IS_OR2(word2, "proc", "endp")) {
+			if (IS(word2, "proc"))
+				strcpy(func, word);
+			else
+				func[0] = 0;
+
 			ssym.name = word;
 			sym = bsearch(&ssym, symlist, symlist_cnt,
 				sizeof(symlist[0]), cmp_sym);
@@ -182,7 +188,9 @@ int main(int argc, char *argv[])
 			ssym.name = word2;
 			sym = bsearch(&ssym, symlist, symlist_cnt,
 				sizeof(symlist[0]), cmp_sym);
-			if (sym != NULL && sym->callsites) {
+			if (sym != NULL
+			    && (sym->callsites || IS(word2, func)))
+			{
 				fprintf(fout, "\t\t%s\t%s%s", word,
 					sym_use(sym), p);
 				continue;
@@ -203,7 +211,9 @@ int main(int argc, char *argv[])
 			ssym.name = word3;
 			sym = bsearch(&ssym, symlist, symlist_cnt,
 				sizeof(symlist[0]), cmp_sym);
-			if (sym != NULL && sym->callsites) {
+			if (sym != NULL
+			    && (sym->callsites || IS(word3, func)))
+			{
 				fprintf(fout, "\t\t%s %s %s%s",
 					word, word2, sym_use(sym), p);
 				continue;
