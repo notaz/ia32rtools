@@ -12,7 +12,7 @@ for sym in $usyms; do
 done
 
 echo "\
-s/^\(loc[r_].*[0-9A-F]:\)[^:]\(.*\;\)/\1:\t\2/g;\
+s/^\([ ]\?loc[r_].*[0-9A-F]:\)[^:]\(.*\;\)/\1:\t\2/g;\
 s/dd[[:blank:]]rva/dd/;\
 s/\<fldcw\>\t\[esp+4+var_4\]/fldcw\tword ptr \[esp\]/;\
 s/\<large \(.*fs:\)/\1/;\
@@ -24,7 +24,7 @@ s/\<pushf\>/pushfd/;\
 s/\<popf\>/popfd/;\
 s/\(\<j[mn]\?[abceglopszp]e\?\>\)\tloc_/\1\tnear ptr loc_/;\
 s/\<jmp\tsub_/jmp\tnear ptr sub_/;\
-' StarCraft.asm" >> $f
+' $1" >> $f
 . $f
 
 # manual fixup:
