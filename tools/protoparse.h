@@ -15,8 +15,10 @@ struct parsed_proto {
 	int argc;
 	int argc_stack;
 	int argc_reg;
+	unsigned int is_func:1;
 	unsigned int is_stdcall:1;
 	unsigned int is_fptr:1;
+	unsigned int is_array:1;
 };
 
 static const char *hdrfn;
@@ -26,6 +28,7 @@ static int find_protostr(char *dst, size_t dlen, FILE *fhdr,
 	const char *fname, const char *sym_)
 {
 	const char *sym = sym_;
+	const char *finc_name;
 	FILE *finc;
 	int symlen;
 	int line = 0;
@@ -41,27 +44,31 @@ static int find_protostr(char *dst, size_t dlen, FILE *fhdr,
 	while (fgets(dst, dlen, fhdr))
 	{
 		line++;
-		if (strncmp(dst, "#include ", 9) == 0) {
-			p = strpbrk(dst + 9, "\r\n ");
+		if (strncmp(dst, "//#include ", 11) == 0) {
+			finc_name = dst + 11;
+			p = strpbrk(finc_name, "\r\n ");
 			if (p != NULL)
 				*p = 0;
 
-			finc = fopen(dst + 9, "r");
+			finc = fopen(finc_name, "r");
 			if (finc == NULL) {
 				printf("%s:%d: can't open '%s'\n",
-					fname, line, dst + 9);
+					fname, line, finc_name);
 				continue;
 			}
 			ret = find_protostr(dst, dlen, finc,
-				dst + 9, sym_);
+				finc_name, sym_);
 			fclose(finc);
 			if (ret == 0)
 				break;
 			continue;
 		}
+		if (strncmp(sskip(dst), "//", 2) == 0)
+			continue;
 
 		p = strstr(dst, sym);
-		if (p != NULL
+		if (p != NULL && p > dst
+		   && (my_isblank(p[-1]) || my_issep(p[-1]))
 		   && (my_isblank(p[symlen]) || my_issep(p[symlen])))
 			break;
 	}
@@ -180,11 +187,21 @@ static int parse_protostr(char *protostr, struct parsed_proto *pp)
 	int ret;
 	int i;
 
-	p = protostr;
+	p = sskip(protostr);
 	if (p[0] == '/' && p[1] == '/') {
-		//printf("warning: decl for sym '%s' is commented out\n", sym);
+		printf("%s:%d: commented out?\n", hdrfn, hdrfline);
 		p = sskip(p + 2);
 	}
+
+	// strip unneeded stuff
+	for (p1 = p; p1[0] != 0 && p1[1] != 0; p1++) {
+		if ((p1[0] == '/' && p1[1] == '*')
+		 || (p1[0] == '*' && p1[1] == '/'))
+			p1[0] = p1[1] = ' ';
+	}
+
+	if (strncmp(p, "extern ", 7) == 0)
+		p = sskip(p + 7);
 
 	kt = check_type(p);
 	if (kt == NULL) {
@@ -195,6 +212,26 @@ static int parse_protostr(char *protostr, struct parsed_proto *pp)
 	pp->ret_type = kt;
 	p += strlen(kt);
 	p = sskip(p);
+
+	if (!strchr(p, ')')) {
+		p = next_idt(buf, sizeof(buf), p);
+		p = sskip(p);
+		if (buf[0] == 0) {
+			printf("%s:%d:%ld: var name missing\n",
+				hdrfn, hdrfline, (p - protostr) + 1);
+			return -1;
+		}
+		strcpy(pp->name, buf);
+
+		p1 = strchr(p, ']');
+		if (p1 != NULL) {
+			p = p1 + 1;
+			pp->is_array = 1;
+		}
+		return p - protostr;
+	}
+
+	pp->is_func = 1;
 
 	if (*p == '(') {
 		pp->is_fptr = 1;
@@ -275,7 +312,8 @@ static int parse_protostr(char *protostr, struct parsed_proto *pp)
 
 	// check for x(void)
 	p = sskip(p);
-	if (strncmp(p, "void", 4) == 0 && *sskip(p + 4) == ')')
+	if ((!strncmp(p, "void", 4) || !strncmp(p, "VOID", 4))
+	   && *sskip(p + 4) == ')')
 		p += 4;
 
 	while (1) {

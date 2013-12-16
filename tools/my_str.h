@@ -6,7 +6,7 @@ static int my_isblank(char c)
 static int my_issep(char c)
 {
 	return c == '(' || c == ')' || c == '[' || c == ']'
-	    || c == '<' || c == '>' || c == ','
+	    || c == '<' || c == '>' || c == ',' || c == ';'
 	    || c == '+' || c == '-' || c == '*' || c == '/';
 }
 

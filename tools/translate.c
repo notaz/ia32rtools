@@ -12,8 +12,9 @@
 
 #include "protoparse.h"
 
-const char *asmfn;
+static const char *asmfn;
 static int asmln;
+static FILE *g_fhdr;
 
 #define anote(fmt, ...) \
 	printf("%s:%d: note: " fmt, asmfn, asmln, ##__VA_ARGS__)
@@ -112,6 +113,7 @@ enum opr_lenmod {
 struct parsed_opr {
   enum opr_type type;
   enum opr_lenmod lmod;
+  unsigned int is_ptr:1;  // pointer in C
   int reg;
   unsigned int val;
   char name[256];
@@ -391,6 +393,61 @@ static int guess_lmod_from_name(struct parsed_opr *opr)
   return 0;
 }
 
+static int guess_lmod_from_c_type(struct parsed_opr *opr, const char *c_type)
+{
+  static const char *ptr_types[] = {
+    "LPCSTR",
+  };
+  static const char *dword_types[] = {
+    "int", "_DWORD", "DWORD", "HANDLE", "HWND", "HMODULE",
+  };
+  static const char *word_types[] = {
+    "__int16", "unsigned __int16",
+  };
+  static const char *byte_types[] = {
+    "char", "__int8", "unsigned __int8", "BYTE",
+  };
+  int i;
+
+  if (strchr(c_type, '*')) {
+    opr->lmod = OPLM_DWORD;
+    opr->is_ptr = 1;
+    return 1;
+  }
+
+  for (i = 0; i < ARRAY_SIZE(dword_types); i++) {
+    if (IS(c_type, dword_types[i])) {
+      opr->lmod = OPLM_DWORD;
+      return 1;
+    }
+  }
+
+  for (i = 0; i < ARRAY_SIZE(ptr_types); i++) {
+    if (IS(c_type, ptr_types[i])) {
+      opr->lmod = OPLM_DWORD;
+      opr->is_ptr = 1;
+      return 1;
+    }
+  }
+
+  for (i = 0; i < ARRAY_SIZE(word_types); i++) {
+    if (IS(c_type, word_types[i])) {
+      opr->lmod = OPLM_WORD;
+      return 1;
+    }
+  }
+
+  for (i = 0; i < ARRAY_SIZE(byte_types); i++) {
+    if (IS(c_type, byte_types[i])) {
+      opr->lmod = OPLM_BYTE;
+      return 1;
+    }
+  }
+
+  anote("unhandled C type '%s' for '%s'\n", c_type, opr->name);
+  return 0;
+}
+
 static void setup_reg_opr(struct parsed_opr *opr, int reg, enum opr_lenmod lmod,
   int *regmask)
 {
@@ -407,6 +464,7 @@ static int parse_operand(struct parsed_opr *opr,
   int *regmask, int *regmask_indirect,
   char words[16][256], int wordc, int w, unsigned int op_flags)
 {
+  struct parsed_proto pp;
   enum opr_lenmod tmplmod;
   int ret, len;
   long number;
@@ -536,12 +594,19 @@ static int parse_operand(struct parsed_opr *opr,
 
   // most likely var in data segment
   opr->type = OPT_LABEL;
+
+  ret = proto_parse(g_fhdr, opr->name, &pp);
+  if (ret == 0) {
+    if (pp.is_fptr) {
+      opr->lmod = OPLM_DWORD;
+      opr->is_ptr = 1;
+    }
+    else if (opr->lmod == OPLM_UNSPEC)
+      guess_lmod_from_c_type(opr, pp.ret_type);
+  }
+
   if (opr->lmod == OPLM_UNSPEC)
     guess_lmod_from_name(opr);
-  if (opr->lmod != OPLM_UNSPEC)
-    return wordc;
-
-  // TODO: scan data seg to determine type?
   return wordc;
 }
 
@@ -2105,8 +2170,9 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
       case OP_MOV:
         assert_operand_cnt(2);
         propagate_lmod(po, &po->operand[0], &po->operand[1]);
-        fprintf(fout, "  %s = %s;",
+        fprintf(fout, "  %s = %s%s;",
             out_dst_opr(buf1, sizeof(buf1), po, &po->operand[0]),
+            po->operand[0].is_ptr ? "(void *)" : "",
             out_src_opr(buf2, sizeof(buf2), po, &po->operand[1], 0));
         break;
 
@@ -2561,7 +2627,7 @@ static int cmpstringp(const void *p1, const void *p2)
 
 int main(int argc, char *argv[])
 {
-  FILE *fout, *fasm, *fhdr, *frlist;
+  FILE *fout, *fasm, *frlist;
   char line[256];
   char words[16][256];
   int ida_func_attr = 0;
@@ -2598,8 +2664,8 @@ int main(int argc, char *argv[])
   my_assert_not(fasm, NULL);
 
   hdrfn = argv[arg++];
-  fhdr = fopen(hdrfn, "r");
-  my_assert_not(fhdr, NULL);
+  g_fhdr = fopen(hdrfn, "r");
+  my_assert_not(g_fhdr, NULL);
 
   rlist_alloc = 64;
   rlist = malloc(rlist_alloc * sizeof(rlist[0]));
@@ -2690,6 +2756,7 @@ int main(int argc, char *argv[])
       continue;
     }
 
+parse_words:
     memset(words, 0, sizeof(words));
     for (wordc = 0; wordc < 16; wordc++) {
       p = sskip(next_word_s(words[wordc], sizeof(words[0]), p));
@@ -2697,6 +2764,14 @@ int main(int argc, char *argv[])
         wordc++;
         break;
       }
+    }
+
+    // alow asm patches in comments
+    if (*p == ';' && IS_START(p, "; sctpatch: ")) {
+      p = sskip(p + 12);
+      if (*p == 0 || *p == ';')
+        continue;
+      goto parse_words; // lame
     }
 
     if (wordc == 0) {
@@ -2736,7 +2811,7 @@ int main(int argc, char *argv[])
           words[0], g_func);
 
       if (in_func && !skip_func)
-        gen_func(fout, fhdr, g_func, pi);
+        gen_func(fout, g_fhdr, g_func, pi);
 
       in_func = 0;
       skip_warned = 0;
@@ -2808,7 +2883,7 @@ int main(int argc, char *argv[])
 
   fclose(fout);
   fclose(fasm);
-  fclose(fhdr);
+  fclose(g_fhdr);
 
   return 0;
 }
