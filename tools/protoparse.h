@@ -1,31 +1,68 @@
 
+struct parsed_proto;
+
+struct parsed_proto_arg {
+	char *reg;
+	const char *type;
+	struct parsed_proto *fptr;
+	void *datap;
+};
+
 struct parsed_proto {
-	struct {
-		char *reg;
-		const char *type;
-		void *datap;
-	} arg[16];
+	char name[256];
 	const char *ret_type;
-	int is_stdcall;
+	struct parsed_proto_arg arg[16];
 	int argc;
 	int argc_stack;
 	int argc_reg;
+	unsigned int is_stdcall:1;
+	unsigned int is_fptr:1;
 };
 
 static const char *hdrfn;
 static int hdrfline = 0;
 
-static int find_protostr(char *dst, size_t dlen, FILE *fhdr, const char *sym)
+static int find_protostr(char *dst, size_t dlen, FILE *fhdr,
+	const char *fname, const char *sym_)
 {
+	const char *sym = sym_;
+	FILE *finc;
+	int symlen;
 	int line = 0;
+	int ret;
 	char *p;
+
+	if (sym[0] == '_' && strncmp(fname, "stdc", 4) == 0)
+		sym++;
+	symlen = strlen(sym);
 
 	rewind(fhdr);
 
 	while (fgets(dst, dlen, fhdr))
 	{
 		line++;
-		if (strstr(dst, sym) != NULL)
+		if (strncmp(dst, "#include ", 9) == 0) {
+			p = strpbrk(dst + 9, "\r\n ");
+			if (p != NULL)
+				*p = 0;
+
+			finc = fopen(dst + 9, "r");
+			if (finc == NULL) {
+				printf("%s:%d: can't open '%s'\n",
+					fname, line, dst + 9);
+				continue;
+			}
+			ret = find_protostr(dst, dlen, finc,
+				dst + 9, sym_);
+			fclose(finc);
+			if (ret == 0)
+				break;
+			continue;
+		}
+
+		p = strstr(dst, sym);
+		if (p != NULL
+		   && (my_isblank(p[symlen]) || my_issep(p[symlen])))
 			break;
 	}
 	hdrfline = line;
@@ -86,13 +123,26 @@ static const char *known_types[] = {
 	"size_t",
 };
 
+static int typecmp(const char *n, const char *t)
+{
+	for (; *t != 0; n++, t++) {
+		while (n[0] == ' ' && (n[1] == ' ' || n[1] == '*'))
+			n++;
+		while (t[0] == ' ' && (t[1] == ' ' || t[1] == '*'))
+			t++;
+		if (*n != *t)
+			return *n - *t;
+	}
+
+	return 0;
+}
+
 static const char *check_type(const char *name)
 {
-	int i, l;
+	int i;
 
 	for (i = 0; i < ARRAY_SIZE(known_types); i++) {
-		l = strlen(known_types[i]);
-		if (strncmp(known_types[i], name, l) == 0)
+		if (typecmp(name, known_types[i]) == 0)
 			return known_types[i];
 	}
 
@@ -120,13 +170,14 @@ static const char *map_reg(const char *reg)
 
 static int parse_protostr(char *protostr, struct parsed_proto *pp)
 {
+	struct parsed_proto_arg *arg;
 	char regparm[16];
 	char buf[256];
 	char cconv[32];
 	const char *kt;
 	int xarg = 0;
+	char *p, *p1;
 	int ret;
-	char *p;
 	int i;
 
 	p = protostr;
@@ -139,18 +190,23 @@ static int parse_protostr(char *protostr, struct parsed_proto *pp)
 	if (kt == NULL) {
 		printf("%s:%d:%ld: unhandled return in '%s'\n",
 			hdrfn, hdrfline, (p - protostr) + 1, protostr);
-		return 1;
+		return -1;
 	}
 	pp->ret_type = kt;
 	p += strlen(kt);
 	p = sskip(p);
+
+	if (*p == '(') {
+		pp->is_fptr = 1;
+		p = sskip(p + 1);
+	}
 
 	p = next_word(cconv, sizeof(cconv), p);
 	p = sskip(p);
 	if (cconv[0] == 0) {
 		printf("%s:%d:%ld: cconv missing\n",
 			hdrfn, hdrfline, (p - protostr) + 1);
-		return 1;
+		return -1;
 	}
 	if      (IS(cconv, "__cdecl"))
 		pp->is_stdcall = 0;
@@ -167,16 +223,26 @@ static int parse_protostr(char *protostr, struct parsed_proto *pp)
 	else {
 		printf("%s:%d:%ld: unhandled cconv: '%s'\n",
 			hdrfn, hdrfline, (p - protostr) + 1, cconv);
-		return 1;
+		return -1;
+	}
+
+	if (pp->is_fptr) {
+		if (*p != '*') {
+			printf("%s:%d:%ld: '*' expected\n",
+				hdrfn, hdrfline, (p - protostr) + 1);
+			return -1;
+		}
+		p = sskip(p + 1);
 	}
 
 	p = next_idt(buf, sizeof(buf), p);
 	p = sskip(p);
 	if (buf[0] == 0) {
 		printf("%s:%d:%ld: func name missing\n",
-				hdrfn, hdrfline, (p - protostr) + 1);
-		return 1;
+			hdrfn, hdrfline, (p - protostr) + 1);
+		return -1;
 	}
+	strcpy(pp->name, buf);
 
 	ret = get_regparm(regparm, sizeof(regparm), p);
 	if (ret > 0) {
@@ -185,37 +251,70 @@ static int parse_protostr(char *protostr, struct parsed_proto *pp)
 		{
 			printf("%s:%d:%ld: bad regparm: %s\n",
 				hdrfn, hdrfline, (p - protostr) + 1, regparm);
-			return 1;
+			return -1;
 		}
 		p += ret;
 		p = sskip(p);
 	}
 
+	if (pp->is_fptr) {
+		if (*p != ')') {
+			printf("%s:%d:%ld: ')' expected\n",
+				hdrfn, hdrfline, (p - protostr) + 1);
+			return -1;
+		}
+		p = sskip(p + 1);
+	}
+
 	if (*p != '(') {
 		printf("%s:%d:%ld: '(' expected, got '%c'\n",
 				hdrfn, hdrfline, (p - protostr) + 1, *p);
-		return 1;
+		return -1;
 	}
 	p++;
 
+	// check for x(void)
+	p = sskip(p);
+	if (strncmp(p, "void", 4) == 0 && *sskip(p + 4) == ')')
+		p += 4;
+
 	while (1) {
 		p = sskip(p);
-		if (*p == ')')
+		if (*p == ')') {
+			p++;
 			break;
+		}
 		if (*p == ',')
 			p = sskip(p + 1);
 
+		arg = &pp->arg[xarg];
 		xarg++;
 
+		p1 = p;
 		kt = check_type(p);
 		if (kt == NULL) {
 			printf("%s:%d:%ld: unhandled type for arg%d\n",
 				hdrfn, hdrfline, (p - protostr) + 1, xarg);
-			return 1;
+			return -1;
 		}
-		pp->arg[xarg - 1].type = kt;
+		arg->type = kt;
 		p += strlen(kt);
 		p = sskip(p);
+
+		if (*p == '(') {
+			// func ptr
+			arg->fptr = calloc(1, sizeof(*arg->fptr));
+			ret = parse_protostr(p1, arg->fptr);
+			if (ret < 0) {
+				printf("%s:%d:%ld: funcarg parse failed\n",
+					hdrfn, hdrfline, p1 - protostr);
+				return -1;
+			}
+			// we'll treat it as void * for non-calls
+			arg->type = "void *";
+
+			p = p1 + ret;
+		}
 
 		p = next_idt(buf, sizeof(buf), p);
 		p = sskip(p);
@@ -223,17 +322,17 @@ static int parse_protostr(char *protostr, struct parsed_proto *pp)
 		if (buf[0] == 0) {
 			printf("%s:%d:%ld: idt missing for arg%d\n",
 				hdrfn, hdrfline, (p - protostr) + 1, xarg);
-			return 1;
+			return -1;
 		}
 #endif
-		pp->arg[xarg - 1].reg = NULL;
+		arg->reg = NULL;
 
 		ret = get_regparm(regparm, sizeof(regparm), p);
 		if (ret > 0) {
 			p += ret;
 			p = sskip(p);
 
-			pp->arg[xarg - 1].reg = strdup(map_reg(regparm));
+			arg->reg = strdup(map_reg(regparm));
 		}
 	}
 
@@ -262,7 +361,7 @@ static int parse_protostr(char *protostr, struct parsed_proto *pp)
 			pp->argc_reg++;
 	}
 
-	return 0;
+	return p - protostr;
 }
 
 static int proto_parse(FILE *fhdr, const char *sym, struct parsed_proto *pp)
@@ -272,13 +371,13 @@ static int proto_parse(FILE *fhdr, const char *sym, struct parsed_proto *pp)
 
 	memset(pp, 0, sizeof(*pp));
 
-	ret = find_protostr(protostr, sizeof(protostr), fhdr, sym);
+	ret = find_protostr(protostr, sizeof(protostr), fhdr, hdrfn, sym);
 	if (ret != 0) {
 		printf("%s: sym '%s' is missing\n", hdrfn, sym);
 		return ret;
 	}
 
-	return parse_protostr(protostr, pp);
+	return parse_protostr(protostr, pp) < 0 ? -1 : 0;
 }
 
 static void proto_release(struct parsed_proto *pp)
@@ -286,7 +385,9 @@ static void proto_release(struct parsed_proto *pp)
 	int i;
 
 	for (i = 0; i < pp->argc; i++) {
-		if (pp->arg[i].reg == NULL)
+		if (pp->arg[i].reg != NULL)
 			free(pp->arg[i].reg);
+		if (pp->arg[i].fptr != NULL)
+			free(pp->arg[i].fptr);
 	}
 }

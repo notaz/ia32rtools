@@ -8,6 +8,7 @@
 
 #define ARRAY_SIZE(x) (sizeof(x) / sizeof(x[0]))
 #define IS(w, y) !strcmp(w, y)
+#define IS_START(w, y) !strncmp(w, y, strlen(y))
 
 #include "protoparse.h"
 
@@ -294,7 +295,7 @@ static int parse_indmode(char *name, int *regmask, int need_c_cvt)
     *d = 0;
 
     // skip 'ds:' prefix
-    if (!strncmp(s, "ds:", 3))
+    if (IS_START(s, "ds:"))
       s += 3;
 
     s = next_idt(w, sizeof(w), s);
@@ -334,12 +335,12 @@ static const char *parse_stack_el(const char *name)
   long val;
   int len;
 
-  if (!strncmp(name, "ebp+", 4)
+  if (IS_START(name, "ebp+")
       && !('0' <= name[4] && name[4] <= '9'))
   {
     return name + 4;
   }
-  if (strncmp(name, "esp+", 4) != 0)
+  if (!IS_START(name, "esp+"))
     return NULL;
 
   p = strchr(name + 4, '+');
@@ -399,7 +400,8 @@ static void setup_reg_opr(struct parsed_opr *opr, int reg, enum opr_lenmod lmod,
   *regmask |= 1 << reg;
 }
 
-static struct parsed_equ *equ_find(struct parsed_op *po, const char *name);
+static struct parsed_equ *equ_find(struct parsed_op *po, const char *name,
+  int *extra_offs);
 
 static int parse_operand(struct parsed_opr *opr,
   int *regmask, int *regmask_indirect,
@@ -409,6 +411,7 @@ static int parse_operand(struct parsed_opr *opr,
   int ret, len;
   long number;
   int wordc_in;
+  char *tmp;
   int i;
 
   if (w >= wordc)
@@ -444,6 +447,8 @@ static int parse_operand(struct parsed_opr *opr,
 
     if (label != NULL) {
       opr->type = OPT_LABEL;
+      if (IS_START(label, "ds:"))
+        label += 3;
       strcpy(opr->name, label);
       return wordc;
     }
@@ -464,16 +469,30 @@ static int parse_operand(struct parsed_opr *opr,
     }
   }
 
-  if (wordc_in == 2 && IS(words[w], "offset")) {
-    opr->type = OPT_OFFSET;
-    strcpy(opr->name, words[w + 1]);
-    return wordc;
+  if (wordc_in == 2) {
+    if (IS(words[w], "offset")) {
+      opr->type = OPT_OFFSET;
+      strcpy(opr->name, words[w + 1]);
+      return wordc;
+    }
+    if (IS(words[w], "(offset")) {
+      char *p = strchr(words[w + 1], ')');
+      if (p == NULL)
+        aerr("parse of bracketed offset failed\n");
+      *p = 0;
+      opr->type = OPT_OFFSET;
+      strcpy(opr->name, words[w + 1]);
+      return wordc;
+    }
   }
 
   if (wordc_in != 1)
     aerr("parse_operand 1 word expected\n");
 
-  strcpy(opr->name, words[w]);
+  tmp = words[w];
+  if (IS_START(tmp, "ds:"))
+    tmp += 3;
+  strcpy(opr->name, tmp);
 
   if (words[w][0] == '[') {
     opr->type = OPT_REGMEM;
@@ -485,7 +504,7 @@ static int parse_operand(struct parsed_opr *opr,
     if (opr->lmod == OPLM_UNSPEC && parse_stack_el(opr->name)) {
       // might be an equ
       struct parsed_equ *eq =
-        equ_find(NULL, parse_stack_el(opr->name));
+        equ_find(NULL, parse_stack_el(opr->name), &i);
       if (eq)
         opr->lmod = eq->lmod;
     }
@@ -905,12 +924,33 @@ static const char *opr_reg_p(struct parsed_op *po, struct parsed_opr *popr)
   return regs_r32[popr->reg];
 }
 
-static struct parsed_equ *equ_find(struct parsed_op *po, const char *name)
+static struct parsed_equ *equ_find(struct parsed_op *po, const char *name,
+  int *extra_offs)
 {
+  const char *p;
+  char *endp;
+  int namelen;
   int i;
 
+  *extra_offs = 0;
+  namelen = strlen(name);
+
+  p = strchr(name, '+');
+  if (p != NULL) {
+    namelen = p - name;
+    if (namelen <= 0)
+      ferr(po, "equ parse failed for '%s'\n", name);
+
+    if (IS_START(p, "0x"))
+      p += 2;
+    *extra_offs = strtol(p, &endp, 16);
+    if (*endp != 0)
+      ferr(po, "equ parse failed for '%s'\n", name);
+  }
+
   for (i = 0; i < g_eqcnt; i++)
-    if (IS(g_eqs[i].name, name))
+    if (strncmp(g_eqs[i].name, name, namelen) == 0
+     && g_eqs[i].name[namelen] == 0)
       break;
   if (i >= g_eqcnt) {
     if (po != NULL)
@@ -930,25 +970,28 @@ static void stack_frame_access(struct parsed_op *po,
   int i, arg_i, arg_s;
   const char *bp_arg;
   int stack_ra = 0;
+  int offset = 0;
   int sf_ofs;
 
   bp_arg = parse_stack_el(name);
   snprintf(g_comment, sizeof(g_comment), "%s", bp_arg);
-  eq = equ_find(po, bp_arg);
+  eq = equ_find(po, bp_arg, &offset);
   if (eq == NULL)
     ferr(po, "detected but missing eq\n");
+
+  offset += eq->offset;
 
   if (!strncmp(name, "ebp", 3))
     stack_ra = 4;
 
-  if (stack_ra <= eq->offset && eq->offset < stack_ra + 4)
-    ferr(po, "reference to ra? %d %d\n", eq->offset, stack_ra);
+  if (stack_ra <= offset && offset < stack_ra + 4)
+    ferr(po, "reference to ra? %d %d\n", offset, stack_ra);
 
-  if (eq->offset > stack_ra) {
-    arg_i = (eq->offset - stack_ra - 4) / 4;
+  if (offset > stack_ra) {
+    arg_i = (offset - stack_ra - 4) / 4;
     if (arg_i < 0 || arg_i >= g_func_pp.argc_stack)
       ferr(po, "offset %d (%s) doesn't map to any arg\n",
-        eq->offset, bp_arg);
+        offset, bp_arg);
 
     for (i = arg_s = 0; i < g_func_pp.argc; i++) {
       if (g_func_pp.arg[i].reg != NULL)
@@ -968,9 +1011,9 @@ static void stack_frame_access(struct parsed_op *po,
     if (g_stack_fsz == 0)
       ferr(po, "stack var access without stackframe\n");
 
-    sf_ofs = g_stack_fsz + eq->offset;
+    sf_ofs = g_stack_fsz + offset;
     if (sf_ofs < 0)
-      ferr(po, "bp_stack offset %d/%d\n", eq->offset, g_stack_fsz);
+      ferr(po, "bp_stack offset %d/%d\n", offset, g_stack_fsz);
 
     if (is_lea)
       prefix = "(u32)&";
@@ -1744,6 +1787,15 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
         ops[ret].flags |= OPF_RMD;
       }
 
+      // can't call functions with non-__cdecl callbacks yet
+      for (arg = 0; arg < pp->argc; arg++) {
+        if (pp->arg[arg].fptr != NULL) {
+          pp_tmp = pp->arg[arg].fptr;
+          if (pp_tmp->is_stdcall || pp_tmp->argc != pp_tmp->argc_stack)
+            ferr(po, "'%s' has a non-__cdecl callback\n", tmpname);
+        }
+      }
+
       for (arg = 0; arg < pp->argc; arg++)
         if (pp->arg[arg].reg == NULL)
           break;
@@ -2334,10 +2386,15 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
             fprintf(fout, "(u32)");
         }
 
-        if (po->operand[0].type != OPT_LABEL)
+        if (po->operand[0].type != OPT_LABEL) {
           fprintf(fout, "icall%d(", i);
-        else
-          fprintf(fout, "%s(", opr_name(po, 0));
+        }
+        else {
+          if (pp->name[0] == 0)
+            ferr(po, "missing pp->name\n");
+          fprintf(fout, "%s(", pp->name);
+        }
+
         for (arg = 0; arg < pp->argc; arg++) {
           if (arg > 0)
             fprintf(fout, ", ");
