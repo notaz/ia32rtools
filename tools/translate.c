@@ -604,6 +604,7 @@ static int parse_operand(struct parsed_opr *opr,
     else if (opr->lmod == OPLM_UNSPEC)
       guess_lmod_from_c_type(opr, pp.ret_type);
   }
+  proto_release(&pp);
 
   if (opr->lmod == OPLM_UNSPEC)
     guess_lmod_from_name(opr);
@@ -1635,6 +1636,24 @@ static int scan_for_cdq_edx(int i)
   return -1;
 }
 
+static int scan_for_reg_clear(int i, int reg)
+{
+  for (; i >= 0; i--) {
+    if (ops[i].op == OP_XOR
+     && ops[i].operand[0].lmod == OPLM_DWORD
+     && ops[i].operand[0].reg == ops[i].operand[1].reg
+     && ops[i].operand[0].reg == reg)
+      return i;
+
+    if (ops[i].regmask_dst & (1 << reg))
+      return -1;
+    if (g_labels[i][0] != 0)
+      return -1;
+  }
+
+  return -1;
+}
+
 // scan for positive, constant esp adjust
 static int scan_for_esp_adjust(int i, int opcnt, int *adj)
 {
@@ -1674,6 +1693,7 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
   int regmask_arg = 0;
   int regmask = 0;
   int pfomask = 0;
+  int found = 0;
   int depth = 0;
   int no_output;
   int dummy;
@@ -1724,11 +1744,15 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
       }
     }
 
+    found = 0;
     i = 2;
     do {
       for (; i < opcnt; i++)
         if (ops[i].op == OP_RET)
           break;
+      if (i == opcnt && (ops[i - 1].flags & OPF_JMP) && found)
+        break;
+
       if (ops[i - 1].op != OP_POP || !IS(opr_name(&ops[i - 1], 0), "ebp"))
         ferr(&ops[i - 1], "'pop ebp' expected\n");
       ops[i - 1].flags |= OPF_RMD;
@@ -1749,6 +1773,7 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
         }
       }
 
+      found = 1;
       i++;
     } while (i < opcnt);
   }
@@ -1833,10 +1858,10 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
         j /= 4;
         if (j > ARRAY_SIZE(pp->arg))
           ferr(po, "esp adjust too large?\n");
-        pp->ret_type = "int";
+        pp->ret_type = strdup("int");
         pp->argc = pp->argc_stack = j;
         for (arg = 0; arg < pp->argc; arg++)
-          pp->arg[arg].type = "int";
+          pp->arg[arg].type = strdup("int");
       }
       else {
         ret = proto_parse(fhdr, tmpname, pp);
@@ -1917,7 +1942,8 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
         }
       }
       if (arg < pp->argc)
-        ferr(po, "arg collect failed for '%s'\n", tmpname);
+        ferr(po, "arg collect failed for '%s': %d/%d\n",
+          tmpname, arg, pp->argc);
       po->datap = pp;
     }
   }
@@ -2386,7 +2412,11 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
           ferr(po, "unhandled lmod %d\n", po->operand[0].lmod);
 
         // 32bit division is common, look for it
-        if (scan_for_cdq_edx(i - 1) >= 0) {
+        if (po->op == OP_DIV)
+          ret = scan_for_reg_clear(i - 1, xDX);
+        else
+          ret = scan_for_cdq_edx(i - 1);
+        if (ret >= 0) {
           out_src_opr(buf1, sizeof(buf1), po, &po->operand[0], 0);
           strcpy(buf2, lmod_cast(po, po->operand[0].lmod,
             po->op == OP_IDIV));

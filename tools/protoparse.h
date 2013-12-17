@@ -3,14 +3,14 @@ struct parsed_proto;
 
 struct parsed_proto_arg {
 	char *reg;
-	const char *type;
+	char *type;
 	struct parsed_proto *fptr;
 	void *datap;
 };
 
 struct parsed_proto {
 	char name[256];
-	const char *ret_type;
+	char *ret_type;
 	struct parsed_proto_arg arg[16];
 	int argc;
 	int argc_stack;
@@ -103,34 +103,41 @@ static int get_regparm(char *dst, size_t dlen, char *p)
 }
 
 // hmh..
+static const char *known_type_mod[] = {
+	"const",
+	"signed",
+	"unsigned",
+};
+
 static const char *known_types[] = {
-	"const void *",
 	"void *",
 	"char *",
 	"FILE *",
 	"int *",
-	"unsigned __int8",
-	"unsigned __int16",
-	"unsigned int",
-	"signed int",
+	"__int8 *",
+	"__int16 *",
 	"char",
 	"__int8",
 	"__int16",
+	"__int32",
 	"int",
 	"bool",
 	"void",
 	"BYTE",
 	"WORD",
+	"BOOL",
 	"DWORD",
 	"_DWORD",
 	"HMODULE",
 	"HANDLE",
 	"HWND",
+	"LANGID",
 	"LPCSTR",
 	"size_t",
 };
 
-static int typecmp(const char *n, const char *t)
+// returns ptr to char after type ends
+static const char *typecmp(const char *n, const char *t)
 {
 	for (; *t != 0; n++, t++) {
 		while (n[0] == ' ' && (n[1] == ' ' || n[1] == '*'))
@@ -138,19 +145,38 @@ static int typecmp(const char *n, const char *t)
 		while (t[0] == ' ' && (t[1] == ' ' || t[1] == '*'))
 			t++;
 		if (*n != *t)
-			return *n - *t;
+			return NULL;
 	}
 
-	return 0;
+	return n;
 }
 
-static const char *check_type(const char *name)
+static char *check_type(const char *name, int *len_out)
 {
+	const char *n = name, *n1;
+	int len;
 	int i;
 
+	*len_out = 0;
+
+	for (i = 0; i < ARRAY_SIZE(known_type_mod); i++) {
+		len = strlen(known_type_mod[i]);
+		if (strncmp(n, known_type_mod[i], len) != 0)
+			continue;
+
+		n += len;
+		while (my_isblank(*n))
+			n++;
+		i = 0;
+	}
+
 	for (i = 0; i < ARRAY_SIZE(known_types); i++) {
-		if (typecmp(name, known_types[i]) == 0)
-			return known_types[i];
+		n1 = typecmp(n, known_types[i]);
+		if (n1 == NULL)
+			continue;
+
+		*len_out = n1 - name;
+		return strndup(name, *len_out);
 	}
 
 	return NULL;
@@ -181,7 +207,7 @@ static int parse_protostr(char *protostr, struct parsed_proto *pp)
 	char regparm[16];
 	char buf[256];
 	char cconv[32];
-	const char *kt;
+	char *kt;
 	int xarg = 0;
 	char *p, *p1;
 	int ret;
@@ -202,16 +228,17 @@ static int parse_protostr(char *protostr, struct parsed_proto *pp)
 
 	if (strncmp(p, "extern ", 7) == 0)
 		p = sskip(p + 7);
+	if (strncmp(p, "WINBASEAPI ", 11) == 0)
+		p = sskip(p + 11);
 
-	kt = check_type(p);
+	kt = check_type(p, &ret);
 	if (kt == NULL) {
 		printf("%s:%d:%ld: unhandled return in '%s'\n",
 			hdrfn, hdrfline, (p - protostr) + 1, protostr);
 		return -1;
 	}
 	pp->ret_type = kt;
-	p += strlen(kt);
-	p = sskip(p);
+	p = sskip(p + ret);
 
 	if (!strchr(p, ')')) {
 		p = next_idt(buf, sizeof(buf), p);
@@ -257,6 +284,8 @@ static int parse_protostr(char *protostr, struct parsed_proto *pp)
 		pp->is_stdcall = 1; // in all cases seen..
 	else if (IS(cconv, "__usercall"))
 		pp->is_stdcall = 0; // ..or is it?
+	else if (IS(cconv, "WINAPI"))
+		pp->is_stdcall = 1;
 	else {
 		printf("%s:%d:%ld: unhandled cconv: '%s'\n",
 			hdrfn, hdrfline, (p - protostr) + 1, cconv);
@@ -329,15 +358,14 @@ static int parse_protostr(char *protostr, struct parsed_proto *pp)
 		xarg++;
 
 		p1 = p;
-		kt = check_type(p);
+		kt = check_type(p, &ret);
 		if (kt == NULL) {
 			printf("%s:%d:%ld: unhandled type for arg%d\n",
 				hdrfn, hdrfline, (p - protostr) + 1, xarg);
 			return -1;
 		}
 		arg->type = kt;
-		p += strlen(kt);
-		p = sskip(p);
+		p = sskip(p + ret);
 
 		if (*p == '(') {
 			// func ptr
@@ -425,7 +453,11 @@ static void proto_release(struct parsed_proto *pp)
 	for (i = 0; i < pp->argc; i++) {
 		if (pp->arg[i].reg != NULL)
 			free(pp->arg[i].reg);
+		if (pp->arg[i].type != NULL)
+			free(pp->arg[i].type);
 		if (pp->arg[i].fptr != NULL)
 			free(pp->arg[i].fptr);
 	}
+	if (pp->ret_type != NULL)
+		free(pp->ret_type);
 }
