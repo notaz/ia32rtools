@@ -129,8 +129,8 @@ struct parsed_op {
   int pfomask;            // flagop: parsed_flag_op that can't be delayed
   int argmask;            // push: args that are altered before call
   int cc_scratch;         // scratch storage during analysis
-  int bt_i;               // branch target (for branches)
-  struct parsed_op *lrl;  // label reference list entry
+  int bt_i;               // branch target for branches
+  struct parsed_data *btj;// branch targets for jumptables
   void *datap;
 };
 
@@ -142,6 +142,26 @@ struct parsed_equ {
   char name[64];
   enum opr_lenmod lmod;
   int offset;
+};
+
+struct parsed_data {
+  char label[256];
+  enum opr_type type;
+  enum opr_lenmod lmod;
+  int count;
+  int count_alloc;
+  struct {
+    union {
+      char *label;
+      int val;
+    } u;
+    int bt_i;
+  } *d;
+};
+
+struct label_ref {
+  int i;
+  struct label_ref *next;
 };
 
 enum ida_func_attr {
@@ -159,13 +179,16 @@ static struct parsed_op ops[MAX_OPS];
 static struct parsed_equ *g_eqs;
 static int g_eqcnt;
 static char g_labels[MAX_OPS][32];
-static struct parsed_op *g_label_refs[MAX_OPS];
+static struct label_ref g_label_refs[MAX_OPS];
 static struct parsed_proto g_func_pp;
+static struct parsed_data *g_func_pd;
+static int g_func_pd_cnt;
 static char g_func[256];
 static char g_comment[256];
 static int g_bp_frame;
 static int g_sp_frame;
 static int g_stack_fsz;
+static int g_ida_func_attr;
 #define ferr(op_, fmt, ...) do { \
   printf("error:%s:#%ld: '%s': " fmt, g_func, (op_) - ops, \
     dump_op(op_), ##__VA_ARGS__); \
@@ -329,19 +352,55 @@ pass:
   return c;
 }
 
-static const char *parse_stack_el(const char *name)
+static int is_reg_in_str(const char *s)
 {
-  const char *p, *s;
+  int i;
+
+  if (strlen(s) < 3 || (s[3] && !my_issep(s[3]) && !my_isblank(s[3])))
+    return 0;
+
+  for (i = 0; i < ARRAY_SIZE(regs_r32); i++)
+    if (!strncmp(s, regs_r32[i], 3))
+      return 1;
+
+  return 0;
+}
+
+static const char *parse_stack_el(const char *name, char *extra_reg)
+{
+  const char *p, *p2, *s;
   char *endp = NULL;
   char buf[32];
   long val;
   int len;
 
-  if (IS_START(name, "ebp+")
-      && !('0' <= name[4] && name[4] <= '9'))
-  {
-    return name + 4;
+  p = name;
+  if (IS_START(p + 3, "+ebp+") && is_reg_in_str(p)) {
+    p += 4;
+    if (extra_reg != NULL) {
+      strncpy(extra_reg, name, 3);
+      extra_reg[4] = 0;
+    }
   }
+
+  if (IS_START(p, "ebp+")) {
+    p += 4;
+
+    p2 = strchr(p, '+');
+    if (p2 != NULL && is_reg_in_str(p)) {
+      if (extra_reg != NULL) {
+        strncpy(extra_reg, p, p2 - p);
+        extra_reg[p2 - p] = 0;
+      }
+      p = p2 + 1;
+    }
+
+    if (!('0' <= *p && *p <= '9'))
+      return p;
+
+    return NULL;
+  }
+
   if (!IS_START(name, "esp+"))
     return NULL;
 
@@ -446,6 +505,19 @@ static int guess_lmod_from_c_type(struct parsed_opr *opr, const char *c_type)
 
   anote("unhandled C type '%s' for '%s'\n", c_type, opr->name);
   return 0;
+}
+
+static enum opr_type lmod_from_directive(const char *d)
+{
+  if (IS(d, "dd"))
+    return OPLM_DWORD;
+  else if (IS(d, "dw"))
+    return OPLM_WORD;
+  else if (IS(d, "db"))
+    return OPLM_BYTE;
+
+  aerr("unhandled directive: '%s'\n", d);
+  return OPLM_UNSPEC;
 }
 
 static void setup_reg_opr(struct parsed_opr *opr, int reg, enum opr_lenmod lmod,
@@ -559,10 +631,10 @@ static int parse_operand(struct parsed_opr *opr,
       aerr("[] parse failure\n");
 
     parse_indmode(opr->name, regmask_indirect, 1);
-    if (opr->lmod == OPLM_UNSPEC && parse_stack_el(opr->name)) {
+    if (opr->lmod == OPLM_UNSPEC && parse_stack_el(opr->name, NULL)) {
       // might be an equ
       struct parsed_equ *eq =
-        equ_find(NULL, parse_stack_el(opr->name), &i);
+        equ_find(NULL, parse_stack_el(opr->name, NULL), &i);
       if (eq)
         opr->lmod = eq->lmod;
     }
@@ -883,6 +955,9 @@ static const char *dump_op(struct parsed_op *po)
   char *p = out;
   int i;
 
+  if (po == NULL)
+    return "???";
+
   snprintf(out, sizeof(out), "%s", op_name(po->op));
   for (i = 0; i < po->operand_cnt; i++) {
     p += strlen(p);
@@ -894,6 +969,22 @@ static const char *dump_op(struct parsed_op *po)
   }
 
   return out;
+}
+
+static const char *lmod_type_u(struct parsed_op *po,
+  enum opr_lenmod lmod)
+{
+  switch (lmod) {
+  case OPLM_DWORD:
+    return "u32";
+  case OPLM_WORD:
+    return "u16";
+  case OPLM_BYTE:
+    return "u8";
+  default:
+    ferr(po, "invalid lmod: %d\n", lmod);
+    return "(_invalid_)";
+  }
 }
 
 static const char *lmod_cast_u(struct parsed_op *po,
@@ -1032,6 +1123,7 @@ static void stack_frame_access(struct parsed_op *po,
   const char *name, int is_src, int is_lea)
 {
   const char *prefix = "";
+  char ofs_reg[16] = { 0, };
   struct parsed_equ *eq;
   int i, arg_i, arg_s;
   const char *bp_arg;
@@ -1039,7 +1131,7 @@ static void stack_frame_access(struct parsed_op *po,
   int offset = 0;
   int sf_ofs;
 
-  bp_arg = parse_stack_el(name);
+  bp_arg = parse_stack_el(name, ofs_reg);
   snprintf(g_comment, sizeof(g_comment), "%s", bp_arg);
   eq = equ_find(po, bp_arg, &offset);
   if (eq == NULL)
@@ -1058,6 +1150,8 @@ static void stack_frame_access(struct parsed_op *po,
     if (arg_i < 0 || arg_i >= g_func_pp.argc_stack)
       ferr(po, "offset %d (%s) doesn't map to any arg\n",
         offset, bp_arg);
+    if (ofs_reg[0] != 0)
+      ferr(po, "offset reg on arg acecss?\n");
 
     for (i = arg_s = 0; i < g_func_pp.argc; i++) {
       if (g_func_pp.arg[i].reg != NULL)
@@ -1087,13 +1181,28 @@ static void stack_frame_access(struct parsed_op *po,
     switch (lmod)
     {
     case OPLM_BYTE:
-      snprintf(buf, buf_size, "%ssf.b[%d]", prefix, sf_ofs);
+      if (ofs_reg[0] != 0)
+        snprintf(buf, buf_size, "%ssf.b[%d+%s]",
+          prefix, sf_ofs, ofs_reg);
+      else
+        snprintf(buf, buf_size, "%ssf.b[%d]",
+          prefix, sf_ofs);
       break;
     case OPLM_WORD:
-      snprintf(buf, buf_size, "%ssf.w[%d]", prefix, sf_ofs / 2);
+      if (ofs_reg[0] != 0)
+        snprintf(buf, buf_size, "%ssf.w[%d+%s/2]",
+          prefix, sf_ofs / 2, ofs_reg);
+      else
+        snprintf(buf, buf_size, "%ssf.w[%d]",
+          prefix, sf_ofs / 2);
       break;
     case OPLM_DWORD:
-      snprintf(buf, buf_size, "%ssf.d[%d]", prefix, sf_ofs / 4);
+      if (ofs_reg[0] != 0)
+        snprintf(buf, buf_size, "%ssf.d[%d+%s/4]",
+          prefix, sf_ofs / 4, ofs_reg);
+      else
+        snprintf(buf, buf_size, "%ssf.d[%d]",
+          prefix, sf_ofs / 4);
       break;
     default:
       ferr(po, "bp_stack bad lmod: %d\n", lmod);
@@ -1132,7 +1241,7 @@ static char *out_src_opr(char *buf, size_t buf_size,
     break;
 
   case OPT_REGMEM:
-    if (parse_stack_el(popr->name)) {
+    if (parse_stack_el(popr->name, NULL)) {
       stack_frame_access(po, popr->lmod, buf, buf_size,
         popr->name, 1, is_lea);
       break;
@@ -1210,7 +1319,7 @@ static char *out_dst_opr(char *buf, size_t buf_size,
     break;
 
   case OPT_REGMEM:
-    if (parse_stack_el(popr->name)) {
+    if (parse_stack_el(popr->name, NULL)) {
       stack_frame_access(po, popr->lmod, buf, buf_size,
         popr->name, 0, 0);
       break;
@@ -1452,6 +1561,7 @@ static int scan_for_pop(int i, int opcnt, const char *reg,
 {
   struct parsed_op *po;
   int ret = 0;
+  int j;
 
   for (; i < opcnt; i++) {
     po = &ops[i];
@@ -1467,6 +1577,19 @@ static int scan_for_pop(int i, int opcnt, const char *reg,
       continue;
 
     if ((po->flags & OPF_JMP) && po->op != OP_CALL) {
+      if (po->btj != NULL) {
+        // jumptable
+        for (j = 0; j < po->btj->count - 1; j++) {
+          ret |= scan_for_pop(po->btj->d[j].bt_i, opcnt, reg, magic,
+                   depth, maxdepth, do_flags);
+          if (ret < 0)
+            return ret; // dead end
+        }
+        // follow last jumptable entry
+        i = po->btj->d[j].bt_i - 1;
+        continue;
+      }
+
       if (po->bt_i < 0) {
         ferr(po, "dead branch\n");
         return -1;
@@ -1677,12 +1800,27 @@ static int scan_for_esp_adjust(int i, int opcnt, int *adj)
   return -1;
 }
 
+static void add_label_ref(struct label_ref *lr, int op_i)
+{
+  struct label_ref *lr_new;
+
+  if (lr->i == -1) {
+    lr->i = op_i;
+    return;
+  }
+
+  lr_new = calloc(1, sizeof(*lr_new));
+  lr_new->i = op_i;
+  lr->next = lr_new;
+}
+
 static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
 {
   struct parsed_op *po, *delayed_flag_op = NULL, *tmp_op;
   struct parsed_opr *last_arith_dst = NULL;
   char buf1[256], buf2[256], buf3[256];
   struct parsed_proto *pp, *pp_tmp;
+  struct parsed_data *pd;
   const char *tmpname;
   enum parsed_flag_op pfo;
   int save_arg_vars = 0;
@@ -1696,9 +1834,9 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
   int found = 0;
   int depth = 0;
   int no_output;
+  int i, j, l;
   int dummy;
   int arg;
-  int i, j;
   int reg;
   int ret;
 
@@ -1728,10 +1866,12 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
     g_bp_frame = 1;
     ops[0].flags |= OPF_RMD;
     ops[1].flags |= OPF_RMD;
+    i = 2;
 
     if (ops[2].op == OP_SUB && IS(opr_name(&ops[2], 0), "esp")) {
       g_stack_fsz = opr_const(&ops[2], 1);
       ops[2].flags |= OPF_RMD;
+      i++;
     }
     else {
       // another way msvc builds stack frame..
@@ -1742,10 +1882,21 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
         ecx_push++;
         i++;
       }
+      // and another way..
+      if (i == 2 && ops[i].op == OP_MOV && ops[i].operand[0].reg == xAX
+          && ops[i].operand[1].type == OPT_CONST
+          && ops[i + 1].op == OP_CALL
+          && IS(opr_name(&ops[i + 1], 0), "__alloca_probe"))
+      {
+        g_stack_fsz += ops[i].operand[1].val;
+        ops[i].flags |= OPF_RMD;
+        i++;
+        ops[i].flags |= OPF_RMD;
+        i++;
+      }
     }
 
     found = 0;
-    i = 2;
     do {
       for (; i < opcnt; i++)
         if (ops[i].op == OP_RET)
@@ -1816,25 +1967,65 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
   for (i = 0; i < opcnt; i++) {
     po = &ops[i];
     po->bt_i = -1;
+    po->btj = NULL;
 
     if ((po->flags & OPF_RMD) || !(po->flags & OPF_JMP)
         || po->op == OP_CALL || po->op == OP_RET)
       continue;
 
-    for (j = 0; j < opcnt; j++) {
-      if (g_labels[j][0] && IS(po->operand[0].name, g_labels[j])) {
-        po->bt_i = j;
-        po->lrl = g_label_refs[j];
-        g_label_refs[j] = po;
+    if (po->operand[0].type == OPT_REGMEM) {
+      char *p = strchr(po->operand[0].name, '[');
+      if (p == NULL)
+        ferr(po, "unhandled indirect branch\n");
+      ret = p - po->operand[0].name;
+      strncpy(buf1, po->operand[0].name, ret);
+      buf1[ret] = 0;
+
+      for (j = 0, pd = NULL; j < g_func_pd_cnt; j++) {
+        if (IS(g_func_pd[j].label, buf1)) {
+          pd = &g_func_pd[j];
+          break;
+        }
+      }
+      if (pd == NULL)
+        ferr(po, "label '%s' not parsed?\n", buf1);
+      if (pd->type != OPT_OFFSET)
+        ferr(po, "label '%s' with non-offset data?\n", buf1);
+
+      // find all labels, link
+      for (j = 0; j < pd->count; j++) {
+        for (l = 0; l < opcnt; l++) {
+          if (g_labels[l][0] && IS(g_labels[l], pd->d[j].u.label)) {
+            add_label_ref(&g_label_refs[l], i);
+            pd->d[j].bt_i = l;
+            break;
+          }
+        }
+      }
+
+      po->btj = pd;
+      continue;
+    }
+
+    for (l = 0; l < opcnt; l++) {
+      if (g_labels[l][0] && IS(po->operand[0].name, g_labels[l])) {
+        add_label_ref(&g_label_refs[l], i);
+        po->bt_i = l;
         break;
       }
     }
 
-    if (po->bt_i == -1) {
+    if (po->bt_i != -1)
+      continue;
+
+    if (po->operand[0].type == OPT_LABEL) {
       // assume tail call
       po->op = OP_CALL;
       po->flags |= OPF_TAIL;
+      continue;
     }
+
+    ferr(po, "unhandled branch\n");
   }
 
   // pass3:
@@ -1886,6 +2077,7 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
         }
       }
 
+      // collect all stack args
       for (arg = 0; arg < pp->argc; arg++)
         if (pp->arg[arg].reg == NULL)
           break;
@@ -1897,11 +2089,11 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
             || (ops[j - 1].flags & (OPF_JMP|OPF_CC)) == OPF_JMP))
           {
             // follow the branch in reverse
-            if (g_label_refs[j] == NULL)
+            if (g_label_refs[j].i == -1)
               ferr(po, "no refs for '%s'?\n", g_labels[j]);
-            if (g_label_refs[j]->lrl != NULL)
-              ferr(po, "unhandled multiple fefs to '%s'\n", g_labels[j]);
-            j = (g_label_refs[j] - ops) + 1;
+            if (g_label_refs[j].next != NULL)
+              ferr(po, "unhandled multiple refs to '%s'\n", g_labels[j]);
+            j = g_label_refs[j].i + 1;
             continue;
           }
           break;
@@ -2045,6 +2237,32 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
     }
   }
 
+  // output LUTs/jumptables
+  for (i = 0; i < g_func_pd_cnt; i++) {
+    pd = &g_func_pd[i];
+    fprintf(fout, "  static const ");
+    if (pd->type == OPT_OFFSET) {
+      fprintf(fout, "void *jt_%s[] =\n    { ", pd->label);
+
+      for (j = 0; j < pd->count; j++) {
+        if (j > 0)
+          fprintf(fout, ", ");
+        fprintf(fout, "&&%s", pd->d[j].u.label);
+      }
+    }
+    else {
+      fprintf(fout, "%s %s[] =\n    { ",
+        lmod_type_u(ops, pd->lmod), pd->label);
+
+      for (j = 0; j < pd->count; j++) {
+        if (j > 0)
+          fprintf(fout, ", ");
+        fprintf(fout, "%u", pd->d[j].u.val);
+      }
+    }
+    fprintf(fout, " };\n");
+  }
+
   // declare stack frame
   if (g_stack_fsz)
     fprintf(fout, "  union { u32 d[%d]; u16 w[%d]; u8 b[%d]; } sf;\n",
@@ -2122,7 +2340,7 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
   // output ops
   for (i = 0; i < opcnt; i++)
   {
-    if (g_labels[i][0] != 0 && g_label_refs[i] != NULL)
+    if (g_labels[i][0] != 0 && g_label_refs[i].i != -1)
       fprintf(fout, "\n%s:\n", g_labels[i]);
 
     po = &ops[i];
@@ -2456,8 +2674,17 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
 
       case OP_JMP:
         assert_operand_cnt(1);
-        if (po->operand[0].type != OPT_LABEL)
-          ferr(po, "unhandled call type\n");
+        if (po->operand[0].type == OPT_REGMEM) {
+          ret = sscanf(po->operand[0].name, "%[^[][%[^*]*4]",
+                  buf1, buf2);
+          if (ret != 2)
+            ferr(po, "parse failure for jmp '%s'\n",
+              po->operand[0].name);
+          fprintf(fout, "  goto *jt_%s[%s];", buf1, buf2);
+          break;
+        }
+        else if (po->operand[0].type != OPT_LABEL)
+          ferr(po, "unhandled jmp type\n");
 
         fprintf(fout, "  goto %s;", po->operand[0].name);
         break;
@@ -2601,6 +2828,17 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
 
   // cleanup
   for (i = 0; i < opcnt; i++) {
+    struct label_ref *lr, *lr_del;
+
+    lr = g_label_refs[i].next;
+    while (lr != NULL) {
+      lr_del = lr;
+      lr = lr->next;
+      free(lr_del);
+    }
+    g_label_refs[i].i = -1;
+    g_label_refs[i].next = NULL;
+
     if (ops[i].op == OP_CALL) {
       pp = ops[i].datap;
       if (pp) {
@@ -2658,21 +2896,24 @@ static int cmpstringp(const void *p1, const void *p2)
 int main(int argc, char *argv[])
 {
   FILE *fout, *fasm, *frlist;
-  char line[256];
-  char words[16][256];
-  int ida_func_attr = 0;
-  int in_func = 0;
-  int skip_func = 0;
-  int skip_warned = 0;
-  int eq_alloc;
+  struct parsed_data *pd = NULL;
+  int pd_alloc = 0;
   char **rlist = NULL;
   int rlist_len = 0;
   int rlist_alloc = 0;
+  char line[256];
+  char words[16][256];
+  enum opr_lenmod lmod;
+  int in_func = 0;
+  int pending_endp = 0;
+  int skip_func = 0;
+  int skip_warned = 0;
+  int eq_alloc;
   int verbose = 0;
   int arg_out;
   int arg = 1;
   int pi = 0;
-  int i, len;
+  int i, j, len;
   char *p;
   int wordc;
 
@@ -2738,8 +2979,14 @@ int main(int argc, char *argv[])
   g_eqs = malloc(eq_alloc * sizeof(g_eqs[0]));
   my_assert_not(g_eqs, NULL);
 
+  for (i = 0; i < ARRAY_SIZE(g_label_refs); i++) {
+    g_label_refs[i].i = -1;
+    g_label_refs[i].next = NULL;
+  }
+
   while (fgets(line, sizeof(line), fasm))
   {
+    wordc = 0;
     asmln++;
 
     p = sskip(line);
@@ -2755,11 +3002,14 @@ int main(int argc, char *argv[])
         "thunk",
         "fpd=",
       };
-      if (p[2] != 'A' || strncmp(p, "; Attributes:", 13) != 0)
+      if (p[2] == '=' && IS_START(p, "; =============== S U B"))
+        goto do_pending_endp; // eww..
+
+      if (p[2] != 'A' || !IS_START(p, "; Attributes:"))
         continue;
 
       // parse IDA's attribute-list comment
-      ida_func_attr = 0;
+      g_ida_func_attr = 0;
       p = sskip(p + 13);
       // get rid of random tabs
       for (i = 0; p[i] != 0; i++)
@@ -2769,7 +3019,7 @@ int main(int argc, char *argv[])
       for (; *p != 0; p = sskip(p)) {
         for (i = 0; i < ARRAY_SIZE(attrs); i++) {
           if (!strncmp(p, attrs[i], strlen(attrs[i]))) {
-            ida_func_attr |= 1 << i;
+            g_ida_func_attr |= 1 << i;
             p += strlen(attrs[i]);
             break;
           }
@@ -2819,12 +3069,95 @@ parse_words:
       continue;
     }
 
+do_pending_endp:
+    // do delayed endp processing to collect switch jumptables
+    if (pending_endp) {
+      if (in_func && !skip_func && wordc >= 2
+          && ((words[0][0] == 'd' && words[0][2] == 0)
+              || (words[1][0] == 'd' && words[1][2] == 0)))
+      {
+        i = 1;
+        if (words[1][0] == 'd' && words[1][2] == 0) {
+          // label
+          if (g_func_pd_cnt >= pd_alloc) {
+            pd_alloc = pd_alloc * 2 + 16;
+            g_func_pd = realloc(g_func_pd,
+              sizeof(g_func_pd[0]) * pd_alloc);
+            my_assert_not(g_func_pd, NULL);
+          }
+          pd = &g_func_pd[g_func_pd_cnt];
+          g_func_pd_cnt++;
+          memset(pd, 0, sizeof(*pd));
+          strcpy(pd->label, words[0]);
+          pd->type = OPT_CONST;
+          pd->lmod = lmod_from_directive(words[1]);
+          i = 2;
+        }
+        else {
+          lmod = lmod_from_directive(words[0]);
+          if (lmod != pd->lmod)
+            aerr("lmod change? %d->%d\n", pd->lmod, lmod);
+        }
+
+        if (pd->count_alloc < pd->count + wordc) {
+          pd->count_alloc = pd->count_alloc * 2 + 14 + wordc;
+          pd->d = realloc(pd->d, sizeof(pd->d[0]) * pd->count_alloc);
+          my_assert_not(pd->d, NULL);
+        }
+        for (; i < wordc; i++) {
+          if (IS(words[i], "offset")) {
+            pd->type = OPT_OFFSET;
+            i++;
+          }
+          p = strchr(words[i], ',');
+          if (p != NULL)
+            *p = 0;
+          if (pd->type == OPT_OFFSET)
+            pd->d[pd->count].u.label = strdup(words[i]);
+          else
+            pd->d[pd->count].u.val = parse_number(words[i]);
+          pd->d[pd->count].bt_i = -1;
+          pd->count++;
+        }
+        continue;
+      }
+
+      if (in_func && !skip_func)
+        gen_func(fout, g_fhdr, g_func, pi);
+
+      pending_endp = 0;
+      in_func = 0;
+      g_ida_func_attr = 0;
+      skip_warned = 0;
+      skip_func = 0;
+      g_func[0] = 0;
+      if (pi != 0) {
+        memset(&ops, 0, pi * sizeof(ops[0]));
+        memset(g_labels, 0, pi * sizeof(g_labels[0]));
+        pi = 0;
+      }
+      g_eqcnt = 0;
+      for (i = 0; i < g_func_pd_cnt; i++) {
+        pd = &g_func_pd[i];
+        if (pd->type == OPT_OFFSET) {
+          for (j = 0; j < pd->count; j++)
+            free(pd->d[j].u.label);
+        }
+        free(pd->d);
+        pd->d = NULL;
+      }
+      g_func_pd_cnt = 0;
+      pd = NULL;
+      if (wordc == 0)
+        continue;
+    }
+
     if (IS(words[1], "proc")) {
       if (in_func)
         aerr("proc '%s' while in_func '%s'?\n",
           words[0], g_func);
       p = words[0];
-      if ((ida_func_attr & IDAFA_THUNK)
+      if ((g_ida_func_attr & IDAFA_THUNK)
        || bsearch(&p, rlist, rlist_len, sizeof(rlist[0]), cmpstringp))
         skip_func = 1;
       strcpy(g_func, words[0]);
@@ -2840,21 +3173,7 @@ parse_words:
         aerr("endp '%s' while in_func '%s'?\n",
           words[0], g_func);
 
-      if (in_func && !skip_func)
-        gen_func(fout, g_fhdr, g_func, pi);
-
-      in_func = 0;
-      skip_warned = 0;
-      skip_func = 0;
-      g_func[0] = 0;
-      if (pi != 0) {
-        memset(&ops, 0, pi * sizeof(ops[0]));
-        memset(g_labels, 0, pi * sizeof(g_labels[0]));
-        memset(g_label_refs, 0, pi * sizeof(g_label_refs[0]));
-        pi = 0;
-      }
-      g_eqcnt = 0;
-      ida_func_attr = 0;
+      pending_endp = 1;
       continue;
     }
 
@@ -2874,7 +3193,7 @@ parse_words:
       continue;
     }
 
-    if (IS(words[1], "=")) {
+    if (wordc > 1 && IS(words[1], "=")) {
       if (wordc != 5)
         aerr("unhandled equ, wc=%d\n", wordc);
       if (g_eqcnt >= eq_alloc) {
