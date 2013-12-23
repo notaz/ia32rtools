@@ -17,6 +17,7 @@ struct parsed_proto {
 	int argc_reg;
 	unsigned int is_func:1;
 	unsigned int is_stdcall:1;
+	unsigned int is_vararg:1;
 	unsigned int is_fptr:1;
 	unsigned int is_array:1;
 };
@@ -354,6 +355,18 @@ static int parse_protostr(char *protostr, struct parsed_proto *pp)
 		if (*p == ',')
 			p = sskip(p + 1);
 
+		if (!strncmp(p, "...", 3)) {
+			pp->is_vararg = 1;
+			p = sskip(p + 3);
+			if (*p == ')') {
+				p++;
+				break;
+			}
+			printf("%s:%d:%ld: ')' expected\n",
+				hdrfn, hdrfline, (p - protostr) + 1);
+			return -1;
+		}
+
 		arg = &pp->arg[xarg];
 		xarg++;
 
@@ -416,6 +429,11 @@ static int parse_protostr(char *protostr, struct parsed_proto *pp)
 				hdrfn, hdrfline, cconv, pp->arg[1].reg);
 		}
 		pp->arg[1].reg = strdup("edx");
+	}
+
+	if (pp->is_vararg && pp->is_stdcall) {
+		printf("%s:%d: vararg stdcall?\n", hdrfn, hdrfline);
+		return -1;
 	}
 
 	pp->argc = xarg;

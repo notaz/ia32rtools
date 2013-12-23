@@ -33,8 +33,10 @@ enum op_flags {
   OPF_JMP    = (1 << 3), /* branches, ret and call */
   OPF_CC     = (1 << 4), /* uses flags */
   OPF_TAIL   = (1 << 5), /* ret or tail call */
-  OPF_REP    = (1 << 6), /* prefixed by rep */
-  OPF_RSAVE  = (1 << 7), /* push/pop is local reg save/load */
+  OPF_RSAVE  = (1 << 6), /* push/pop is local reg save/load */
+  OPF_REP    = (1 << 7), /* prefixed by rep */
+  OPF_REPZ   = (1 << 8), /* rep is repe/repz */
+  OPF_REPNZ  = (1 << 9), /* rep is repne/repnz */
 };
 
 enum op_op {
@@ -50,6 +52,7 @@ enum op_op {
 	OP_CDQ,
 	OP_STOS,
 	OP_MOVS,
+	OP_CMPS,
 	OP_RET,
 	OP_ADD,
 	OP_SUB,
@@ -113,7 +116,8 @@ enum opr_lenmod {
 struct parsed_opr {
   enum opr_type type;
   enum opr_lenmod lmod;
-  unsigned int is_ptr:1;  // pointer in C
+  unsigned int is_ptr:1;   // pointer in C
+  unsigned int is_array:1; // array in C
   int reg;
   unsigned int val;
   char name[256];
@@ -675,6 +679,7 @@ static int parse_operand(struct parsed_opr *opr,
     }
     else if (opr->lmod == OPLM_UNSPEC)
       guess_lmod_from_c_type(opr, pp.ret_type);
+    opr->is_array = pp.is_array;
   }
   proto_release(&pp);
 
@@ -688,6 +693,10 @@ static const struct {
   unsigned int flags;
 } pref_table[] = {
   { "rep",    OPF_REP },
+  { "repe",   OPF_REP|OPF_REPZ },
+  { "repz",   OPF_REP|OPF_REPZ },
+  { "repne",  OPF_REP|OPF_REPNZ },
+  { "repnz",  OPF_REP|OPF_REPNZ },
 };
 
 static const struct {
@@ -712,6 +721,9 @@ static const struct {
   { "movsb",OP_MOVS,   0, 0, OPF_DATA },
   { "movsw",OP_MOVS,   0, 0, OPF_DATA },
   { "movsd",OP_MOVS,   0, 0, OPF_DATA },
+  { "cmpsb",OP_CMPS,   0, 0, OPF_DATA|OPF_FLAGS },
+  { "cmpsw",OP_CMPS,   0, 0, OPF_DATA|OPF_FLAGS },
+  { "cmpsd",OP_CMPS,   0, 0, OPF_DATA|OPF_FLAGS },
   { "add",  OP_ADD,    2, 2, OPF_DATA|OPF_FLAGS },
   { "sub",  OP_SUB,    2, 2, OPF_DATA|OPF_FLAGS },
   { "and",  OP_AND,    2, 2, OPF_DATA|OPF_FLAGS },
@@ -885,13 +897,14 @@ static void parse_op(struct parsed_op *op, char words[16][256], int wordc)
     break;
 
   case OP_MOVS:
+  case OP_CMPS:
     if (op->operand_cnt != 0)
       break;
-    if      (IS(words[op_w], "movsb"))
+    if      (words[op_w][4] == 'b')
       lmod = OPLM_BYTE;
-    else if (IS(words[op_w], "movsw"))
+    else if (words[op_w][4] == 'w')
       lmod = OPLM_WORD;
-    else if (IS(words[op_w], "movsd"))
+    else if (words[op_w][4] == 'd')
       lmod = OPLM_DWORD;
     op->operand_cnt = 3;
     setup_reg_opr(&op->operand[0], xDI, lmod, &op->regmask_src);
@@ -930,6 +943,14 @@ static void parse_op(struct parsed_op *op, char words[16][256], int wordc)
   case OP_ROR:
     if (op->operand[1].lmod == OPLM_UNSPEC)
       op->operand[1].lmod = OPLM_BYTE;
+    break;
+
+  case OP_PUSH:
+    if (op->operand[0].lmod == OPLM_UNSPEC
+        && (op->operand[0].type == OPT_CONST
+         || op->operand[0].type == OPT_OFFSET
+         || op->operand[0].type == OPT_LABEL))
+      op->operand[0].lmod = OPLM_DWORD;
     break;
 
   default:
@@ -1151,7 +1172,7 @@ static void stack_frame_access(struct parsed_op *po,
       ferr(po, "offset %d (%s) doesn't map to any arg\n",
         offset, bp_arg);
     if (ofs_reg[0] != 0)
-      ferr(po, "offset reg on arg acecss?\n");
+      ferr(po, "offset reg on arg access?\n");
 
     for (i = arg_s = 0; i < g_func_pp.argc; i++) {
       if (g_func_pp.arg[i].reg != NULL)
@@ -1165,7 +1186,43 @@ static void stack_frame_access(struct parsed_op *po,
     if (is_lea)
       ferr(po, "lea to arg?\n");
 
-    snprintf(buf, buf_size, "%sa%d", is_src ? "(u32)" : "", i + 1);
+    switch (lmod)
+    {
+    case OPLM_BYTE:
+      if (is_src && (offset & 3) == 0)
+        snprintf(buf, buf_size, "(u8)a%d", i + 1);
+      else
+        snprintf(buf, buf_size, "BYTE%d(a%d)", offset & 3, i + 1);
+      break;
+
+    case OPLM_WORD:
+      if (offset & 1)
+        ferr(po, "unaligned arg access\n");
+      if (is_src && (offset & 2) == 0)
+        snprintf(buf, buf_size, "(u16)a%d", i + 1);
+      else
+        snprintf(buf, buf_size, "%sWORD(a%d)",
+          (offset & 2) ? "HI" : "LO", i + 1);
+      break;
+
+    case OPLM_DWORD:
+      if (offset & 3)
+        ferr(po, "unaligned arg access\n");
+      snprintf(buf, buf_size, "%sa%d", is_src ? "(u32)" : "", i + 1);
+      break;
+
+    default:
+      ferr(po, "bp_arg bad lmod: %d\n", lmod);
+    }
+
+    // common problem
+    if ((offset & 3)
+        && (strstr(g_func_pp.arg[i].type, "int8")
+         || strstr(g_func_pp.arg[i].type, "int16")))
+    {
+      ferr(po, "bp_arg arg/w offset %d and type '%s'\n",
+        offset, g_func_pp.arg[i].type);
+    }
   }
   else {
     if (g_stack_fsz == 0)
@@ -1181,29 +1238,36 @@ static void stack_frame_access(struct parsed_op *po,
     switch (lmod)
     {
     case OPLM_BYTE:
-      if (ofs_reg[0] != 0)
-        snprintf(buf, buf_size, "%ssf.b[%d+%s]",
-          prefix, sf_ofs, ofs_reg);
-      else
-        snprintf(buf, buf_size, "%ssf.b[%d]",
-          prefix, sf_ofs);
+      snprintf(buf, buf_size, "%ssf.b[%d%s%s]",
+        prefix, sf_ofs, ofs_reg[0] ? "+" : "", ofs_reg);
       break;
+
     case OPLM_WORD:
-      if (ofs_reg[0] != 0)
-        snprintf(buf, buf_size, "%ssf.w[%d+%s/2]",
-          prefix, sf_ofs / 2, ofs_reg);
-      else
-        snprintf(buf, buf_size, "%ssf.w[%d]",
-          prefix, sf_ofs / 2);
+      if ((sf_ofs & 1) || ofs_reg[0] != 0) {
+        // known unaligned or possibly unaligned
+        strcat(g_comment, " unaligned");
+        if (prefix[0] == 0)
+          prefix = "*(u16 *)&";
+        snprintf(buf, buf_size, "%ssf.b[%d%s%s]",
+          prefix, sf_ofs, ofs_reg[0] ? "+" : "", ofs_reg);
+        break;
+      }
+      snprintf(buf, buf_size, "%ssf.w[%d]", prefix, sf_ofs / 2);
       break;
+
     case OPLM_DWORD:
-      if (ofs_reg[0] != 0)
-        snprintf(buf, buf_size, "%ssf.d[%d+%s/4]",
-          prefix, sf_ofs / 4, ofs_reg);
-      else
-        snprintf(buf, buf_size, "%ssf.d[%d]",
-          prefix, sf_ofs / 4);
+      if ((sf_ofs & 3) || ofs_reg[0] != 0) {
+        // known unaligned or possibly unaligned
+        strcat(g_comment, " unaligned");
+        if (prefix[0] == 0)
+          prefix = "*(u32 *)&";
+        snprintf(buf, buf_size, "%ssf.b[%d%s%s]",
+          prefix, sf_ofs, ofs_reg[0] ? "+" : "", ofs_reg);
+        break;
+      }
+      snprintf(buf, buf_size, "%ssf.d[%d]", prefix, sf_ofs / 4);
       break;
+
     default:
       ferr(po, "bp_stack bad lmod: %d\n", lmod);
     }
@@ -1270,7 +1334,10 @@ static char *out_src_opr(char *buf, size_t buf_size,
     if (is_lea)
       snprintf(buf, buf_size, "(u32)&%s", popr->name);
     else
-      snprintf(buf, buf_size, "(u32)%s", popr->name);
+      snprintf(buf, buf_size, "%s%s%s",
+        popr->is_ptr ? "(u32)" : "",
+        popr->name,
+        popr->is_array ? "[0]" : "");
     break;
 
   case OPT_OFFSET:
@@ -1328,7 +1395,8 @@ static char *out_dst_opr(char *buf, size_t buf_size,
     return out_src_opr(buf, buf_size, po, popr, 0);
 
   case OPT_LABEL:
-    snprintf(buf, buf_size, "%s", popr->name);
+    snprintf(buf, buf_size, "%s%s", popr->name,
+      popr->is_array ? "[0]" : "");
     break;
 
   default:
@@ -1780,19 +1848,27 @@ static int scan_for_reg_clear(int i, int reg)
 // scan for positive, constant esp adjust
 static int scan_for_esp_adjust(int i, int opcnt, int *adj)
 {
+  struct parsed_op *po;
+  *adj = 0;
+
   for (; i < opcnt; i++) {
-    if (ops[i].op == OP_ADD && ops[i].operand[0].reg == xSP) {
-      if (ops[i].operand[1].type != OPT_CONST)
+    po = &ops[i];
+
+    if (po->op == OP_ADD && po->operand[0].reg == xSP) {
+      if (po->operand[1].type != OPT_CONST)
         ferr(&ops[i], "non-const esp adjust?\n");
-      *adj = ops[i].operand[1].val;
+      *adj += po->operand[1].val;
       if (*adj & 3)
         ferr(&ops[i], "unaligned esp adjust: %x\n", *adj);
       return i;
     }
-
-    if ((ops[i].flags & (OPF_JMP|OPF_TAIL))
-         || ops[i].op == OP_PUSH || ops[i].op == OP_POP)
+    else if (po->op == OP_PUSH)
+      *adj -= lmod_bytes(po, po->operand[0].lmod);
+    else if (po->op == OP_POP)
+      *adj += lmod_bytes(po, po->operand[0].lmod);
+    else if ((po->flags & (OPF_JMP|OPF_TAIL)) && po->op != OP_CALL)
       return -1;
+
     if (g_labels[i][0] != 0)
       return -1;
   }
@@ -2060,13 +2136,37 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
           ferr(po, "proto_parse failed for call '%s'\n", tmpname);
       }
 
-      ret = scan_for_esp_adjust(i + 1, opcnt, &j);
+      // look for and make use of esp adjust
+      ret = -1;
+      if (!pp->is_stdcall)
+        ret = scan_for_esp_adjust(i + 1, opcnt, &j);
       if (ret >= 0) {
+        if (pp->is_vararg) {
+          if (j / 4 < pp->argc_stack)
+            ferr(po, "esp adjust is too small: %x < %x\n",
+              j, pp->argc_stack * 4);
+          // modify pp to make it have varargs as normal args
+          arg = pp->argc;
+          pp->argc += j / 4 - pp->argc_stack;
+          for (; arg < pp->argc; arg++) {
+            pp->arg[arg].type = strdup("int");
+            pp->argc_stack++;
+          }
+          if (pp->argc > ARRAY_SIZE(pp->arg))
+            ferr(po, "too many args\n");
+        }
         if (pp->argc_stack != j / 4)
           ferr(po, "stack tracking failed: %x %x\n",
-            pp->argc_stack, j);
+            pp->argc_stack * 4, j);
+
         ops[ret].flags |= OPF_RMD;
+        // a bit of a hack, but deals with use of
+        // single adj for multiple calls
+        ops[ret].operand[1].val -= j;
       }
+      else if (pp->is_vararg)
+        ferr(po, "missing esp_adjust for vararg func '%s'\n",
+          pp->name);
 
       // can't call functions with non-__cdecl callbacks yet
       for (arg = 0; arg < pp->argc; arg++) {
@@ -2204,6 +2304,9 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
       if (tmp_op->op == OP_TEST || tmp_op->op == OP_CMP) {
         if (scan_for_mod(tmp_op, ret + 1, i) >= 0)
           pfomask = 1 << pfo;
+      }
+      else if (tmp_op->op == OP_CMPS) {
+        pfomask = 1 << PFO_Z;
       }
       else {
         if ((pfo != PFO_Z && pfo != PFO_S && pfo != PFO_P)
@@ -2377,7 +2480,7 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
         is_delayed = 1;
       }
       else if (po->datap != NULL) {
-        // use preprocessed results
+        // use preprocessed flag calc results
         tmp_op = po->datap;
         if (!tmp_op || !(tmp_op->pfomask & (1 << pfo)))
           ferr(po, "not prepared for pfo %d\n", pfo);
@@ -2503,6 +2606,35 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
             buf1, buf1, j, j);
           strcpy(g_comment, "movs");
         }
+        break;
+
+      case OP_CMPS:
+        // assumes DF=0
+        // repe ~ repeat while ZF=1
+        assert_operand_cnt(3);
+        j = lmod_bytes(po, po->operand[0].lmod);
+        strcpy(buf1, lmod_cast_u_ptr(po, po->operand[0].lmod));
+        if (po->flags & OPF_REP) {
+          fprintf(fout,
+            "  for (; ecx != 0; ecx--, edi += %d, esi += %d)\n",
+            j, j);
+          fprintf(fout,
+            "    if ((cond_z = (%sedi == %sesi)) %s 0)\n",
+              buf1, buf1, (po->flags & OPF_REPZ) ? "==" : "!=");
+          fprintf(fout,
+            "      break;");
+          snprintf(g_comment, sizeof(g_comment), "rep%s cmps",
+            (po->flags & OPF_REPZ) ? "e" : "ne");
+        }
+        else {
+          fprintf(fout,
+            "    cond_z = (%sedi = %sesi); edi += %d; esi += %d;",
+            buf1, buf1, j, j);
+          strcpy(g_comment, "cmps");
+        }
+        pfomask &= ~(1 << PFO_Z);
+        last_arith_dst = NULL;
+        delayed_flag_op = NULL;
         break;
 
       // arithmetic w/flags
@@ -2662,6 +2794,7 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
         }
         else
           no_output = 1;
+        last_arith_dst = NULL;
         delayed_flag_op = po;
         break;
 
@@ -2801,6 +2934,13 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
         break;
     }
 
+    // some sanity checking
+    if ((po->flags & OPF_REP) && po->op != OP_STOS
+        && po->op != OP_MOVS && po->op != OP_CMPS)
+      ferr(po, "unexpected rep\n");
+    if ((po->flags & (OPF_REPZ|OPF_REPNZ)) && po->op != OP_CMPS)
+      ferr(po, "unexpected repz/repnz\n");
+
     if (g_comment[0] != 0) {
       fprintf(fout, "  // %s", g_comment);
       g_comment[0] = 0;
@@ -2810,7 +2950,7 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
       fprintf(fout, "\n");
 
     if (pfomask != 0)
-        ferr(po, "missed flag calc, pfomask=%x\n", pfomask);
+      ferr(po, "missed flag calc, pfomask=%x\n", pfomask);
 
     // see is delayed flag stuff is still valid
     if (delayed_flag_op != NULL && delayed_flag_op != po) {
