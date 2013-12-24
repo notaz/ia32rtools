@@ -234,7 +234,7 @@ static int parse_protostr(char *protostr, struct parsed_proto *pp)
 
 	kt = check_type(p, &ret);
 	if (kt == NULL) {
-		printf("%s:%d:%ld: unhandled return in '%s'\n",
+		printf("%s:%d:%zd: unhandled return in '%s'\n",
 			hdrfn, hdrfline, (p - protostr) + 1, protostr);
 		return -1;
 	}
@@ -245,7 +245,7 @@ static int parse_protostr(char *protostr, struct parsed_proto *pp)
 		p = next_idt(buf, sizeof(buf), p);
 		p = sskip(p);
 		if (buf[0] == 0) {
-			printf("%s:%d:%ld: var name missing\n",
+			printf("%s:%d:%zd: var name missing\n",
 				hdrfn, hdrfline, (p - protostr) + 1);
 			return -1;
 		}
@@ -269,7 +269,7 @@ static int parse_protostr(char *protostr, struct parsed_proto *pp)
 	p = next_word(cconv, sizeof(cconv), p);
 	p = sskip(p);
 	if (cconv[0] == 0) {
-		printf("%s:%d:%ld: cconv missing\n",
+		printf("%s:%d:%zd: cconv missing\n",
 			hdrfn, hdrfline, (p - protostr) + 1);
 		return -1;
 	}
@@ -288,14 +288,14 @@ static int parse_protostr(char *protostr, struct parsed_proto *pp)
 	else if (IS(cconv, "WINAPI"))
 		pp->is_stdcall = 1;
 	else {
-		printf("%s:%d:%ld: unhandled cconv: '%s'\n",
+		printf("%s:%d:%zd: unhandled cconv: '%s'\n",
 			hdrfn, hdrfline, (p - protostr) + 1, cconv);
 		return -1;
 	}
 
 	if (pp->is_fptr) {
 		if (*p != '*') {
-			printf("%s:%d:%ld: '*' expected\n",
+			printf("%s:%d:%zd: '*' expected\n",
 				hdrfn, hdrfline, (p - protostr) + 1);
 			return -1;
 		}
@@ -305,7 +305,7 @@ static int parse_protostr(char *protostr, struct parsed_proto *pp)
 	p = next_idt(buf, sizeof(buf), p);
 	p = sskip(p);
 	if (buf[0] == 0) {
-		printf("%s:%d:%ld: func name missing\n",
+		printf("%s:%d:%zd: func name missing\n",
 			hdrfn, hdrfline, (p - protostr) + 1);
 		return -1;
 	}
@@ -316,7 +316,7 @@ static int parse_protostr(char *protostr, struct parsed_proto *pp)
 		if (!IS(regparm, "eax") && !IS(regparm, "ax")
 		 && !IS(regparm, "al"))
 		{
-			printf("%s:%d:%ld: bad regparm: %s\n",
+			printf("%s:%d:%zd: bad regparm: %s\n",
 				hdrfn, hdrfline, (p - protostr) + 1, regparm);
 			return -1;
 		}
@@ -326,7 +326,7 @@ static int parse_protostr(char *protostr, struct parsed_proto *pp)
 
 	if (pp->is_fptr) {
 		if (*p != ')') {
-			printf("%s:%d:%ld: ')' expected\n",
+			printf("%s:%d:%zd: ')' expected\n",
 				hdrfn, hdrfline, (p - protostr) + 1);
 			return -1;
 		}
@@ -334,7 +334,7 @@ static int parse_protostr(char *protostr, struct parsed_proto *pp)
 	}
 
 	if (*p != '(') {
-		printf("%s:%d:%ld: '(' expected, got '%c'\n",
+		printf("%s:%d:%zd: '(' expected, got '%c'\n",
 				hdrfn, hdrfline, (p - protostr) + 1, *p);
 		return -1;
 	}
@@ -362,7 +362,7 @@ static int parse_protostr(char *protostr, struct parsed_proto *pp)
 				p++;
 				break;
 			}
-			printf("%s:%d:%ld: ')' expected\n",
+			printf("%s:%d:%zd: ')' expected\n",
 				hdrfn, hdrfline, (p - protostr) + 1);
 			return -1;
 		}
@@ -373,7 +373,7 @@ static int parse_protostr(char *protostr, struct parsed_proto *pp)
 		p1 = p;
 		kt = check_type(p, &ret);
 		if (kt == NULL) {
-			printf("%s:%d:%ld: unhandled type for arg%d\n",
+			printf("%s:%d:%zd: unhandled type for arg%d\n",
 				hdrfn, hdrfline, (p - protostr) + 1, xarg);
 			return -1;
 		}
@@ -385,7 +385,7 @@ static int parse_protostr(char *protostr, struct parsed_proto *pp)
 			arg->fptr = calloc(1, sizeof(*arg->fptr));
 			ret = parse_protostr(p1, arg->fptr);
 			if (ret < 0) {
-				printf("%s:%d:%ld: funcarg parse failed\n",
+				printf("%s:%d:%zd: funcarg parse failed\n",
 					hdrfn, hdrfline, p1 - protostr);
 				return -1;
 			}
@@ -399,7 +399,7 @@ static int parse_protostr(char *protostr, struct parsed_proto *pp)
 		p = sskip(p);
 #if 0
 		if (buf[0] == 0) {
-			printf("%s:%d:%ld: idt missing for arg%d\n",
+			printf("%s:%d:%zd: idt missing for arg%d\n",
 				hdrfn, hdrfline, (p - protostr) + 1, xarg);
 			return -1;
 		}

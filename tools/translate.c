@@ -157,7 +157,7 @@ struct parsed_data {
   struct {
     union {
       char *label;
-      int val;
+      unsigned int val;
     } u;
     int bt_i;
   } *d;
@@ -194,7 +194,7 @@ static int g_sp_frame;
 static int g_stack_fsz;
 static int g_ida_func_attr;
 #define ferr(op_, fmt, ...) do { \
-  printf("error:%s:#%ld: '%s': " fmt, g_func, (op_) - ops, \
+  printf("error:%s:#%zd: '%s': " fmt, g_func, (op_) - ops, \
     dump_op(op_), ##__VA_ARGS__); \
   fcloseall(); \
   exit(1); \
@@ -236,7 +236,8 @@ static int char_array_i(const char *array[], size_t len, const char *s)
   return -1;
 }
 
-static void printf_number(char *buf, size_t buf_size, long number)
+static void printf_number(char *buf, size_t buf_size,
+  unsigned long number)
 {
   // output in C-friendly form
   snprintf(buf, buf_size, number < 10 ? "%lu" : "0x%02lx", number);
@@ -270,14 +271,14 @@ static int parse_reg(enum opr_lenmod *reg_lmod, const char *s)
   return -1;
 }
 
-static long parse_number(const char *number)
+static unsigned long parse_number(const char *number)
 {
   int len = strlen(number);
   const char *p = number;
   char *endp = NULL;
+  unsigned long ret;
   int neg = 0;
   int bad;
-  long ret;
 
   if (*p == '-') {
     neg = 1;
@@ -286,11 +287,11 @@ static long parse_number(const char *number)
   if (len > 1 && *p == '0')
     p++;
   if (number[len - 1] == 'h') {
-    ret = strtol(p, &endp, 16);
+    ret = strtoul(p, &endp, 16);
     bad = (*endp != 'h');
   }
   else {
-    ret = strtol(p, &endp, 10);
+    ret = strtoul(p, &endp, 10);
     bad = (*endp != 0);
   }
   if (bad)
@@ -542,8 +543,8 @@ static int parse_operand(struct parsed_opr *opr,
 {
   struct parsed_proto pp;
   enum opr_lenmod tmplmod;
+  unsigned long number;
   int ret, len;
-  long number;
   int wordc_in;
   char *tmp;
   int i;
