@@ -29,9 +29,11 @@ s/\<jmp\tsub_/jmp\tnear ptr sub_/;\
 
 # manual fixup:
 # - 'end start' -> 'end'
-# - 'lea     ecx, [ecx+0]' -> align
+# - 'mov edi, edi', 'lea ...' -> align
 # - add 'near ptr' to some jumps
-# - 'cmp     [ebp+edx+0], cl' -> 'cmp     [edx+ebp+0], cl'
+# - 'cmp     [ebp+edx+0], cl' -> 'cmp     [ebp+edx*1+0], cl'
 # - 0FFxxh constants - masm treats a byte, ONLY sometimes prefix with 'word ptr'
 # - jmp near:
 #   - jmp _strchr
+# - search for 'dword_xx+N', make byte/word, also word->byte
+# - get rid of type propagation, regenerate as 'simple' var_
