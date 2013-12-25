@@ -287,11 +287,11 @@ static int handle_pad(uint8_t *d_obj, uint8_t *d_exe, int maxlen)
 {
 	static const uint8_t p7[7] = { 0x8d, 0xa4, 0x24, 0x00, 0x00, 0x00, 0x00 };
 	static const uint8_t p6[6] = { 0x8d, 0x9b, 0x00, 0x00, 0x00, 0x00 };
-	static const uint8_t p5[5] = { 0x05, 0x00, 0x00, 0x00, 0x00 };
-	static const uint8_t p4[4] = { 0x8d, 0x64, 0x24, 0x00 };
-	static const uint8_t p3[3] = { 0x8d, 0x49, 0x00 };
-	static const uint8_t p2[2] = { 0x8b, 0xff };
-	static const uint8_t p1[1] = { 0x90 };
+	static const uint8_t p5[5] = { 0x05, 0x00, 0x00, 0x00, 0x00 }; // add eax, 0
+	static const uint8_t p4[4] = { 0x8d, 0x64, 0x24, 0x00 }; // lea
+	static const uint8_t p3[3] = { 0x8d, 0x49, 0x00 }; // lea ecx, [ecx]
+	static const uint8_t p2[2] = { 0x8b, 0xff }; // mov edi, edi
+	static const uint8_t p1[1] = { 0x90 }; // nop
 	int len;
 	int i;
 
@@ -494,14 +494,14 @@ int main(int argc, char *argv[])
 
 	f_obj = fopen(argv[1], "r+b");
 	if (f_obj == NULL) {
-		fprintf(stderr, "%s", argv[1]);
+		fprintf(stderr, "%s: ", argv[1]);
 		perror("");
 		return 1;
 	}
 
 	f_exe = fopen(argv[2], "r");
 	if (f_exe == NULL) {
-		fprintf(stderr, "%s", argv[2]);
+		fprintf(stderr, "%s: ", argv[2]);
 		perror("");
 		return 1;
 	}
