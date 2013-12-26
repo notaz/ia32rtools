@@ -131,12 +131,16 @@ static const char *known_ptr_types[] = {
 	"PDWORD",
 	"PVOID",
 	"PCVOID",
+	"va_list",
+	"__VALIST",
 };
 
 static const char *ignored_keywords[] = {
 	"extern",
 	"WINBASEAPI",
 	"WINUSERAPI",
+	"WINGDIAPI",
+	"WINADVAPI",
 };
 
 // returns ptr to char after type ends

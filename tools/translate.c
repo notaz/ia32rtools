@@ -1149,21 +1149,32 @@ static void stack_frame_access(struct parsed_op *po,
 {
   enum opr_lenmod tmp_lmod = OPLM_UNSPEC;
   const char *prefix = "";
+  const char *bp_arg = NULL;
   char ofs_reg[16] = { 0, };
   struct parsed_equ *eq;
+  const char *p;
+  char *endp = NULL;
   int i, arg_i, arg_s;
-  const char *bp_arg;
   int stack_ra = 0;
   int offset = 0;
   int sf_ofs;
 
-  bp_arg = parse_stack_el(name, ofs_reg);
-  snprintf(g_comment, sizeof(g_comment), "%s", bp_arg);
-  eq = equ_find(po, bp_arg, &offset);
-  if (eq == NULL)
-    ferr(po, "detected but missing eq\n");
-
-  offset += eq->offset;
+  if (!IS_START(name, "ebp-")) {
+    bp_arg = parse_stack_el(name, ofs_reg);
+    snprintf(g_comment, sizeof(g_comment), "%s", bp_arg);
+    eq = equ_find(po, bp_arg, &offset);
+    if (eq == NULL)
+      ferr(po, "detected but missing eq\n");
+    offset += eq->offset;
+  }
+  else {
+    p = name + 4;
+    if (IS_START(p, "0x"))
+      p += 2;
+    offset = -strtoul(p, &endp, 16);
+    if (*endp != 0)
+      ferr(po, "ebp- parse of '%s' failed\n", name);
+  }
 
   if (!strncmp(name, "ebp", 3))
     stack_ra = 4;
@@ -1171,11 +1182,21 @@ static void stack_frame_access(struct parsed_op *po,
   if (stack_ra <= offset && offset < stack_ra + 4)
     ferr(po, "reference to ra? %d %d\n", offset, stack_ra);
 
-  if (offset > stack_ra) {
+  if (offset > stack_ra)
+  {
     arg_i = (offset - stack_ra - 4) / 4;
     if (arg_i < 0 || arg_i >= g_func_pp.argc_stack)
-      ferr(po, "offset %d (%s) doesn't map to any arg\n",
-        offset, bp_arg);
+    {
+      if (g_func_pp.is_vararg && arg_i == g_func_pp.argc_stack && is_lea) {
+        // should be va_list
+        if (cast[0] == 0)
+          cast = "(u32)";
+        snprintf(buf, buf_size, "%sap", cast);
+        return;
+      }
+      ferr(po, "offset %d (%s,%d) doesn't map to any arg\n",
+        offset, bp_arg, arg_i);
+    }
     if (ofs_reg[0] != 0)
       ferr(po, "offset reg on arg access?\n");
 
@@ -1188,12 +1209,12 @@ static void stack_frame_access(struct parsed_op *po,
     }
     if (i == g_func_pp.argc)
       ferr(po, "arg %d not in prototype?\n", arg_i);
-    if (is_lea)
-      ferr(po, "lea to arg?\n");
 
     switch (lmod)
     {
     case OPLM_BYTE:
+      if (is_lea)
+        ferr(po, "lea/byte to arg?\n");
       if (is_src && (offset & 3) == 0)
         snprintf(buf, buf_size, "(u8)a%d", i + 1);
       else
@@ -1201,6 +1222,8 @@ static void stack_frame_access(struct parsed_op *po,
       break;
 
     case OPLM_WORD:
+      if (is_lea)
+        ferr(po, "lea/word to arg?\n");
       if (offset & 1)
         ferr(po, "unaligned arg access\n");
       if (is_src && (offset & 2) == 0)
@@ -1217,7 +1240,7 @@ static void stack_frame_access(struct parsed_op *po,
         prefix = cast;
       else if (is_src)
         prefix = "(u32)";
-      snprintf(buf, buf_size, "%sa%d", prefix, i + 1);
+      snprintf(buf, buf_size, "%s%sa%d", prefix, is_lea ? "&" : "", i + 1);
       break;
 
     default:
@@ -1230,7 +1253,8 @@ static void stack_frame_access(struct parsed_op *po,
       ferr(po, "bp_arg arg/w offset %d and type '%s'\n",
         offset, g_func_pp.arg[i].type.name);
   }
-  else {
+  else
+  {
     if (g_stack_fsz == 0)
       ferr(po, "stack var access without stackframe\n");
 
@@ -1323,7 +1347,9 @@ static char *out_src_opr(char *buf, size_t buf_size,
     break;
 
   case OPT_REGMEM:
-    if (parse_stack_el(popr->name, NULL)) {
+    if (parse_stack_el(popr->name, NULL)
+      || (g_bp_frame && IS_START(popr->name, "ebp-")))
+    {
       stack_frame_access(po, popr->lmod, buf, buf_size,
         popr->name, cast, 1, is_lea);
       break;
@@ -1411,7 +1437,9 @@ static char *out_dst_opr(char *buf, size_t buf_size,
     break;
 
   case OPT_REGMEM:
-    if (parse_stack_el(popr->name, NULL)) {
+    if (parse_stack_el(popr->name, NULL)
+      || (g_bp_frame && IS_START(popr->name, "ebp-")))
+    {
       stack_frame_access(po, popr->lmod, buf, buf_size,
         popr->name, "", 0, 0);
       break;
@@ -1960,6 +1988,11 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
       fprintf(fout, ", ");
     fprintf(fout, "%s a%d", g_func_pp.arg[i].type.name, i + 1);
   }
+  if (g_func_pp.is_vararg) {
+    if (i > 0)
+      fprintf(fout, ", ");
+    fprintf(fout, "...");
+  }
   fprintf(fout, ")\n{\n");
 
   // pass1:
@@ -2398,10 +2431,13 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
     fprintf(fout, " };\n");
   }
 
-  // declare stack frame
+  // declare stack frame, va_arg
   if (g_stack_fsz)
     fprintf(fout, "  union { u32 d[%d]; u16 w[%d]; u8 b[%d]; } sf;\n",
       (g_stack_fsz + 3) / 4, (g_stack_fsz + 1) / 2, g_stack_fsz);
+
+  if (g_func_pp.is_vararg)
+    fprintf(fout, "  va_list ap;\n");
 
   // declare arg-registers
   for (i = 0; i < g_func_pp.argc; i++) {
@@ -2473,6 +2509,12 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
 
   if (had_decl)
     fprintf(fout, "\n");
+
+  if (g_func_pp.is_vararg) {
+    if (g_func_pp.argc_stack == 0)
+      ferr(ops, "vararg func without stack args?\n");
+    fprintf(fout, "  va_start(ap, a%d);\n", g_func_pp.argc);
+  }
 
   // output ops
   for (i = 0; i < opcnt; i++)
@@ -2928,6 +2970,9 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
         break;
 
       case OP_RET:
+        if (g_func_pp.is_vararg)
+          fprintf(fout, "  va_end(ap);\n");
+ 
         if (IS(g_func_pp.ret_type.name, "void")) {
           if (i != opcnt - 1 || label_pending)
             fprintf(fout, "  return;");

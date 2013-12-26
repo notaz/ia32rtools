@@ -28,7 +28,12 @@ static void out_toasm_x86(FILE *f, char *sym, struct parsed_proto *pp)
 	int must_save = 0;
 	int sarg_ofs = 1; // stack offset to args, in DWORDs
 	int args_repushed = 0;
+	int argc_repush;
 	int i;
+
+	argc_repush = pp->argc;
+	if (pp->is_vararg)
+		argc_repush = ARRAY_SIZE(pp->arg); // hopefully enough?
 
 	for (i = 0; i < pp->argc; i++) {
 		if (pp->arg[i].reg != NULL)
@@ -43,7 +48,9 @@ static void out_toasm_x86(FILE *f, char *sym, struct parsed_proto *pp)
 		return;
 	}
 
-	if (pp->argc_stack == 0 && !must_save && !pp->is_stdcall) {
+	if (pp->argc_stack == 0 && !must_save && !pp->is_stdcall
+	     && !pp->is_vararg)
+	{
 		// load arg regs
 		for (i = 0; i < pp->argc; i++) {
 			fprintf(f, "\tmovl %d(%%esp), %%%s\n",
@@ -62,7 +69,7 @@ static void out_toasm_x86(FILE *f, char *sym, struct parsed_proto *pp)
 	}
 
 	// reconstruct arg stack
-	for (i = pp->argc - 1; i >= 0; i--) {
+	for (i = argc_repush - 1; i >= 0; i--) {
 		if (pp->arg[i].reg == NULL) {
 			fprintf(f, "\tmovl %d(%%esp), %%eax\n",
 				(i + sarg_ofs) * 4);
@@ -71,7 +78,7 @@ static void out_toasm_x86(FILE *f, char *sym, struct parsed_proto *pp)
 			args_repushed++;
 		}
 	}
-	my_assert(args_repushed, pp->argc_stack);
+	// my_assert(args_repushed, pp->argc_stack);
 
 	// load arg regs
 	for (i = 0; i < pp->argc; i++) {
@@ -99,8 +106,16 @@ static void out_toasm_x86(FILE *f, char *sym, struct parsed_proto *pp)
 static void out_fromasm_x86(FILE *f, char *sym, struct parsed_proto *pp)
 {
 	int sarg_ofs = 1; // stack offset to args, in DWORDs
+	int argc_repush;
 	int stack_args;
 	int i;
+
+	argc_repush = pp->argc;
+	stack_args = pp->argc_stack;
+	if (pp->is_vararg) {
+		argc_repush = ARRAY_SIZE(pp->arg); // hopefully enough?
+		stack_args = argc_repush - pp->argc_reg;
+	}
 
 	fprintf(f, "# %s\n", pp->is_stdcall ? "__stdcall" : "__cdecl");
 	fprintf(f, ".global %s\n", sym);
@@ -115,8 +130,7 @@ static void out_fromasm_x86(FILE *f, char *sym, struct parsed_proto *pp)
 	sarg_ofs++;
 
 	// construct arg stack
-	stack_args = pp->argc_stack;
-	for (i = pp->argc - 1; i >= 0; i--) {
+	for (i = argc_repush - 1; i >= 0; i--) {
 		if (pp->arg[i].reg == NULL) {
 			fprintf(f, "\tmovl %d(%%esp), %%edx\n",
 				(sarg_ofs + stack_args - 1) * 4);

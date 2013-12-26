@@ -86,6 +86,8 @@ size_t __cdecl 	fwrite (const void*, size_t, size_t, FILE*);
 int __cdecl 	fseek (FILE*, long, int);
 long __cdecl 	ftell (FILE*);
 void __cdecl 	rewind (FILE*);
+int __cdecl 	_snprintf (char*, size_t, const char*, ...);
+int __cdecl 	_vsnprintf (char*, size_t, const char*, __VALIST);
 
 unsigned char* __cdecl  _mbscpy (unsigned char*, const unsigned char*);
 unsigned char* __cdecl  _mbsncpy (unsigned char*, const unsigned char*, size_t);
