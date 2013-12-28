@@ -30,4 +30,5 @@
 
 #define memcpy_0 memcpy
 
+#define noreturn __attribute__((noreturn))
 

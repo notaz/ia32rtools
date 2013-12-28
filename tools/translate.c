@@ -1925,14 +1925,103 @@ static int scan_for_esp_adjust(int i, int opcnt, int *adj)
       *adj -= lmod_bytes(po, po->operand[0].lmod);
     else if (po->op == OP_POP)
       *adj += lmod_bytes(po, po->operand[0].lmod);
-    else if ((po->flags & (OPF_JMP|OPF_TAIL)) && po->op != OP_CALL)
-      return -1;
+    else if (po->flags & (OPF_JMP|OPF_TAIL)) {
+      if (po->op != OP_CALL)
+        return -1;
+      if (po->operand[0].type != OPT_LABEL)
+        return -1;
+      // TODO: should only allow combining __cdecl calls..
+    }
 
     if (g_labels[i][0] != 0)
       return -1;
   }
 
   return -1;
+}
+
+static int collect_call_args(struct parsed_op *po, int i,
+  struct parsed_proto *pp, int *save_arg_vars, int arg,
+  int need_op_saving)
+{
+  struct parsed_proto *pp_tmp;
+  struct label_ref *lr;
+  int ret = 0;
+  int j;
+
+  if (i < 0)
+    ferr(po, "no refs for '%s'?\n", g_labels[i]);
+
+  for (arg = 0; arg < pp->argc; arg++)
+    if (pp->arg[arg].reg == NULL)
+      break;
+
+  for (j = i; j >= 0 && arg < pp->argc; )
+  {
+    if (g_labels[j][0] != 0) {
+      lr = &g_label_refs[j];
+      if (lr->next != NULL)
+        need_op_saving = 1;
+      for (; lr->next; lr = lr->next)
+        ret |= collect_call_args(po, lr->i, pp, save_arg_vars,
+                 arg, need_op_saving);
+
+      if (j > 0 && ((ops[j - 1].flags & OPF_TAIL)
+        || (ops[j - 1].flags & (OPF_JMP|OPF_CC)) == OPF_JMP))
+      {
+        // follow last branch in reverse
+        j = lr->i;
+        continue;
+      }
+      need_op_saving = 1;
+      ret |= collect_call_args(po, lr->i, pp, save_arg_vars,
+               arg, need_op_saving);
+    }
+    j--;
+
+    if (ops[j].op == OP_CALL)
+    {
+      pp_tmp = ops[j].datap;
+      if (pp_tmp == NULL)
+        ferr(po, "arg collect hit unparsed call\n");
+      if (pp_tmp->argc_stack > 0)
+        ferr(po, "arg collect hit '%s' with %d stack args\n",
+          opr_name(&ops[j], 0), pp_tmp->argc_stack);
+    }
+    else if ((ops[j].flags & OPF_TAIL)
+        || (ops[j].flags & (OPF_JMP|OPF_CC)) == OPF_JMP)
+    {
+      break;
+    }
+    else if (ops[j].op == OP_PUSH)
+    {
+      pp->arg[arg].datap = &ops[j];
+      if (!need_op_saving) {
+        ret = scan_for_mod(&ops[j], j + 1, i);
+        need_op_saving = (ret >= 0);
+      }
+      if (need_op_saving) {
+        // mark this push as one that needs operand saving
+        ops[j].flags &= ~OPF_RMD;
+        ops[j].argmask |= 1 << arg;
+        *save_arg_vars |= 1 << arg;
+      }
+      else
+        ops[j].flags |= OPF_RMD;
+
+      // next arg
+      for (arg++; arg < pp->argc; arg++)
+        if (pp->arg[arg].reg == NULL)
+          break;
+    }
+  }
+
+  if (arg < pp->argc) {
+    ferr(po, "arg collect failed for '%s': %d/%d\n",
+      pp->name, arg, pp->argc);
+    ret = -1;
+  }
+  return ret;
 }
 
 static void add_label_ref(struct label_ref *lr, int op_i)
@@ -1982,7 +2071,10 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
   if (ret)
     ferr(ops, "proto_parse failed for '%s'\n", funcn);
 
-  fprintf(fout, "%s %s(", g_func_pp.ret_type.name, funcn);
+  fprintf(fout, "%s ", g_func_pp.ret_type.name);
+  if (g_ida_func_attr & IDAFA_NORETURN)
+    fprintf(fout, "noreturn ");
+  fprintf(fout, "%s(", funcn);
   for (i = 0; i < g_func_pp.argc; i++) {
     if (i > 0)
       fprintf(fout, ", ");
@@ -2045,18 +2137,20 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
       if (i == opcnt && (ops[i - 1].flags & OPF_JMP) && found)
         break;
 
-      if (ops[i - 1].op != OP_POP || !IS(opr_name(&ops[i - 1], 0), "ebp"))
+      if (ops[i - 1].op == OP_POP && IS(opr_name(&ops[i - 1], 0), "ebp"))
+        ops[i - 1].flags |= OPF_RMD;
+      else if (!(g_ida_func_attr & IDAFA_NORETURN))
         ferr(&ops[i - 1], "'pop ebp' expected\n");
-      ops[i - 1].flags |= OPF_RMD;
 
       if (g_stack_fsz != 0) {
-        if (ops[i - 2].op != OP_MOV
-            || !IS(opr_name(&ops[i - 2], 0), "esp")
-            || !IS(opr_name(&ops[i - 2], 1), "ebp"))
+        if (ops[i - 2].op == OP_MOV
+            && IS(opr_name(&ops[i - 2], 0), "esp")
+            && IS(opr_name(&ops[i - 2], 1), "ebp"))
         {
-          ferr(&ops[i - 2], "esp restore expected\n");
+          ops[i - 2].flags |= OPF_RMD;
         }
-        ops[i - 2].flags |= OPF_RMD;
+        else if (!(g_ida_func_attr & IDAFA_NORETURN))
+          ferr(&ops[i - 2], "esp restore expected\n");
 
         if (ecx_push && ops[i - 3].op == OP_POP
           && IS(opr_name(&ops[i - 3], 0), "ecx"))
@@ -2203,7 +2297,7 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
 
       // look for and make use of esp adjust
       ret = -1;
-      if (!pp->is_stdcall)
+      if (!pp->is_stdcall && pp->argc_stack > 0)
         ret = scan_for_esp_adjust(i + 1, opcnt, &j);
       if (ret >= 0) {
         if (pp->is_vararg) {
@@ -2218,11 +2312,11 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
             pp->argc_stack++;
           }
           if (pp->argc > ARRAY_SIZE(pp->arg))
-            ferr(po, "too many args\n");
+            ferr(po, "too many args for '%s'\n", tmpname);
         }
         if (pp->argc_stack != j / 4)
-          ferr(po, "stack tracking failed: %x %x\n",
-            pp->argc_stack * 4, j);
+          ferr(po, "stack tracking failed for '%s': %x %x\n",
+            tmpname, pp->argc_stack * 4, j);
 
         ops[ret].flags |= OPF_RMD;
         // a bit of a hack, but deals with use of
@@ -2242,65 +2336,7 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
         }
       }
 
-      // collect all stack args
-      for (arg = 0; arg < pp->argc; arg++)
-        if (pp->arg[arg].reg == NULL)
-          break;
-
-      for (j = i; j >= 0 && arg < pp->argc; )
-      {
-        if (g_labels[j][0] != 0) {
-          if (j > 0 && ((ops[j - 1].flags & OPF_TAIL)
-            || (ops[j - 1].flags & (OPF_JMP|OPF_CC)) == OPF_JMP))
-          {
-            // follow the branch in reverse
-            if (g_label_refs[j].i == -1)
-              ferr(po, "no refs for '%s'?\n", g_labels[j]);
-            if (g_label_refs[j].next != NULL)
-              ferr(po, "unhandled multiple refs to '%s'\n", g_labels[j]);
-            j = g_label_refs[j].i + 1;
-            continue;
-          }
-          break;
-        }
-        j--;
-
-        if (ops[j].op == OP_CALL)
-        {
-          pp_tmp = ops[j].datap;
-          if (pp_tmp == NULL)
-            ferr(po, "arg collect hit unparsed call\n");
-          if (pp_tmp->argc_stack > 0)
-            ferr(po, "arg collect hit '%s' with %d stack args\n",
-              opr_name(&ops[j], 0), pp_tmp->argc_stack);
-        }
-        else if ((ops[j].flags & OPF_TAIL)
-            || (ops[j].flags & (OPF_JMP|OPF_CC)) == OPF_JMP)
-        {
-          break;
-        }
-        else if (ops[j].op == OP_PUSH)
-        {
-          pp->arg[arg].datap = &ops[j];
-          ret = scan_for_mod(&ops[j], j + 1, i);
-          if (ret >= 0) {
-            // mark this push as one that needs operand saving
-            ops[j].flags &= ~OPF_RMD;
-            ops[j].argmask |= 1 << arg;
-            save_arg_vars |= 1 << arg;
-          }
-          else
-            ops[j].flags |= OPF_RMD;
-
-          // next arg
-          for (arg++; arg < pp->argc; arg++)
-            if (pp->arg[arg].reg == NULL)
-              break;
-        }
-      }
-      if (arg < pp->argc)
-        ferr(po, "arg collect failed for '%s': %d/%d\n",
-          tmpname, arg, pp->argc);
+      collect_call_args(po, i, pp, &save_arg_vars, 0, 0);
       po->datap = pp;
     }
   }
@@ -2960,7 +2996,9 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
 
         if (po->flags & OPF_TAIL) {
           strcpy(g_comment, "tailcall");
-          if (IS(pp->ret_type.name, "void")) {
+          if (IS(pp->ret_type.name, "void")
+           && !(g_ida_func_attr & IDAFA_NORETURN))
+          {
             fprintf(fout, "\n  return;");
             strcpy(g_comment, "^ tailcall");
           }
@@ -3000,7 +3038,9 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
           fprintf(fout, "  s_%s = %s;", buf1, buf1);
           break;
         }
-        ferr(po, "stray push encountered\n");
+        if (!(g_ida_func_attr & IDAFA_NORETURN))
+          ferr(po, "stray push encountered\n");
+        no_output = 1;
         break;
 
       case OP_POP:
@@ -3092,8 +3132,8 @@ static void set_label(int i, const char *name)
 
   if (len > sizeof(g_labels[0]) - 1)
     aerr("label '%s' too long: %d\n", name, len);
-  if (g_labels[i][0] != 0)
-    aerr("dupe label '%s'?\n", name);
+  if (g_labels[i][0] != 0 && !IS_START(g_labels[i], "algn_"))
+    aerr("dupe label '%s' vs '%s'?\n", name, g_labels[i]);
   memcpy(g_labels[i], name, len);
   g_labels[i][len] = 0;
 }
@@ -3118,6 +3158,17 @@ static char *next_word_s(char *w, size_t wsize, char *s)
 	return s + i;
 }
 
+struct chunk_item {
+  char *name;
+  long fptr;
+};
+
+static int cmp_chunks(const void *p1, const void *p2)
+{
+  const struct chunk_item *c1 = p1, *c2 = p2;
+  return strcmp(c1->name, c2->name);
+}
+
 static int cmpstringp(const void *p1, const void *p2)
 {
   return strcmp(*(char * const *)p1, *(char * const *)p2);
@@ -3131,6 +3182,13 @@ int main(int argc, char *argv[])
   char **rlist = NULL;
   int rlist_len = 0;
   int rlist_alloc = 0;
+  struct chunk_item *func_chunks;
+  int func_chunks_used = 0;
+  int func_chunks_sorted = 0;
+  int func_chunk_cnt = 0;
+  int func_chunk_alloc;
+  int func_chunk_i = -1;
+  long func_chunk_ret = 0;
   char line[256];
   char words[16][256];
   enum opr_lenmod lmod;
@@ -3143,7 +3201,8 @@ int main(int argc, char *argv[])
   int arg_out;
   int arg = 1;
   int pi = 0;
-  int i, j, len;
+  int i, j;
+  int ret, len;
   char *p;
   int wordc;
 
@@ -3173,6 +3232,10 @@ int main(int argc, char *argv[])
   my_assert_not(rlist, NULL);
   // needs special handling..
   rlist[rlist_len++] = "__alloca_probe";
+
+  func_chunk_alloc = 32;
+  func_chunks = malloc(func_chunk_alloc * sizeof(func_chunks[0]));
+  my_assert_not(func_chunks, NULL);
 
   for (; arg < argc; arg++) {
     frlist = fopen(argv[arg], "r");
@@ -3223,48 +3286,100 @@ int main(int argc, char *argv[])
     if (*p == 0)
       continue;
 
-    if (*p == ';') {
-      static const char *attrs[] = {
-        "bp-based frame",
-        "library function",
-        "static",
-        "noreturn",
-        "thunk",
-        "fpd=",
-      };
-      if (p[2] == '=' && IS_START(p, "; =============== S U B"))
-        goto do_pending_endp; // eww..
-
-      if (p[2] != 'A' || !IS_START(p, "; Attributes:"))
-        continue;
-
-      // parse IDA's attribute-list comment
-      g_ida_func_attr = 0;
-      p = sskip(p + 13);
+    if (*p == ';')
+    {
       // get rid of random tabs
       for (i = 0; p[i] != 0; i++)
         if (p[i] == '\t')
           p[i] = ' ';
 
-      for (; *p != 0; p = sskip(p)) {
-        for (i = 0; i < ARRAY_SIZE(attrs); i++) {
-          if (!strncmp(p, attrs[i], strlen(attrs[i]))) {
-            g_ida_func_attr |= 1 << i;
-            p += strlen(attrs[i]);
+      if (p[2] == '=' && IS_START(p, "; =============== S U B"))
+        goto do_pending_endp; // eww..
+
+      if (p[2] == 'A' && IS_START(p, "; Attributes:"))
+      {
+        static const char *attrs[] = {
+          "bp-based frame",
+          "library function",
+          "static",
+          "noreturn",
+          "thunk",
+          "fpd=",
+        };
+
+        // parse IDA's attribute-list comment
+        g_ida_func_attr = 0;
+        p = sskip(p + 13);
+
+        for (; *p != 0; p = sskip(p)) {
+          for (i = 0; i < ARRAY_SIZE(attrs); i++) {
+            if (!strncmp(p, attrs[i], strlen(attrs[i]))) {
+              g_ida_func_attr |= 1 << i;
+              p += strlen(attrs[i]);
+              break;
+            }
+          }
+          if (i == ARRAY_SIZE(attrs)) {
+            anote("unparsed IDA attr: %s\n", p);
             break;
           }
+          if (IS(attrs[i], "fpd=")) {
+            p = next_word(words[0], sizeof(words[0]), p);
+            // ignore for now..
+          }
         }
-        if (i == ARRAY_SIZE(attrs)) {
-          anote("unparsed IDA attr: %s\n", p);
-          break;
+      }
+      else if (p[2] == 'S' && IS_START(p, "; START OF FUNCTION CHUNK FOR "))
+      {
+        p += 30;
+        next_word(words[0], sizeof(words[0]), p);
+        if (words[0][0] == 0)
+          aerr("missing nam for func chunk?\n");
+        if (func_chunk_cnt >= func_chunk_alloc) {
+          func_chunk_alloc *= 2;
+          func_chunks = realloc(func_chunks,
+            func_chunk_alloc * sizeof(func_chunks[0]));
+          my_assert_not(func_chunks, NULL);
         }
-        if (IS(attrs[i], "fpd=")) {
-          p = next_word(words[0], sizeof(words[0]), p);
-          // ignore for now..
+        func_chunks[func_chunk_cnt].fptr = ftell(fasm);
+        func_chunks[func_chunk_cnt].name = strdup(words[0]);
+        func_chunk_cnt++;
+        func_chunks_sorted = 0;
+      }
+      else if (p[2] == 'E' && IS_START(p, "; END OF FUNCTION CHUNK"))
+      {
+        if (func_chunk_i >= 0) {
+          if (func_chunk_i < func_chunk_cnt
+            && IS(func_chunks[func_chunk_i].name, g_func))
+          {
+            // move on to next chunk
+            ret = fseek(fasm, func_chunks[func_chunk_i].fptr, SEEK_SET);
+            if (ret)
+              aerr("seek failed for '%s' chunk #%d\n",
+                g_func, func_chunk_i);
+            func_chunk_i++;
+          }
+          else {
+            if (func_chunk_ret == 0)
+              aerr("no return from chunk?\n");
+            fseek(fasm, func_chunk_ret, SEEK_SET);
+            func_chunk_ret = 0;
+            pending_endp = 1;
+          }
+        }
+      }
+      else if (p[2] == 'F' && IS_START(p, "; FUNCTION CHUNK AT ")) {
+        func_chunks_used = 1;
+        p += 20;
+        if (IS_START(g_func, "sub_")) {
+          unsigned long addr = strtoul(p, NULL, 16);
+          unsigned long f_addr = strtoul(g_func + 4, NULL, 16);
+          if (addr > f_addr)
+            aerr("need a chunk %lX that is after %s\n", addr, g_func);
         }
       }
       continue;
-    }
+    } // *p == ';'
 
 parse_words:
     memset(words, 0, sizeof(words));
@@ -3361,6 +3476,8 @@ do_pending_endp:
       skip_warned = 0;
       skip_func = 0;
       g_func[0] = 0;
+      func_chunks_used = 0;
+      func_chunk_i = -1;
       if (pi != 0) {
         memset(&ops, 0, pi * sizeof(ops[0]));
         memset(g_labels, 0, pi * sizeof(g_labels[0]));
@@ -3396,13 +3513,39 @@ do_pending_endp:
       continue;
     }
 
-    if (IS(words[1], "endp")) {
+    if (IS(words[1], "endp"))
+    {
       if (!in_func)
         aerr("endp '%s' while not in_func?\n", words[0]);
       if (!IS(g_func, words[0]))
         aerr("endp '%s' while in_func '%s'?\n",
           words[0], g_func);
 
+      if (!skip_func && func_chunks_used) {
+        // start processing chunks
+        struct chunk_item *ci, key = { g_func, 0 };
+
+        func_chunk_ret = ftell(fasm);
+        if (!func_chunks_sorted) {
+          qsort(func_chunks, func_chunk_cnt,
+            sizeof(func_chunks[0]), cmp_chunks);
+          func_chunks_sorted = 1;
+        }
+        ci = bsearch(&key, func_chunks, func_chunk_cnt,
+               sizeof(func_chunks[0]), cmp_chunks);
+        if (ci == NULL)
+          aerr("'%s' needs chunks, but none found\n", g_func);
+        func_chunk_i = ci - func_chunks;
+        for (; func_chunk_i > 0; func_chunk_i--)
+          if (!IS(func_chunks[func_chunk_i - 1].name, g_func))
+            break;
+
+        ret = fseek(fasm, func_chunks[func_chunk_i].fptr, SEEK_SET);
+        if (ret)
+          aerr("seek failed for '%s' chunk #%d\n", g_func, func_chunk_i);
+        func_chunk_i++;
+        continue;
+      }
       pending_endp = 1;
       continue;
     }

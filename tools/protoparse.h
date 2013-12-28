@@ -28,6 +28,7 @@ struct parsed_proto {
 	unsigned int is_stdcall:1;
 	unsigned int is_vararg:1;
 	unsigned int is_fptr:1;
+	unsigned int is_noreturn:1;
 };
 
 static const char *hdrfn;
@@ -121,16 +122,25 @@ static const char *known_type_mod[] = {
 };
 
 static const char *known_ptr_types[] = {
+	"HACCEL",
 	"HANDLE",
-	"HMODULE",
-	"HINSTANCE",
-	"HWND",
+	"HBITMAP",
+	"HCURSOR",
 	"HDC",
 	"HGDIOBJ",
+	"HGLOBAL",
+	"HINSTANCE",
+	"HMODULE",
+	"HRGN",
+	"HRSRC",
+	"HKEY",
+	"HMENU",
+	"HWND",
 	"PLONG",
 	"PDWORD",
 	"PVOID",
 	"PCVOID",
+	"DLGPROC",
 	"va_list",
 	"__VALIST",
 };
@@ -258,6 +268,11 @@ static int parse_protostr(char *protostr, struct parsed_proto *pp)
 		if ((p1[0] == '/' && p1[1] == '*')
 		 || (p1[0] == '*' && p1[1] == '/'))
 			p1[0] = p1[1] = ' ';
+	}
+
+	if (!strncmp(p, "DECLSPEC_NORETURN ", 18)) {
+		pp->is_noreturn = 1;
+		p = sskip(p + 18);
 	}
 
 	for (i = 0; i < ARRAY_SIZE(ignored_keywords); i++) {
