@@ -330,9 +330,9 @@ static int parse_protostr(char *protostr, struct parsed_proto *pp)
 	else if (IS(cconv, "__thiscall"))
 		pp->is_stdcall = 1;
 	else if (IS(cconv, "__userpurge"))
-		pp->is_stdcall = 1; // in all cases seen..
+		pp->is_stdcall = 1; // IDA
 	else if (IS(cconv, "__usercall"))
-		pp->is_stdcall = 0; // ..or is it?
+		pp->is_stdcall = 0; // IDA
 	else if (IS(cconv, "WINAPI"))
 		pp->is_stdcall = 1;
 	else {
@@ -353,9 +353,9 @@ static int parse_protostr(char *protostr, struct parsed_proto *pp)
 	p = next_idt(buf, sizeof(buf), p);
 	p = sskip(p);
 	if (buf[0] == 0) {
-		printf("%s:%d:%zd: func name missing\n",
-			hdrfn, hdrfline, (p - protostr) + 1);
-		return -1;
+		//printf("%s:%d:%zd: func name missing\n",
+		//	hdrfn, hdrfline, (p - protostr) + 1);
+		//return -1;
 	}
 	strcpy(pp->name, buf);
 

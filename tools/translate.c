@@ -37,6 +37,7 @@ enum op_flags {
   OPF_REP    = (1 << 7), /* prefixed by rep */
   OPF_REPZ   = (1 << 8), /* rep is repe/repz */
   OPF_REPNZ  = (1 << 9), /* rep is repne/repnz */
+  OPF_FARG   = (1 << 10), /* push collected as func arg (no reuse) */
 };
 
 enum op_op {
@@ -131,7 +132,7 @@ struct parsed_op {
   int regmask_src;        // all referensed regs
   int regmask_dst;
   int pfomask;            // flagop: parsed_flag_op that can't be delayed
-  int argmask;            // push: args that are altered before call
+  int argnum;             // push: altered before call arg #
   int cc_scratch;         // scratch storage during analysis
   int bt_i;               // branch target for branches
   struct parsed_data *btj;// branch targets for jumptables
@@ -199,6 +200,9 @@ static int g_ida_func_attr;
   fcloseall(); \
   exit(1); \
 } while (0)
+#define fnote(op_, fmt, ...) \
+  printf("error:%s:#%zd: '%s': " fmt, g_func, (op_) - ops, \
+    dump_op(op_), ##__VA_ARGS__)
 
 #define MAX_REGS 8
 
@@ -742,7 +746,7 @@ static const struct {
   { "test", OP_TEST,   2, 2, OPF_FLAGS },
   { "cmp",  OP_CMP,    2, 2, OPF_FLAGS },
   { "retn", OP_RET,    0, 1, OPF_JMP|OPF_TAIL },
-  { "call", OP_CALL,   1, 1, OPF_JMP|OPF_FLAGS },
+  { "call", OP_CALL,   1, 1, OPF_JMP|OPF_DATA|OPF_FLAGS },
   { "jmp",  OP_JMP,    1, 1, OPF_JMP },
   { "jo",   OP_JO,     1, 1, OPF_JMP|OPF_CC }, // 70 OF=1
   { "jno",  OP_JNO,    1, 1, OPF_JMP|OPF_CC }, // 71 OF=0
@@ -957,6 +961,17 @@ static void parse_op(struct parsed_op *op, char words[16][256], int wordc)
     }
     break;
 
+  case OP_LEA:
+    if (op->operand[0].type == OPT_REG
+     && op->operand[1].type == OPT_REGMEM)
+    {
+      char buf[16];
+      snprintf(buf, sizeof(buf), "%s+0", op->operand[0].name);
+      if (IS(buf, op->operand[1].name))
+        op->flags |= OPF_RMD;
+    }
+    break;
+
   default:
     break;
   }
@@ -1144,7 +1159,7 @@ static struct parsed_equ *equ_find(struct parsed_op *po, const char *name,
 }
 
 static void stack_frame_access(struct parsed_op *po,
-  enum opr_lenmod lmod, char *buf, size_t buf_size,
+  struct parsed_opr *popr, char *buf, size_t buf_size,
   const char *name, const char *cast, int is_src, int is_lea)
 {
   enum opr_lenmod tmp_lmod = OPLM_UNSPEC;
@@ -1158,6 +1173,7 @@ static void stack_frame_access(struct parsed_op *po,
   int stack_ra = 0;
   int offset = 0;
   int sf_ofs;
+  int lim;
 
   if (!IS_START(name, "ebp-")) {
     bp_arg = parse_stack_el(name, ofs_reg);
@@ -1210,7 +1226,9 @@ static void stack_frame_access(struct parsed_op *po,
     if (i == g_func_pp.argc)
       ferr(po, "arg %d not in prototype?\n", arg_i);
 
-    switch (lmod)
+    popr->is_ptr = g_func_pp.arg[i].type.is_ptr;
+
+    switch (popr->lmod)
     {
     case OPLM_BYTE:
       if (is_lea)
@@ -1234,17 +1252,25 @@ static void stack_frame_access(struct parsed_op *po,
       break;
 
     case OPLM_DWORD:
-      if (offset & 3)
-        ferr(po, "unaligned arg access\n");
       if (cast[0])
         prefix = cast;
       else if (is_src)
         prefix = "(u32)";
-      snprintf(buf, buf_size, "%s%sa%d", prefix, is_lea ? "&" : "", i + 1);
+      if (offset & 3) {
+        if (is_lea)
+          ferr(po, "unaligned lea?\n");
+        snprintf(g_comment, sizeof(g_comment), "%s unaligned", bp_arg);
+        snprintf(buf, buf_size, "%s(a%d >> %d)",
+          prefix, i + 1, (offset & 3) * 8);
+      }
+      else {
+        snprintf(buf, buf_size, "%s%sa%d",
+          prefix, is_lea ? "&" : "", i + 1);
+      }
       break;
 
     default:
-      ferr(po, "bp_arg bad lmod: %d\n", lmod);
+      ferr(po, "bp_arg bad lmod: %d\n", popr->lmod);
     }
 
     // common problem
@@ -1259,7 +1285,8 @@ static void stack_frame_access(struct parsed_op *po,
       ferr(po, "stack var access without stackframe\n");
 
     sf_ofs = g_stack_fsz + offset;
-    if (sf_ofs < 0)
+    lim = (ofs_reg[0] != 0) ? -4 : 0;
+    if (offset > 0 || sf_ofs < lim)
       ferr(po, "bp_stack offset %d/%d\n", offset, g_stack_fsz);
 
     if (is_lea)
@@ -1267,7 +1294,7 @@ static void stack_frame_access(struct parsed_op *po,
     else
       prefix = cast;
 
-    switch (lmod)
+    switch (popr->lmod)
     {
     case OPLM_BYTE:
       snprintf(buf, buf_size, "%ssf.b[%d%s%s]",
@@ -1301,7 +1328,7 @@ static void stack_frame_access(struct parsed_op *po,
       break;
 
     default:
-      ferr(po, "bp_stack bad lmod: %d\n", lmod);
+      ferr(po, "bp_stack bad lmod: %d\n", popr->lmod);
     }
   }
 }
@@ -1350,7 +1377,7 @@ static char *out_src_opr(char *buf, size_t buf_size,
     if (parse_stack_el(popr->name, NULL)
       || (g_bp_frame && IS_START(popr->name, "ebp-")))
     {
-      stack_frame_access(po, popr->lmod, buf, buf_size,
+      stack_frame_access(po, popr, buf, buf_size,
         popr->name, cast, 1, is_lea);
       break;
     }
@@ -1411,6 +1438,7 @@ static char *out_src_opr(char *buf, size_t buf_size,
   return buf;
 }
 
+// note: may set is_ptr (we find that out late for ebp frame..)
 static char *out_dst_opr(char *buf, size_t buf_size,
 	struct parsed_op *po, struct parsed_opr *popr)
 {
@@ -1440,7 +1468,7 @@ static char *out_dst_opr(char *buf, size_t buf_size,
     if (parse_stack_el(popr->name, NULL)
       || (g_bp_frame && IS_START(popr->name, "ebp-")))
     {
-      stack_frame_access(po, popr->lmod, buf, buf_size,
+      stack_frame_access(po, popr, buf, buf_size,
         popr->name, "", 0, 0);
       break;
     }
@@ -1683,6 +1711,10 @@ static void set_flag_no_dup(struct parsed_op *po, enum op_flags flag,
   po->flags |= flag;
 }
 
+// last op in stream - unconditional branch or ret
+#define LAST_OP(_i) ((ops[_i].flags & OPF_TAIL) \
+  || (ops[_i].flags & (OPF_JMP|OPF_CC)) == OPF_JMP)
+
 static int scan_for_pop(int i, int opcnt, const char *reg,
   int magic, int depth, int *maxdepth, int do_flags)
 {
@@ -1700,7 +1732,7 @@ static int scan_for_pop(int i, int opcnt, const char *reg,
       return -1; // deadend
 
     if ((po->flags & OPF_RMD)
-        || (po->op == OP_PUSH && po->argmask)) // arg push
+        || (po->op == OP_PUSH && po->argnum != 0)) // arg push
       continue;
 
     if ((po->flags & OPF_JMP) && po->op != OP_CALL) {
@@ -1822,7 +1854,16 @@ static int is_any_opr_modified(const struct parsed_op *po_test,
   if ((po->flags & OPF_RMD) || !(po->flags & OPF_DATA))
     return 0;
 
-  if (po_test->regmask_src & po->regmask_dst)
+  if (po_test->operand_cnt == 1 && po_test->operand[0].type == OPT_CONST)
+    return 0;
+
+  if ((po_test->regmask_src | po_test->regmask_dst) & po->regmask_dst)
+    return 1;
+
+  // in reality, it can wreck any register, but in decompiled C
+  // version it can only overwrite eax
+  if (po->op == OP_CALL
+   && ((po_test->regmask_src | po_test->regmask_dst) & (1 << xAX)))
     return 1;
 
   for (i = 0; i < po_test->operand_cnt; i++)
@@ -1855,15 +1896,26 @@ static int scan_for_mod_opr0(struct parsed_op *po_test,
   return -1;
 }
 
-static int scan_for_flag_set(int i)
+static int scan_for_flag_set(int i, int *branched)
 {
-  for (; i >= 0; i--) {
+  *branched = 0;
+
+  while (i >= 0) {
+    if (g_labels[i][0] != 0) {
+      if (g_label_refs[i].next != NULL)
+        return -1;
+      if (i > 0 && LAST_OP(i - 1)) {
+        i = g_label_refs[i].i;
+        *branched = 1;
+        continue;
+      }
+    }
+    i--;
+
     if (ops[i].flags & OPF_FLAGS)
       return i;
 
     if ((ops[i].flags & OPF_JMP) && !(ops[i].flags & OPF_CC))
-      return -1;
-    if (g_labels[i][0] != 0)
       return -1;
   }
 
@@ -1942,7 +1994,7 @@ static int scan_for_esp_adjust(int i, int opcnt, int *adj)
 
 static int collect_call_args(struct parsed_op *po, int i,
   struct parsed_proto *pp, int *save_arg_vars, int arg,
-  int need_op_saving)
+  int need_op_saving, int branched)
 {
   struct parsed_proto *pp_tmp;
   struct label_ref *lr;
@@ -1952,30 +2004,29 @@ static int collect_call_args(struct parsed_op *po, int i,
   if (i < 0)
     ferr(po, "no refs for '%s'?\n", g_labels[i]);
 
-  for (arg = 0; arg < pp->argc; arg++)
+  for (; arg < pp->argc; arg++)
     if (pp->arg[arg].reg == NULL)
       break;
 
   for (j = i; j >= 0 && arg < pp->argc; )
   {
     if (g_labels[j][0] != 0) {
+      branched = 1;
       lr = &g_label_refs[j];
       if (lr->next != NULL)
         need_op_saving = 1;
       for (; lr->next; lr = lr->next)
         ret |= collect_call_args(po, lr->i, pp, save_arg_vars,
-                 arg, need_op_saving);
+                 arg, need_op_saving, branched);
 
-      if (j > 0 && ((ops[j - 1].flags & OPF_TAIL)
-        || (ops[j - 1].flags & (OPF_JMP|OPF_CC)) == OPF_JMP))
-      {
+      if (j > 0 && LAST_OP(j - 1)) {
         // follow last branch in reverse
         j = lr->i;
         continue;
       }
       need_op_saving = 1;
       ret |= collect_call_args(po, lr->i, pp, save_arg_vars,
-               arg, need_op_saving);
+               arg, need_op_saving, branched);
     }
     j--;
 
@@ -1984,16 +2035,25 @@ static int collect_call_args(struct parsed_op *po, int i,
       pp_tmp = ops[j].datap;
       if (pp_tmp == NULL)
         ferr(po, "arg collect hit unparsed call\n");
-      if (pp_tmp->argc_stack > 0)
-        ferr(po, "arg collect hit '%s' with %d stack args\n",
-          opr_name(&ops[j], 0), pp_tmp->argc_stack);
+      if (branched && pp_tmp->argc_stack > 0)
+        ferr(po, "arg collect %d/%d hit '%s' with %d stack args\n",
+          arg, pp->argc, opr_name(&ops[j], 0), pp_tmp->argc_stack);
     }
-    else if ((ops[j].flags & OPF_TAIL)
-        || (ops[j].flags & (OPF_JMP|OPF_CC)) == OPF_JMP)
-    {
+    else if (ops[j].op == OP_ADD && ops[j].operand[0].reg == xSP) {
+      ferr(po, "arg collect %d/%d hit esp adjust\n",
+        arg, pp->argc);
+    }
+    else if (ops[j].op == OP_POP) {
+      ferr(po, "arg collect %d/%d hit pop\n", arg, pp->argc);
+    }
+    else if (LAST_OP(j)) {
       break;
     }
-    else if (ops[j].op == OP_PUSH)
+    else if ((ops[j].flags & (OPF_JMP|OPF_CC)) == (OPF_JMP|OPF_CC))
+    {
+      branched = 1;
+    }
+    else if (ops[j].op == OP_PUSH && !(ops[j].flags & OPF_FARG))
     {
       pp->arg[arg].datap = &ops[j];
       if (!need_op_saving) {
@@ -2003,11 +2063,22 @@ static int collect_call_args(struct parsed_op *po, int i,
       if (need_op_saving) {
         // mark this push as one that needs operand saving
         ops[j].flags &= ~OPF_RMD;
-        ops[j].argmask |= 1 << arg;
-        *save_arg_vars |= 1 << arg;
+        if (ops[j].argnum == 0) {
+          ops[j].argnum = arg + 1;
+          *save_arg_vars |= 1 << arg;
+        }
+        else if (ops[j].argnum < arg + 1)
+          ferr(&ops[j], "argnum conflict (%d<%d) for '%s'\n",
+            ops[j].argnum, arg + 1, pp->name);
       }
-      else
+      else if (ops[j].argnum == 0)
         ops[j].flags |= OPF_RMD;
+
+      // some PUSHes are reused by calls on multiple branches,
+      // but that can't happen if we didn't branch, so they
+      // can be removed from future searches (handles nested calls)
+      if (!branched)
+        ops[j].flags |= OPF_FARG;
 
       // next arg
       for (arg++; arg < pp->argc; arg++)
@@ -2051,6 +2122,7 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
   int cmp_result_vars = 0;
   int need_mul_var = 0;
   int had_decl = 0;
+  int branched = 0;
   int label_pending = 0;
   int regmask_save = 0;
   int regmask_arg = 0;
@@ -2199,7 +2271,8 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
 
   // pass2:
   // - resolve all branches
-  for (i = 0; i < opcnt; i++) {
+  for (i = 0; i < opcnt; i++)
+  {
     po = &ops[i];
     po->bt_i = -1;
     po->btj = NULL;
@@ -2336,7 +2409,7 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
         }
       }
 
-      collect_call_args(po, i, pp, &save_arg_vars, 0, 0);
+      collect_call_args(po, i, pp, &save_arg_vars, 0, 0, 0);
       po->datap = pp;
     }
   }
@@ -2352,7 +2425,7 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
       continue;
 
     if (po->op == OP_PUSH
-        && po->argmask == 0 && !(po->flags & OPF_RSAVE)
+        && po->argnum == 0 && !(po->flags & OPF_RSAVE)
         && po->operand[0].type == OPT_REG)
     {
       reg = po->operand[0].reg;
@@ -2391,7 +2464,7 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
 
     if (po->flags & OPF_CC)
     {
-      ret = scan_for_flag_set(i - 1);
+      ret = scan_for_flag_set(i, &branched);
       if (ret < 0)
         ferr(po, "unable to trace flag setter\n");
 
@@ -2401,9 +2474,9 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
 
       // to get nicer code, we try to delay test and cmp;
       // if we can't because of operand modification, or if we
-      // have math op, make it calculate flags explicitly
+      // have math op, or branch, make it calculate flags explicitly
       if (tmp_op->op == OP_TEST || tmp_op->op == OP_CMP) {
-        if (scan_for_mod(tmp_op, ret + 1, i) >= 0)
+        if (branched || scan_for_mod(tmp_op, ret + 1, i) >= 0)
           pfomask = 1 << pfo;
       }
       else if (tmp_op->op == OP_CMPS) {
@@ -2631,8 +2704,8 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
       case OP_MOV:
         assert_operand_cnt(2);
         propagate_lmod(po, &po->operand[0], &po->operand[1]);
-        fprintf(fout, "  %s = %s;",
-            out_dst_opr(buf1, sizeof(buf1), po, &po->operand[0]),
+        out_dst_opr(buf1, sizeof(buf1), po, &po->operand[0]);
+        fprintf(fout, "  %s = %s;", buf1,
             out_src_opr(buf2, sizeof(buf2), po, &po->operand[1],
               po->operand[0].is_ptr ? "(void *)" : "", 0));
         break;
@@ -2854,8 +2927,10 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
         break;
 
       case OP_IMUL:
-        if (po->operand_cnt == 2)
+        if (po->operand_cnt == 2) {
+          propagate_lmod(po, &po->operand[0], &po->operand[1]);
           goto dualop_arith;
+        }
         if (po->operand_cnt == 3)
           ferr(po, "TODO imul3\n");
         // fallthrough
@@ -2922,6 +2997,9 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
 
       case OP_JMP:
         assert_operand_cnt(1);
+        last_arith_dst = NULL;
+        delayed_flag_op = NULL;
+
         if (po->operand[0].type == OPT_REGMEM) {
           ret = sscanf(po->operand[0].name, "%[^[][%[^*]*4]",
                   buf1, buf2);
@@ -2983,8 +3061,8 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
           tmp_op = pp->arg[arg].datap;
           if (tmp_op == NULL)
             ferr(po, "parsed_op missing for arg%d\n", arg);
-          if (tmp_op->argmask) {
-            fprintf(fout, "%ss_a%d", cast, arg + 1);
+          if (tmp_op->argnum != 0) {
+            fprintf(fout, "%ss_a%d", cast, tmp_op->argnum);
           }
           else {
             fprintf(fout, "%s",
@@ -3021,16 +3099,16 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
         }
         else
           fprintf(fout, "  return eax;");
+
+        last_arith_dst = NULL;
+        delayed_flag_op = NULL;
         break;
 
       case OP_PUSH:
-        if (po->argmask) {
+        if (po->argnum != 0) {
           // special case - saved func arg
           out_src_opr_u32(buf1, sizeof(buf1), po, &po->operand[0]);
-          for (j = 0; j < 32; j++) {
-            if (po->argmask & (1 << j))
-              fprintf(fout, "  s_a%d = %s;", j + 1, buf1);
-          }
+          fprintf(fout, "  s_a%d = %s;", po->argnum, buf1);
           break;
         }
         else if (po->flags & OPF_RSAVE) {
@@ -3161,6 +3239,7 @@ static char *next_word_s(char *w, size_t wsize, char *s)
 struct chunk_item {
   char *name;
   long fptr;
+  int asmln;
 };
 
 static int cmp_chunks(const void *p1, const void *p2)
@@ -3189,6 +3268,7 @@ int main(int argc, char *argv[])
   int func_chunk_alloc;
   int func_chunk_i = -1;
   long func_chunk_ret = 0;
+  int func_chunk_ret_ln = 0;
   char line[256];
   char words[16][256];
   enum opr_lenmod lmod;
@@ -3286,13 +3366,13 @@ int main(int argc, char *argv[])
     if (*p == 0)
       continue;
 
+    // get rid of random tabs
+    for (i = 0; line[i] != 0; i++)
+      if (line[i] == '\t')
+        line[i] = ' ';
+
     if (*p == ';')
     {
-      // get rid of random tabs
-      for (i = 0; p[i] != 0; i++)
-        if (p[i] == '\t')
-          p[i] = ' ';
-
       if (p[2] == '=' && IS_START(p, "; =============== S U B"))
         goto do_pending_endp; // eww..
 
@@ -3343,6 +3423,7 @@ int main(int argc, char *argv[])
         }
         func_chunks[func_chunk_cnt].fptr = ftell(fasm);
         func_chunks[func_chunk_cnt].name = strdup(words[0]);
+        func_chunks[func_chunk_cnt].asmln = asmln;
         func_chunk_cnt++;
         func_chunks_sorted = 0;
       }
@@ -3357,12 +3438,14 @@ int main(int argc, char *argv[])
             if (ret)
               aerr("seek failed for '%s' chunk #%d\n",
                 g_func, func_chunk_i);
+            asmln = func_chunks[func_chunk_i].asmln;
             func_chunk_i++;
           }
           else {
             if (func_chunk_ret == 0)
               aerr("no return from chunk?\n");
             fseek(fasm, func_chunk_ret, SEEK_SET);
+            asmln = func_chunk_ret_ln;
             func_chunk_ret = 0;
             pending_endp = 1;
           }
@@ -3526,6 +3609,7 @@ do_pending_endp:
         struct chunk_item *ci, key = { g_func, 0 };
 
         func_chunk_ret = ftell(fasm);
+        func_chunk_ret_ln = asmln;
         if (!func_chunks_sorted) {
           qsort(func_chunks, func_chunk_cnt,
             sizeof(func_chunks[0]), cmp_chunks);
@@ -3543,6 +3627,7 @@ do_pending_endp:
         ret = fseek(fasm, func_chunks[func_chunk_i].fptr, SEEK_SET);
         if (ret)
           aerr("seek failed for '%s' chunk #%d\n", g_func, func_chunk_i);
+        asmln = func_chunks[func_chunk_i].asmln;
         func_chunk_i++;
         continue;
       }

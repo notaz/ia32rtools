@@ -112,7 +112,7 @@ int main(int argc, char *argv[])
 	char word5[256];
 	char word6[256];
 	char func[256];
-	char *p;
+	char *p, *p2;
 	int i;
 
 	if (argc < 4) {
@@ -203,10 +203,9 @@ int main(int argc, char *argv[])
 
 		p = next_word(word3, sizeof(word3), p);
 
-		// dd offset <sym>
 		// push offset <sym>
 		// jcc short <sym>
-		if ( (IS_OR2(word, "dd", "push") && IS(word2, "offset"))
+		if ( (IS(word, "push") && IS(word2, "offset"))
 		  || (word[0] == 'j' && IS(word2, "short")) ) {
 			ssym.name = word3;
 			sym = bsearch(&ssym, symlist, symlist_cnt,
@@ -220,6 +219,13 @@ int main(int argc, char *argv[])
 			}
 		}
 
+		// dd offset <sym>
+		if (IS(word, "dd") && IS(word2, "offset")) {
+			fprintf(fout, "\t\tdd");
+			strcpy(word, word3);
+			goto offset_loop;
+		}
+
 		p = sskip(p);
 		if (*p == 0 || *p == ';')
 			goto pass; // need at least 4 words
@@ -228,14 +234,9 @@ int main(int argc, char *argv[])
 
 		// <name> dd offset <sym>
 		if (IS(word2, "dd") && IS(word3, "offset")) {
-			ssym.name = word4;
-			sym = bsearch(&ssym, symlist, symlist_cnt,
-				sizeof(symlist[0]), cmp_sym);
-			if (sym != NULL && sym->callsites) {
-				fprintf(fout, "%s\tdd offset %s%s", word,
-					sym_use(sym), p);
-				continue;
-			}
+			fprintf(fout, "%s\tdd", word);
+			strcpy(word, word4);
+			goto offset_loop;
 		}
 
 		// mov <something>, offset <sym>
@@ -280,6 +281,33 @@ int main(int argc, char *argv[])
 
 pass:
 		fwrite(line, 1, strlen(line), fout);
+		continue;
+
+offset_loop:
+		while (1) {
+			p2 = strchr(word, ',');
+			if (p2)
+				*p2 = 0;
+
+			ssym.name = word;
+			sym = bsearch(&ssym, symlist, symlist_cnt,
+				sizeof(symlist[0]), cmp_sym);
+			fprintf(fout, " offset %s%s",
+				(sym != NULL && sym->callsites) ? sym_use(sym) : word,
+				p2 ? "," : "");
+
+			p2 = next_word(word, sizeof(word), p);
+			if (word[0] == 0 || word[0] == ';') {
+				break;
+			}
+			if (!IS(word, "offset")) {
+				printf("could not handle offset array\n");
+				break;
+			}
+			p = next_word(word, sizeof(word), p2);
+		}
+		fprintf(fout, "%s", p);
+		continue;
 	}
 
 	for (i = 0; i < symlist_cnt; i++) {
@@ -292,3 +320,5 @@ pass:
 
 	return 0;
 }
+
+// vim:ts=2:shiftwidth=2

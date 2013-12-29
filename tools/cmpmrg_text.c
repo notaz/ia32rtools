@@ -474,7 +474,7 @@ static void fill_int3(unsigned char *d, int len)
 
 int main(int argc, char *argv[])
 {
-	unsigned int base = 0, addr, addr2, end, sym, *t;
+	unsigned int base = 0, addr, end, sym, *t;
 	struct my_sect_info s_text_obj, s_text_exe;
 	struct my_symtab *raw_syms_obj = NULL;
 	struct my_symtab *syms_obj = NULL;
@@ -608,10 +608,12 @@ int main(int argc, char *argv[])
 			i--;
 			s_text_obj.reloc_cnt--;
 		}
+#if 0
 		// note: branches/calls already linked,
 		// so only useful for dd refs
+		// XXX: rm'd because of switch tables
 		else if (raw_syms_obj[sym].is_text) {
-			addr2 = raw_syms_obj[sym].addr;
+			unsigned int addr2 = raw_syms_obj[sym].addr;
 			if (s_text_obj.data[addr2] == 0xcc) {
 				printf("warning: reloc %08x -> %08x "
 					"points to rm'd target '%s'\n",
@@ -619,6 +621,7 @@ int main(int argc, char *argv[])
 					raw_syms_obj[sym].name);
 			}
 		}
+#endif
 	}
 
 	// patch .text
