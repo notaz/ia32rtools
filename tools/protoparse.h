@@ -34,28 +34,26 @@ struct parsed_proto {
 static const char *hdrfn;
 static int hdrfline = 0;
 
-static int find_protostr(char *dst, size_t dlen, FILE *fhdr,
-	const char *fname, const char *sym_)
+static int b_pp_c_handler(char *proto, const char *fname);
+
+static int do_protostrs(FILE *fhdr, const char *fname)
 {
-	const char *sym = sym_;
 	const char *finc_name;
+	const char *hdrfn_saved;
+	char protostr[256];
 	FILE *finc;
-	int symlen;
 	int line = 0;
 	int ret;
 	char *p;
 
-	if (sym[0] == '_' && strncmp(fname, "stdc", 4) == 0)
-		sym++;
-	symlen = strlen(sym);
+	hdrfn_saved = hdrfn;
+	hdrfn = fname;
 
-	rewind(fhdr);
-
-	while (fgets(dst, dlen, fhdr))
+	while (fgets(protostr, sizeof(protostr), fhdr))
 	{
 		line++;
-		if (strncmp(dst, "//#include ", 11) == 0) {
-			finc_name = dst + 11;
+		if (strncmp(protostr, "//#include ", 11) == 0) {
+			finc_name = protostr + 11;
 			p = strpbrk(finc_name, "\r\n ");
 			if (p != NULL)
 				*p = 0;
@@ -66,32 +64,34 @@ static int find_protostr(char *dst, size_t dlen, FILE *fhdr,
 					fname, line, finc_name);
 				continue;
 			}
-			ret = find_protostr(dst, dlen, finc,
-				finc_name, sym_);
+			ret = do_protostrs(finc, finc_name);
 			fclose(finc);
-			if (ret == 0)
+			if (ret < 0)
 				break;
 			continue;
 		}
-		if (strncmp(sskip(dst), "//", 2) == 0)
+		if (strncmp(sskip(protostr), "//", 2) == 0)
 			continue;
 
-		p = strstr(dst, sym);
-		if (p != NULL && p > dst
-		   && (my_isblank(p[-1]) || my_issep(p[-1]))
-		   && (my_isblank(p[symlen]) || my_issep(p[symlen])))
+		p = protostr + strlen(protostr);
+		for (p--; p >= protostr && my_isblank(*p); --p)
+			*p = 0;
+		if (p < protostr)
+			continue;
+
+		hdrfline = line;
+
+		ret = b_pp_c_handler(protostr, hdrfn);
+		if (ret < 0)
 			break;
 	}
-	hdrfline = line;
+
+	hdrfn = hdrfn_saved;
 
 	if (feof(fhdr))
-		return -1;
+		return 0;
 
-	p = dst + strlen(dst);
-	for (p--; p > dst && my_isblank(*p); --p)
-		*p = 0;
-
-	return 0;
+	return -1;
 }
 
 static int get_regparm(char *dst, size_t dlen, char *p)
@@ -176,6 +176,8 @@ static const char *skip_type_mod(const char *n)
 	for (i = 0; i < ARRAY_SIZE(known_type_mod); i++) {
 		len = strlen(known_type_mod[i]);
 		if (strncmp(n, known_type_mod[i], len) != 0)
+			continue;
+		if (!my_isblank(n[len]))
 			continue;
 
 		n += len;
@@ -347,7 +349,11 @@ static int parse_protostr(char *protostr, struct parsed_proto *pp)
 				hdrfn, hdrfline, (p - protostr) + 1);
 			return -1;
 		}
-		p = sskip(p + 1);
+		p++;
+		// XXX: skipping extra asterisks, for now
+		while (*p == '*')
+			p++;
+		p = sskip(p);
 	}
 
 	p = next_idt(buf, sizeof(buf), p);
@@ -373,6 +379,17 @@ static int parse_protostr(char *protostr, struct parsed_proto *pp)
 	}
 
 	if (pp->is_fptr) {
+		if (*p == '[') {
+			// not really ret_type is array, but ohwell
+			pp->ret_type.is_array = 1;
+			p = strchr(p + 1, ']');
+			if (p == NULL) {
+				printf("%s:%d:%zd: ']' expected\n",
+				 hdrfn, hdrfline, (p - protostr) + 1);
+				return -1;
+			}
+			p = sskip(p + 1);
+		}
 		if (*p != ')') {
 			printf("%s:%d:%zd: ')' expected\n",
 				hdrfn, hdrfline, (p - protostr) + 1);
@@ -496,23 +513,104 @@ static int parse_protostr(char *protostr, struct parsed_proto *pp)
 	return p - protostr;
 }
 
-static int proto_parse(FILE *fhdr, const char *sym, struct parsed_proto *pp)
+static int pp_name_cmp(const void *p1, const void *p2)
 {
-	char protostr[256];
-	int ret;
-
-	memset(pp, 0, sizeof(*pp));
-
-	ret = find_protostr(protostr, sizeof(protostr), fhdr, hdrfn, sym);
-	if (ret != 0) {
-		printf("%s: sym '%s' is missing\n", hdrfn, sym);
-		return ret;
-	}
-
-	return parse_protostr(protostr, pp) < 0 ? -1 : 0;
+	const struct parsed_proto *pp1 = p1, *pp2 = p2;
+	return strcmp(pp1->name, pp2->name);
 }
 
-static void proto_release(struct parsed_proto *pp)
+static struct parsed_proto *pp_cache;
+static int pp_cache_size;
+static int pp_cache_alloc;
+
+static int b_pp_c_handler(char *proto, const char *fname)
+{
+	int ret;
+
+	if (pp_cache_size >= pp_cache_alloc) {
+		pp_cache_alloc = pp_cache_alloc * 2 + 64;
+		pp_cache = realloc(pp_cache, pp_cache_alloc
+				* sizeof(pp_cache[0]));
+		my_assert_not(pp_cache, NULL);
+		memset(pp_cache + pp_cache_size, 0,
+			(pp_cache_alloc - pp_cache_size)
+			 * sizeof(pp_cache[0]));
+	}
+
+	ret = parse_protostr(proto, &pp_cache[pp_cache_size]);
+	if (ret < 0)
+		return -1;
+
+	pp_cache_size++;
+	return 0;
+}
+
+static void build_pp_cache(FILE *fhdr)
+{
+	int ret;
+
+	rewind(fhdr);
+
+	ret = do_protostrs(fhdr, hdrfn);
+	if (ret < 0)
+		exit(1);
+
+	qsort(pp_cache, pp_cache_size, sizeof(pp_cache[0]), pp_name_cmp);
+}
+
+static const struct parsed_proto *proto_parse(FILE *fhdr, const char *sym)
+{
+	const struct parsed_proto *pp_ret;
+	struct parsed_proto pp_search;
+
+	if (pp_cache == NULL)
+		build_pp_cache(fhdr);
+
+	if (sym[0] == '_') // && strncmp(fname, "stdc", 4) == 0)
+		sym++;
+
+	strcpy(pp_search.name, sym);
+	pp_ret = bsearch(&pp_search, pp_cache, pp_cache_size,
+			sizeof(pp_cache[0]), pp_name_cmp);
+	if (pp_ret == NULL)
+		printf("%s: sym '%s' is missing\n", hdrfn, sym);
+
+	return pp_ret;
+}
+
+struct parsed_proto *proto_clone(const struct parsed_proto *pp_c)
+{
+	struct parsed_proto *pp;
+	int i;
+
+	pp = malloc(sizeof(*pp));
+	my_assert_not(pp, NULL);
+	memcpy(pp, pp_c, sizeof(*pp)); // lazy..
+
+	// do the actual deep copy..
+	for (i = 0; i < pp_c->argc; i++) {
+		if (pp_c->arg[i].reg != NULL) {
+			pp->arg[i].reg = strdup(pp_c->arg[i].reg);
+			my_assert_not(pp->arg[i].reg, NULL);
+		}
+		if (pp_c->arg[i].type.name != NULL) {
+			pp->arg[i].type.name = strdup(pp_c->arg[i].type.name);
+			my_assert_not(pp->arg[i].type.name, NULL);
+		}
+		if (pp_c->arg[i].fptr != NULL) {
+			pp->arg[i].fptr = malloc(sizeof(*pp->arg[i].fptr));
+			my_assert_not(pp->arg[i].fptr, NULL);
+			memcpy(pp->arg[i].fptr, pp_c->arg[i].fptr,
+				sizeof(*pp->arg[i].fptr));
+		}
+	}
+	if (pp_c->ret_type.name != NULL)
+		pp->ret_type.name = strdup(pp_c->ret_type.name);
+
+	return pp;
+}
+
+static inline void proto_release(struct parsed_proto *pp)
 {
 	int i;
 
@@ -526,4 +624,5 @@ static void proto_release(struct parsed_proto *pp)
 	}
 	if (pp->ret_type.name != NULL)
 		free(pp->ret_type.name);
+	free(pp);
 }

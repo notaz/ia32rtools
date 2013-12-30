@@ -23,7 +23,7 @@ static int is_x86_reg_saved(const char *reg)
 	return !nosave;
 }
 
-static void out_toasm_x86(FILE *f, char *sym, struct parsed_proto *pp)
+static void out_toasm_x86(FILE *f, char *sym, const struct parsed_proto *pp)
 {
 	int must_save = 0;
 	int sarg_ofs = 1; // stack offset to args, in DWORDs
@@ -103,7 +103,7 @@ static void out_toasm_x86(FILE *f, char *sym, struct parsed_proto *pp)
 	fprintf(f, "\tret\n\n");
 }
 
-static void out_fromasm_x86(FILE *f, char *sym, struct parsed_proto *pp)
+static void out_fromasm_x86(FILE *f, char *sym, const struct parsed_proto *pp)
 {
 	int sarg_ofs = 1; // stack offset to args, in DWORDs
 	int argc_repush;
@@ -166,7 +166,7 @@ static void out_fromasm_x86(FILE *f, char *sym, struct parsed_proto *pp)
 int main(int argc, char *argv[])
 {
 	FILE *fout, *fsyms_to, *fsyms_from, *fhdr;
-	struct parsed_proto pp;
+	const struct parsed_proto *pp;
 	char line[256];
 	char sym[256];
 	int ret;
@@ -199,12 +199,11 @@ int main(int argc, char *argv[])
 		if (sym[0] == 0 || sym[0] == ';' || sym[0] == '#')
 			continue;
 
-		ret = proto_parse(fhdr, sym, &pp);
-		if (ret)
+		pp = proto_parse(fhdr, sym);
+		if (pp == NULL)
 			goto out;
 
-		out_toasm_x86(fout, sym, &pp);
-		proto_release(&pp);
+		out_toasm_x86(fout, sym, pp);
 	}
 
 	fprintf(fout, "# from asm\n\n");
@@ -215,12 +214,11 @@ int main(int argc, char *argv[])
 		if (sym[0] == 0 || sym[0] == ';' || sym[0] == '#')
 			continue;
 
-		ret = proto_parse(fhdr, sym, &pp);
-		if (ret)
+		pp = proto_parse(fhdr, sym);
+		if (pp == NULL)
 			goto out;
 
-		out_fromasm_x86(fout, sym, &pp);
-		proto_release(&pp);
+		out_fromasm_x86(fout, sym, pp);
 	}
 
 	ret = 0;

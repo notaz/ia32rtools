@@ -188,7 +188,7 @@ static struct parsed_equ *g_eqs;
 static int g_eqcnt;
 static char g_labels[MAX_OPS][32];
 static struct label_ref g_label_refs[MAX_OPS];
-static struct parsed_proto g_func_pp;
+static const struct parsed_proto *g_func_pp;
 static struct parsed_data *g_func_pd;
 static int g_func_pd_cnt;
 static char g_func[256];
@@ -469,6 +469,7 @@ static int guess_lmod_from_c_type(enum opr_lenmod *lmod,
 {
   static const char *dword_types[] = {
     "int", "_DWORD", "DWORD", "HANDLE", "HWND", "HMODULE",
+    "WPARAM", "UINT",
   };
   static const char *word_types[] = {
     "uint16_t", "int16_t",
@@ -541,7 +542,7 @@ static int parse_operand(struct parsed_opr *opr,
   int *regmask, int *regmask_indirect,
   char words[16][256], int wordc, int w, unsigned int op_flags)
 {
-  struct parsed_proto pp;
+  const struct parsed_proto *pp;
   enum opr_lenmod tmplmod;
   unsigned long number;
   int ret, len;
@@ -672,16 +673,16 @@ static int parse_operand(struct parsed_opr *opr,
   // most likely var in data segment
   opr->type = OPT_LABEL;
 
-  ret = proto_parse(g_fhdr, opr->name, &pp);
-  if (ret == 0) {
-    if (pp.is_fptr) {
+  pp = proto_parse(g_fhdr, opr->name);
+  if (pp != NULL) {
+    if (pp->is_fptr) {
       opr->lmod = OPLM_DWORD;
       opr->is_ptr = 1;
     }
     else {
-      if (!guess_lmod_from_c_type(&tmplmod, &pp.type))
+      if (!guess_lmod_from_c_type(&tmplmod, &pp->type))
         anote("unhandled C type '%s' for '%s'\n",
-          pp.type.name, opr->name);
+          pp->type.name, opr->name);
       
       if (opr->lmod == OPLM_UNSPEC)
         opr->lmod = tmplmod;
@@ -691,10 +692,9 @@ static int parse_operand(struct parsed_opr *opr,
           opr->size_lt = 1;
       }
     }
-    opr->is_ptr = pp.type.is_ptr;
-    opr->is_array = pp.type.is_array;
+    opr->is_ptr = pp->type.is_ptr;
+    opr->is_array = pp->type.is_array;
   }
-  proto_release(&pp);
 
   if (opr->lmod == OPLM_UNSPEC)
     guess_lmod_from_name(opr);
@@ -1215,9 +1215,11 @@ static void stack_frame_access(struct parsed_op *po,
   if (offset > stack_ra)
   {
     arg_i = (offset - stack_ra - 4) / 4;
-    if (arg_i < 0 || arg_i >= g_func_pp.argc_stack)
+    if (arg_i < 0 || arg_i >= g_func_pp->argc_stack)
     {
-      if (g_func_pp.is_vararg && arg_i == g_func_pp.argc_stack && is_lea) {
+      if (g_func_pp->is_vararg
+          && arg_i == g_func_pp->argc_stack && is_lea)
+      {
         // should be va_list
         if (cast[0] == 0)
           cast = "(u32)";
@@ -1230,17 +1232,17 @@ static void stack_frame_access(struct parsed_op *po,
     if (ofs_reg[0] != 0)
       ferr(po, "offset reg on arg access?\n");
 
-    for (i = arg_s = 0; i < g_func_pp.argc; i++) {
-      if (g_func_pp.arg[i].reg != NULL)
+    for (i = arg_s = 0; i < g_func_pp->argc; i++) {
+      if (g_func_pp->arg[i].reg != NULL)
         continue;
       if (arg_s == arg_i)
         break;
       arg_s++;
     }
-    if (i == g_func_pp.argc)
+    if (i == g_func_pp->argc)
       ferr(po, "arg %d not in prototype?\n", arg_i);
 
-    popr->is_ptr = g_func_pp.arg[i].type.is_ptr;
+    popr->is_ptr = g_func_pp->arg[i].type.is_ptr;
 
     switch (popr->lmod)
     {
@@ -1290,10 +1292,10 @@ static void stack_frame_access(struct parsed_op *po,
     }
 
     // common problem
-    guess_lmod_from_c_type(&tmp_lmod, &g_func_pp.arg[i].type);
+    guess_lmod_from_c_type(&tmp_lmod, &g_func_pp->arg[i].type);
     if ((offset & 3) && tmp_lmod != OPLM_DWORD)
       ferr(po, "bp_arg arg/w offset %d and type '%s'\n",
-        offset, g_func_pp.arg[i].type.name);
+        offset, g_func_pp->arg[i].type.name);
   }
   else
   {
@@ -2155,6 +2157,7 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
   struct parsed_op *po, *delayed_flag_op = NULL, *tmp_op;
   struct parsed_opr *last_arith_dst = NULL;
   char buf1[256], buf2[256], buf3[256], cast[64];
+  const struct parsed_proto *pp_c;
   struct parsed_proto *pp, *pp_tmp;
   struct parsed_data *pd;
   const char *tmpname;
@@ -2179,20 +2182,20 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
 
   g_bp_frame = g_sp_frame = g_stack_fsz = 0;
 
-  ret = proto_parse(fhdr, funcn, &g_func_pp);
-  if (ret)
+  g_func_pp = proto_parse(fhdr, funcn);
+  if (g_func_pp == NULL)
     ferr(ops, "proto_parse failed for '%s'\n", funcn);
 
-  fprintf(fout, "%s ", g_func_pp.ret_type.name);
+  fprintf(fout, "%s ", g_func_pp->ret_type.name);
   if (g_ida_func_attr & IDAFA_NORETURN)
     fprintf(fout, "noreturn ");
   fprintf(fout, "%s(", funcn);
-  for (i = 0; i < g_func_pp.argc; i++) {
+  for (i = 0; i < g_func_pp->argc; i++) {
     if (i > 0)
       fprintf(fout, ", ");
-    fprintf(fout, "%s a%d", g_func_pp.arg[i].type.name, i + 1);
+    fprintf(fout, "%s a%d", g_func_pp->arg[i].type.name, i + 1);
   }
-  if (g_func_pp.is_vararg) {
+  if (g_func_pp->is_vararg) {
     if (i > 0)
       fprintf(fout, ", ");
     fprintf(fout, "...");
@@ -2403,9 +2406,10 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
           pp->arg[arg].type.name = strdup("int");
       }
       else {
-        ret = proto_parse(fhdr, tmpname, pp);
-        if (ret)
+        pp_c = proto_parse(fhdr, tmpname);
+        if (pp_c == NULL)
           ferr(po, "proto_parse failed for call '%s'\n", tmpname);
+        pp = proto_clone(pp_c);
       }
 
       // look for and make use of esp adjust
@@ -2596,27 +2600,27 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
     fprintf(fout, "  union { u32 d[%d]; u16 w[%d]; u8 b[%d]; } sf;\n",
       (g_stack_fsz + 3) / 4, (g_stack_fsz + 1) / 2, g_stack_fsz);
 
-  if (g_func_pp.is_vararg)
+  if (g_func_pp->is_vararg)
     fprintf(fout, "  va_list ap;\n");
 
   // declare arg-registers
-  for (i = 0; i < g_func_pp.argc; i++) {
-    if (g_func_pp.arg[i].reg != NULL) {
+  for (i = 0; i < g_func_pp->argc; i++) {
+    if (g_func_pp->arg[i].reg != NULL) {
       reg = char_array_i(regs_r32,
-              ARRAY_SIZE(regs_r32), g_func_pp.arg[i].reg);
+              ARRAY_SIZE(regs_r32), g_func_pp->arg[i].reg);
       if (reg < 0)
-        ferr(ops, "arg '%s' is not a reg?\n", g_func_pp.arg[i].reg);
+        ferr(ops, "arg '%s' is not a reg?\n", g_func_pp->arg[i].reg);
 
       regmask_arg |= 1 << reg;
       fprintf(fout, "  u32 %s = (u32)a%d;\n",
-        g_func_pp.arg[i].reg, i + 1);
+        g_func_pp->arg[i].reg, i + 1);
       had_decl = 1;
     }
   }
 
   // declare other regs - special case for eax
   if (!((regmask | regmask_arg) & 1)
-   && !IS(g_func_pp.ret_type.name, "void"))
+   && !IS(g_func_pp->ret_type.name, "void"))
   {
     fprintf(fout, "  u32 eax = 0;\n");
     had_decl = 1;
@@ -2670,10 +2674,10 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
   if (had_decl)
     fprintf(fout, "\n");
 
-  if (g_func_pp.is_vararg) {
-    if (g_func_pp.argc_stack == 0)
+  if (g_func_pp->is_vararg) {
+    if (g_func_pp->argc_stack == 0)
       ferr(ops, "vararg func without stack args?\n");
-    fprintf(fout, "  va_start(ap, a%d);\n", g_func_pp.argc);
+    fprintf(fout, "  va_start(ap, a%d);\n", g_func_pp->argc);
   }
 
   // output ops
@@ -3088,8 +3092,8 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
         else if (!IS(pp->ret_type.name, "void")) {
           if (po->flags & OPF_TAIL) {
             fprintf(fout, "return ");
-            if (g_func_pp.ret_type.is_ptr != pp->ret_type.is_ptr)
-              fprintf(fout, "(%s)", g_func_pp.ret_type.name);
+            if (g_func_pp->ret_type.is_ptr != pp->ret_type.is_ptr)
+              fprintf(fout, "(%s)", g_func_pp->ret_type.name);
           }
           else {
             fprintf(fout, "eax = ");
@@ -3155,16 +3159,16 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
         break;
 
       case OP_RET:
-        if (g_func_pp.is_vararg)
+        if (g_func_pp->is_vararg)
           fprintf(fout, "  va_end(ap);\n");
  
-        if (IS(g_func_pp.ret_type.name, "void")) {
+        if (IS(g_func_pp->ret_type.name, "void")) {
           if (i != opcnt - 1 || label_pending)
             fprintf(fout, "  return;");
         }
-        else if (g_func_pp.ret_type.is_ptr) {
+        else if (g_func_pp->ret_type.is_ptr) {
           fprintf(fout, "  return (%s)eax;",
-            g_func_pp.ret_type.name);
+            g_func_pp->ret_type.name);
         }
         else
           fprintf(fout, "  return eax;");
@@ -3259,13 +3263,11 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
 
     if (ops[i].op == OP_CALL) {
       pp = ops[i].datap;
-      if (pp) {
+      if (pp)
         proto_release(pp);
-        free(pp);
-      }
     }
   }
-  proto_release(&g_func_pp);
+  g_func_pp = NULL;
 }
 
 static void set_label(int i, const char *name)
