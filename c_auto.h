@@ -14,7 +14,7 @@
 #define _BYTE BYTE
 #define _WORD WORD
 #define _DWORD DWORD
-#define _UNKNOWN char
+#define _UNKNOWN uint8_t
 #undef LOBYTE
 #undef LOWORD
 #undef HIBYTE

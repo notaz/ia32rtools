@@ -105,6 +105,7 @@ enum opr_type {
   OPT_CONST,
 };
 
+// must be sorted (larger len must be further in enum)
 enum opr_lenmod {
 	OPLM_UNSPEC,
 	OPLM_BYTE,
@@ -119,6 +120,8 @@ struct parsed_opr {
   enum opr_lenmod lmod;
   unsigned int is_ptr:1;   // pointer in C
   unsigned int is_array:1; // array in C
+  unsigned int size_mismatch:1; // type override differs from C
+  unsigned int size_lt:1;  // type override is larger than C
   int reg;
   unsigned int val;
   char name[256];
@@ -141,7 +144,7 @@ struct parsed_op {
 
 // datap:
 // OP_CALL - ptr to parsed_proto
-// (OPF_CC) - point to corresponding (OPF_FLAGS)
+// (OPF_CC) - point to one of (OPF_FLAGS) that affects cc op
 
 struct parsed_equ {
   char name[64];
@@ -468,10 +471,12 @@ static int guess_lmod_from_c_type(enum opr_lenmod *lmod,
     "int", "_DWORD", "DWORD", "HANDLE", "HWND", "HMODULE",
   };
   static const char *word_types[] = {
-    "__int16", "unsigned __int16",
+    "uint16_t", "int16_t",
+    "unsigned __int16", "__int16",
   };
   static const char *byte_types[] = {
-    "char", "__int8", "unsigned __int8", "BYTE",
+    "uint8_t", "int8_t", "char",
+    "unsigned __int8", "__int8", "BYTE",
   };
   const char *n;
   int i;
@@ -673,9 +678,18 @@ static int parse_operand(struct parsed_opr *opr,
       opr->lmod = OPLM_DWORD;
       opr->is_ptr = 1;
     }
-    else if (opr->lmod == OPLM_UNSPEC) {
-      if (!guess_lmod_from_c_type(&opr->lmod, &pp.type))
-        anote("unhandled C type '%s' for '%s'\n", pp.type.name, opr->name);
+    else {
+      if (!guess_lmod_from_c_type(&tmplmod, &pp.type))
+        anote("unhandled C type '%s' for '%s'\n",
+          pp.type.name, opr->name);
+      
+      if (opr->lmod == OPLM_UNSPEC)
+        opr->lmod = tmplmod;
+      else if (opr->lmod != tmplmod) {
+        opr->size_mismatch = 1;
+        if (tmplmod < opr->lmod)
+          opr->size_lt = 1;
+      }
     }
     opr->is_ptr = pp.type.is_ptr;
     opr->is_array = pp.type.is_array;
@@ -1257,11 +1271,13 @@ static void stack_frame_access(struct parsed_op *po,
       else if (is_src)
         prefix = "(u32)";
       if (offset & 3) {
-        if (is_lea)
-          ferr(po, "unaligned lea?\n");
         snprintf(g_comment, sizeof(g_comment), "%s unaligned", bp_arg);
-        snprintf(buf, buf_size, "%s(a%d >> %d)",
-          prefix, i + 1, (offset & 3) * 8);
+        if (is_lea)
+          snprintf(buf, buf_size, "(u32)&a%d + %d",
+            i + 1, offset & 3);
+        else
+          snprintf(buf, buf_size, "%s(a%d >> %d)",
+            prefix, i + 1, (offset & 3) * 8);
       }
       else {
         snprintf(buf, buf_size, "%s%sa%d",
@@ -1406,8 +1422,14 @@ static char *out_src_opr(char *buf, size_t buf_size,
     check_label_read_ref(po, popr->name);
     if (cast[0] == 0 && popr->is_ptr)
       cast = "(u32)";
+
     if (is_lea)
       snprintf(buf, buf_size, "(u32)&%s", popr->name);
+    else if (popr->size_lt)
+      snprintf(buf, buf_size, "%s%s%s%s", cast,
+        lmod_cast_u_ptr(po, popr->lmod),
+        popr->is_array ? "" : "&",
+        popr->name);
     else
       snprintf(buf, buf_size, "%s%s%s", cast, popr->name,
         popr->is_array ? "[0]" : "");
@@ -1476,8 +1498,13 @@ static char *out_dst_opr(char *buf, size_t buf_size,
     return out_src_opr(buf, buf_size, po, popr, NULL, 0);
 
   case OPT_LABEL:
-    snprintf(buf, buf_size, "%s%s", popr->name,
-      popr->is_array ? "[0]" : "");
+    if (popr->size_mismatch)
+      snprintf(buf, buf_size, "%s%s%s",
+        lmod_cast_u_ptr(po, popr->lmod),
+        popr->is_array ? "" : "&", popr->name);
+    else
+      snprintf(buf, buf_size, "%s%s", popr->name,
+        popr->is_array ? "[0]" : "");
     break;
 
   default:
@@ -1861,9 +1888,10 @@ static int is_any_opr_modified(const struct parsed_op *po_test,
     return 1;
 
   // in reality, it can wreck any register, but in decompiled C
-  // version it can only overwrite eax
+  // version it can only overwrite eax or edx:eax
   if (po->op == OP_CALL
-   && ((po_test->regmask_src | po_test->regmask_dst) & (1 << xAX)))
+   && ((po_test->regmask_src | po_test->regmask_dst)
+       & ((1 << xAX)|(1 << xDX))))
     return 1;
 
   for (i = 0; i < po_test->operand_cnt; i++)
@@ -1876,6 +1904,9 @@ static int is_any_opr_modified(const struct parsed_op *po_test,
 // scan for any po_test operand modification in range given
 static int scan_for_mod(struct parsed_op *po_test, int i, int opcnt)
 {
+  if (po_test->operand_cnt == 1 && po_test->operand[0].type == OPT_CONST)
+    return -1;
+
   for (; i < opcnt; i++) {
     if (is_any_opr_modified(po_test, &ops[i]))
       return i;
@@ -1896,24 +1927,32 @@ static int scan_for_mod_opr0(struct parsed_op *po_test,
   return -1;
 }
 
-static int scan_for_flag_set(int i, int *branched)
+static int scan_for_flag_set(int i, int *branched, int *setters,
+  int *setter_cnt)
 {
-  *branched = 0;
+  int ret;
 
   while (i >= 0) {
     if (g_labels[i][0] != 0) {
+      *branched = 1;
       if (g_label_refs[i].next != NULL)
         return -1;
       if (i > 0 && LAST_OP(i - 1)) {
         i = g_label_refs[i].i;
-        *branched = 1;
         continue;
       }
+      ret = scan_for_flag_set(g_label_refs[i].i, branched,
+              setters, setter_cnt);
+      if (ret < 0)
+        return ret;
     }
     i--;
 
-    if (ops[i].flags & OPF_FLAGS)
-      return i;
+    if (ops[i].flags & OPF_FLAGS) {
+      setters[*setter_cnt] = i;
+      (*setter_cnt)++;
+      return 0;
+    }
 
     if ((ops[i].flags & OPF_JMP) && !(ops[i].flags & OPF_CC))
       return -1;
@@ -1998,6 +2037,7 @@ static int collect_call_args(struct parsed_op *po, int i,
 {
   struct parsed_proto *pp_tmp;
   struct label_ref *lr;
+  int need_to_save_current;
   int ret = 0;
   int j;
 
@@ -2056,11 +2096,12 @@ static int collect_call_args(struct parsed_op *po, int i,
     else if (ops[j].op == OP_PUSH && !(ops[j].flags & OPF_FARG))
     {
       pp->arg[arg].datap = &ops[j];
+      need_to_save_current = 0;
       if (!need_op_saving) {
         ret = scan_for_mod(&ops[j], j + 1, i);
-        need_op_saving = (ret >= 0);
+        need_to_save_current = (ret >= 0);
       }
-      if (need_op_saving) {
+      if (need_op_saving || need_to_save_current) {
         // mark this push as one that needs operand saving
         ops[j].flags &= ~OPF_RMD;
         if (ops[j].argnum == 0) {
@@ -2122,7 +2163,6 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
   int cmp_result_vars = 0;
   int need_mul_var = 0;
   int had_decl = 0;
-  int branched = 0;
   int label_pending = 0;
   int regmask_save = 0;
   int regmask_arg = 0;
@@ -2410,6 +2450,9 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
       }
 
       collect_call_args(po, i, pp, &save_arg_vars, 0, 0, 0);
+
+      if (strstr(pp->ret_type.name, "int64"))
+        need_mul_var = 1;
       po->datap = pp;
     }
   }
@@ -2464,33 +2507,41 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
 
     if (po->flags & OPF_CC)
     {
-      ret = scan_for_flag_set(i, &branched);
-      if (ret < 0)
-        ferr(po, "unable to trace flag setter\n");
+      int setters[16], cnt = 0, branched = 0;
 
-      tmp_op = &ops[ret]; // flag setter
+      ret = scan_for_flag_set(i, &branched, setters, &cnt);
+      if (ret < 0 || cnt <= 0)
+        ferr(po, "unable to trace flag setter(s)\n");
+      if (cnt > ARRAY_SIZE(setters))
+        ferr(po, "too many flag setters\n");
+
       pfo = split_cond(po, po->op, &dummy);
-      pfomask = 0;
+      for (j = 0; j < cnt; j++)
+      {
+        tmp_op = &ops[setters[j]]; // flag setter
+        pfomask = 0;
 
-      // to get nicer code, we try to delay test and cmp;
-      // if we can't because of operand modification, or if we
-      // have math op, or branch, make it calculate flags explicitly
-      if (tmp_op->op == OP_TEST || tmp_op->op == OP_CMP) {
-        if (branched || scan_for_mod(tmp_op, ret + 1, i) >= 0)
-          pfomask = 1 << pfo;
-      }
-      else if (tmp_op->op == OP_CMPS) {
-        pfomask = 1 << PFO_Z;
-      }
-      else {
-        if ((pfo != PFO_Z && pfo != PFO_S && pfo != PFO_P)
-            || scan_for_mod_opr0(tmp_op, ret + 1, i) >= 0)
-          pfomask = 1 << pfo;
-      }
-      if (pfomask) {
-        tmp_op->pfomask |= pfomask;
-        cmp_result_vars |= pfomask;
-        po->datap = tmp_op;
+        // to get nicer code, we try to delay test and cmp;
+        // if we can't because of operand modification, or if we
+        // have math op, or branch, make it calculate flags explicitly
+        if (tmp_op->op == OP_TEST || tmp_op->op == OP_CMP) {
+          if (branched || scan_for_mod(tmp_op, setters[j] + 1, i) >= 0)
+            pfomask = 1 << pfo;
+        }
+        else if (tmp_op->op == OP_CMPS) {
+          pfomask = 1 << PFO_Z;
+        }
+        else {
+          if ((pfo != PFO_Z && pfo != PFO_S && pfo != PFO_P)
+              || scan_for_mod_opr0(tmp_op, setters[j] + 1, i) >= 0)
+            pfomask = 1 << pfo;
+        }
+        if (pfomask) {
+          tmp_op->pfomask |= pfomask;
+          cmp_result_vars |= pfomask;
+          // note: may overwrite, currently not a problem
+          po->datap = tmp_op;
+        }
       }
 
       if (po->op == OP_ADC || po->op == OP_SBB)
@@ -2631,6 +2682,9 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
     if (g_labels[i][0] != 0 && g_label_refs[i].i != -1) {
       fprintf(fout, "\n%s:\n", g_labels[i]);
       label_pending = 1;
+
+      delayed_flag_op = NULL;
+      last_arith_dst = NULL;
     }
 
     po = &ops[i];
@@ -3026,13 +3080,22 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
             out_src_opr_u32(buf1, sizeof(buf1), po, &po->operand[0]));
 
         fprintf(fout, "  ");
-        if (!IS(pp->ret_type.name, "void")) {
+        if (strstr(pp->ret_type.name, "int64")) {
           if (po->flags & OPF_TAIL)
+            ferr(po, "int64 and tail?\n");
+          fprintf(fout, "mul_tmp = ");
+        }
+        else if (!IS(pp->ret_type.name, "void")) {
+          if (po->flags & OPF_TAIL) {
             fprintf(fout, "return ");
-          else
+            if (g_func_pp.ret_type.is_ptr != pp->ret_type.is_ptr)
+              fprintf(fout, "(%s)", g_func_pp.ret_type.name);
+          }
+          else {
             fprintf(fout, "eax = ");
-          if (pp->ret_type.is_ptr)
-            fprintf(fout, "(u32)");
+            if (pp->ret_type.is_ptr)
+              fprintf(fout, "(u32)");
+          }
         }
 
         if (po->operand[0].type != OPT_LABEL) {
@@ -3071,6 +3134,12 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
           }
         }
         fprintf(fout, ");");
+
+        if (strstr(pp->ret_type.name, "int64")) {
+          fprintf(fout, "\n");
+          fprintf(fout, "  edx = mul_tmp >> 32;\n");
+          fprintf(fout, "  eax = mul_tmp;");
+        }
 
         if (po->flags & OPF_TAIL) {
           strcpy(g_comment, "tailcall");
@@ -3131,6 +3200,7 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
         break;
 
       case OP_NOP:
+        no_output = 1;
         break;
 
       default:
@@ -3140,13 +3210,6 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
         break;
     }
 
-    // some sanity checking
-    if ((po->flags & OPF_REP) && po->op != OP_STOS
-        && po->op != OP_MOVS && po->op != OP_CMPS)
-      ferr(po, "unexpected rep\n");
-    if ((po->flags & (OPF_REPZ|OPF_REPNZ)) && po->op != OP_CMPS)
-      ferr(po, "unexpected repz/repnz\n");
-
     if (g_comment[0] != 0) {
       fprintf(fout, "  // %s", g_comment);
       g_comment[0] = 0;
@@ -3154,6 +3217,13 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
     }
     if (!no_output)
       fprintf(fout, "\n");
+
+    // some sanity checking
+    if ((po->flags & OPF_REP) && po->op != OP_STOS
+        && po->op != OP_MOVS && po->op != OP_CMPS)
+      ferr(po, "unexpected rep\n");
+    if ((po->flags & (OPF_REPZ|OPF_REPNZ)) && po->op != OP_CMPS)
+      ferr(po, "unexpected repz/repnz\n");
 
     if (pfomask != 0)
       ferr(po, "missed flag calc, pfomask=%x\n", pfomask);

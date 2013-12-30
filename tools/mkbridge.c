@@ -126,21 +126,22 @@ static void out_fromasm_x86(FILE *f, char *sym, struct parsed_proto *pp)
 		return;
 	}
 
-	fprintf(f, "\tpushl %%edx\n"); // just in case..
+	// scratch reg, must not be eax or edx (for ret edx:eax)
+	fprintf(f, "\tpushl %%ebx\n");
 	sarg_ofs++;
 
 	// construct arg stack
 	for (i = argc_repush - 1; i >= 0; i--) {
 		if (pp->arg[i].reg == NULL) {
-			fprintf(f, "\tmovl %d(%%esp), %%edx\n",
+			fprintf(f, "\tmovl %d(%%esp), %%ebx\n",
 				(sarg_ofs + stack_args - 1) * 4);
-			fprintf(f, "\tpushl %%edx\n");
+			fprintf(f, "\tpushl %%ebx\n");
 			stack_args--;
 		}
 		else {
-			if (IS(pp->arg[i].reg, "edx"))
-				// must reload original edx
-				fprintf(f, "\tmovl %d(%%esp), %%edx\n",
+			if (IS(pp->arg[i].reg, "ebx"))
+				// must reload original ebx
+				fprintf(f, "\tmovl %d(%%esp), %%ebx\n",
 					(sarg_ofs - 2) * 4);
 
 			fprintf(f, "\tpushl %%%s\n", pp->arg[i].reg);
@@ -154,7 +155,7 @@ static void out_fromasm_x86(FILE *f, char *sym, struct parsed_proto *pp)
 	if (sarg_ofs > 2)
 		fprintf(f, "\tadd $%d,%%esp\n", (sarg_ofs - 2) * 4);
 
-	fprintf(f, "\tpopl %%edx\n");
+	fprintf(f, "\tpopl %%ebx\n");
 
 	if (pp->is_stdcall && pp->argc_stack)
 		fprintf(f, "\tret $%d\n\n", pp->argc_stack * 4);

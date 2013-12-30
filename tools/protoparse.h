@@ -362,7 +362,7 @@ static int parse_protostr(char *protostr, struct parsed_proto *pp)
 	ret = get_regparm(regparm, sizeof(regparm), p);
 	if (ret > 0) {
 		if (!IS(regparm, "eax") && !IS(regparm, "ax")
-		 && !IS(regparm, "al"))
+		 && !IS(regparm, "al") && !IS(regparm, "edx:eax"))
 		{
 			printf("%s:%d:%zd: bad regparm: %s\n",
 				hdrfn, hdrfline, (p - protostr) + 1, regparm);
