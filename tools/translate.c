@@ -2189,19 +2189,41 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
     ferr(ops, "proto_parse failed for '%s'\n", funcn);
 
   fprintf(fout, "%s ", g_func_pp->ret_type.name);
+  if (g_func_pp->is_stdcall && g_func_pp->argc_reg == 0)
+    fprintf(fout, "__stdcall ");
   if (g_ida_func_attr & IDAFA_NORETURN)
     fprintf(fout, "noreturn ");
   fprintf(fout, "%s(", funcn);
+
   for (i = 0; i < g_func_pp->argc; i++) {
     if (i > 0)
       fprintf(fout, ", ");
-    fprintf(fout, "%s a%d", g_func_pp->arg[i].type.name, i + 1);
+    if (g_func_pp->arg[i].fptr != NULL) {
+      // func pointer..
+      pp = g_func_pp->arg[i].fptr;
+      fprintf(fout, "%s (", pp->ret_type.name);
+      if (pp->is_stdcall && pp->argc_reg == 0)
+        fprintf(fout, "__stdcall ");
+      fprintf(fout, "*a%d)(", i + 1);
+      for (j = 0; j < pp->argc; j++) {
+        if (j > 0)
+          fprintf(fout, ", ");
+        if (pp->arg[j].fptr)
+          ferr(ops, "nested fptr\n");
+        fprintf(fout, "%s", pp->arg[j].type.name);
+      }
+      fprintf(fout, ")");
+    }
+    else {
+      fprintf(fout, "%s a%d", g_func_pp->arg[i].type.name, i + 1);
+    }
   }
   if (g_func_pp->is_vararg) {
     if (i > 0)
       fprintf(fout, ", ");
     fprintf(fout, "...");
   }
+
   fprintf(fout, ")\n{\n");
 
   // pass1:

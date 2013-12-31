@@ -23,7 +23,8 @@ static int is_x86_reg_saved(const char *reg)
 	return !nosave;
 }
 
-static void out_toasm_x86(FILE *f, char *sym, const struct parsed_proto *pp)
+static void out_toasm_x86(FILE *f, const char *sym_in,
+	const char *sym_out, const struct parsed_proto *pp)
 {
 	int must_save = 0;
 	int sarg_ofs = 1; // stack offset to args, in DWORDs
@@ -40,11 +41,11 @@ static void out_toasm_x86(FILE *f, char *sym, const struct parsed_proto *pp)
 			must_save |= is_x86_reg_saved(pp->arg[i].reg);
 	}
 
-	fprintf(f, ".global _%s\n", sym);
-	fprintf(f, "_%s:\n", sym);
+	fprintf(f, ".global _%s\n", sym_in);
+	fprintf(f, "_%s:\n", sym_in);
 
-	if (pp->argc_reg == 0 && !pp->is_stdcall) {
-		fprintf(f, "\tjmp %s\n\n", sym);
+	if (pp->argc_reg == 0) {
+		fprintf(f, "\tjmp %s\n\n", sym_out);
 		return;
 	}
 
@@ -56,7 +57,7 @@ static void out_toasm_x86(FILE *f, char *sym, const struct parsed_proto *pp)
 			fprintf(f, "\tmovl %d(%%esp), %%%s\n",
 				(i + sarg_ofs) * 4, pp->arg[i].reg);
 		}
-		fprintf(f, "\tjmp %s\n\n", sym);
+		fprintf(f, "\tjmp %s\n\n", sym_out);
 		return;
 	}
 
@@ -89,7 +90,7 @@ static void out_toasm_x86(FILE *f, char *sym, const struct parsed_proto *pp)
 	}
 
 	fprintf(f, "\n\t# %s\n", pp->is_stdcall ? "__stdcall" : "__cdecl");
-	fprintf(f, "\tcall %s\n\n", sym);
+	fprintf(f, "\tcall %s\n\n", sym_out);
 
 	if (args_repushed && !pp->is_stdcall)
 		fprintf(f, "\tadd $%d,%%esp\n", args_repushed * 4);
@@ -103,7 +104,8 @@ static void out_toasm_x86(FILE *f, char *sym, const struct parsed_proto *pp)
 	fprintf(f, "\tret\n\n");
 }
 
-static void out_fromasm_x86(FILE *f, char *sym, const struct parsed_proto *pp)
+static void out_fromasm_x86(FILE *f, const char *sym,
+	const struct parsed_proto *pp)
 {
 	int sarg_ofs = 1; // stack offset to args, in DWORDs
 	int argc_repush;
@@ -121,8 +123,12 @@ static void out_fromasm_x86(FILE *f, char *sym, const struct parsed_proto *pp)
 	fprintf(f, ".global %s\n", sym);
 	fprintf(f, "%s:\n", sym);
 
-	if (pp->argc_reg == 0 && !pp->is_stdcall) {
-		fprintf(f, "\tjmp _%s\n\n", sym);
+	if (pp->argc_reg == 0) {
+		//fprintf(f, "\tjmp _%s\n\n", sym);
+		fprintf(f, "\tjmp _%s", sym);
+		if (pp->is_stdcall && pp->argc > 0)
+			fprintf(f, "@%d", pp->argc * 4);
+		fprintf(f, "\n\n");
 		return;
 	}
 
@@ -168,8 +174,10 @@ int main(int argc, char *argv[])
 	FILE *fout, *fsyms_to, *fsyms_from, *fhdr;
 	const struct parsed_proto *pp;
 	char line[256];
+	char sym_noat[256];
 	char sym[256];
-	int ret;
+	char *p;
+	int ret = 1;
 
 	if (argc != 5) {
 		printf("usage:\n%s <bridge.s> <toasm_symf> <fromasm_symf> <hdrf>\n",
@@ -199,11 +207,17 @@ int main(int argc, char *argv[])
 		if (sym[0] == 0 || sym[0] == ';' || sym[0] == '#')
 			continue;
 
-		pp = proto_parse(fhdr, sym);
+		// IDA asm doesn't do '@' notation..
+		strcpy(sym_noat, sym);
+		p = strchr(sym_noat, '@');
+		if (p != NULL)
+			*p = 0;
+
+		pp = proto_parse(fhdr, sym_noat);
 		if (pp == NULL)
 			goto out;
 
-		out_toasm_x86(fout, sym, pp);
+		out_toasm_x86(fout, sym, sym_noat, pp);
 	}
 
 	fprintf(fout, "# from asm\n\n");

@@ -25,5 +25,6 @@ cat $2 | \
 while read a; do
 #  echo "_$a equ $a" >> $3
 #  echo "PUBLIC _$a" >> $3
+  a=`echo $a | awk -F@ '{print $1}'`
   echo "PUBLIC $a" >> $3
 done
