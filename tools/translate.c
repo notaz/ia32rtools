@@ -691,8 +691,8 @@ static int parse_operand(struct parsed_opr *opr,
         if (tmplmod < opr->lmod)
           opr->size_lt = 1;
       }
+      opr->is_ptr = pp->type.is_ptr;
     }
-    opr->is_ptr = pp->type.is_ptr;
     opr->is_array = pp->type.is_array;
   }
 
@@ -2035,7 +2035,7 @@ static int scan_for_esp_adjust(int i, int opcnt, int *adj)
 
 static int collect_call_args(struct parsed_op *po, int i,
   struct parsed_proto *pp, int *save_arg_vars, int arg,
-  int need_op_saving, int branched)
+  int need_op_saving, int may_reuse)
 {
   struct parsed_proto *pp_tmp;
   struct label_ref *lr;
@@ -2053,14 +2053,18 @@ static int collect_call_args(struct parsed_op *po, int i,
   for (j = i; j >= 0 && arg < pp->argc; )
   {
     if (g_labels[j][0] != 0) {
-      branched = 1;
       lr = &g_label_refs[j];
       if (lr->next != NULL)
         need_op_saving = 1;
-      for (; lr->next; lr = lr->next)
+      for (; lr->next; lr = lr->next) {
+        if ((ops[lr->i].flags & (OPF_JMP|OPF_CC)) != OPF_JMP)
+          may_reuse = 1;
         ret |= collect_call_args(po, lr->i, pp, save_arg_vars,
-                 arg, need_op_saving, branched);
+                 arg, need_op_saving, may_reuse);
+      }
 
+      if ((ops[lr->i].flags & (OPF_JMP|OPF_CC)) != OPF_JMP)
+        may_reuse = 1;
       if (j > 0 && LAST_OP(j - 1)) {
         // follow last branch in reverse
         j = lr->i;
@@ -2068,7 +2072,7 @@ static int collect_call_args(struct parsed_op *po, int i,
       }
       need_op_saving = 1;
       ret |= collect_call_args(po, lr->i, pp, save_arg_vars,
-               arg, need_op_saving, branched);
+               arg, need_op_saving, may_reuse);
     }
     j--;
 
@@ -2077,7 +2081,7 @@ static int collect_call_args(struct parsed_op *po, int i,
       pp_tmp = ops[j].datap;
       if (pp_tmp == NULL)
         ferr(po, "arg collect hit unparsed call\n");
-      if (branched && pp_tmp->argc_stack > 0)
+      if (may_reuse && pp_tmp->argc_stack > 0)
         ferr(po, "arg collect %d/%d hit '%s' with %d stack args\n",
           arg, pp->argc, opr_name(&ops[j], 0), pp_tmp->argc_stack);
     }
@@ -2088,12 +2092,9 @@ static int collect_call_args(struct parsed_op *po, int i,
     else if (ops[j].op == OP_POP) {
       ferr(po, "arg collect %d/%d hit pop\n", arg, pp->argc);
     }
-    else if (LAST_OP(j)) {
-      break;
-    }
     else if ((ops[j].flags & (OPF_JMP|OPF_CC)) == (OPF_JMP|OPF_CC))
     {
-      branched = 1;
+      may_reuse = 1;
     }
     else if (ops[j].op == OP_PUSH && !(ops[j].flags & OPF_FARG))
     {
@@ -2117,10 +2118,10 @@ static int collect_call_args(struct parsed_op *po, int i,
       else if (ops[j].argnum == 0)
         ops[j].flags |= OPF_RMD;
 
-      // some PUSHes are reused by calls on multiple branches,
+      // some PUSHes are reused by different calls on other branches,
       // but that can't happen if we didn't branch, so they
       // can be removed from future searches (handles nested calls)
-      if (!branched)
+      if (!may_reuse)
         ops[j].flags |= OPF_FARG;
 
       // next arg
@@ -2149,6 +2150,7 @@ static void add_label_ref(struct label_ref *lr, int op_i)
 
   lr_new = calloc(1, sizeof(*lr_new));
   lr_new->i = op_i;
+  lr_new->next = lr->next;
   lr->next = lr_new;
 }
 
@@ -3108,7 +3110,8 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
         else {
           if (pp->name[0] == 0)
             ferr(po, "missing pp->name\n");
-          fprintf(fout, "%s(", pp->name);
+          fprintf(fout, "%s%s(", pp->name,
+            pp->has_structarg ? "_sa" : "");
         }
 
         for (arg = 0; arg < pp->argc; arg++) {

@@ -31,7 +31,6 @@ char* __cdecl 	strerror (int);
 double __cdecl 	atof	(const char*);
 int __cdecl 	atoi	(const char*);
 long __cdecl  	atol	(const char*);
-
 size_t __cdecl 	strlen (const char*) ;
 char* __cdecl 	strncat (char*, const char*, size_t);
 int __cdecl 	strncmp (const char*, const char*, size_t) ;
@@ -42,6 +41,21 @@ size_t __cdecl 	strspn (const char*, const char*) ;
 char* __cdecl 	strstr (const char*, const char*) ;
 char* __cdecl 	strtok (char*, const char*);
 size_t __cdecl 	strxfrm (char*, const char*, size_t);
+
+char* __cdecl 	_strerror (const char *);
+void* __cdecl 	_memccpy (void*, const void*, int, size_t);
+int __cdecl  	_memicmp (const void*, const void*, size_t);
+char* __cdecl  	_strdup (const char*);
+int __cdecl 	_strcmpi (const char*, const char*);
+int __cdecl 	_stricmp (const char*, const char*);
+int __cdecl 	_stricoll (const char*, const char*);
+char* __cdecl 	_strlwr (char*);
+int __cdecl 	_strnicmp (const char*, const char*, size_t);
+char* __cdecl 	_strnset (char*, int, size_t);
+char* __cdecl 	_strrev (char*);
+char* __cdecl 	_strset (char*, int);
+char* __cdecl 	_strupr (char*);
+void __cdecl 	_swab (const char*, char*, size_t);
 
 int __cdecl  isalnum(int);
 int __cdecl  isalpha(int);

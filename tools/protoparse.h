@@ -5,6 +5,7 @@ struct parsed_type {
 	char *name;
 	unsigned int is_array:1;
 	unsigned int is_ptr:1;
+	unsigned int is_struct:1; // split for args
 };
 
 struct parsed_proto_arg {
@@ -29,10 +30,14 @@ struct parsed_proto {
 	unsigned int is_vararg:1;
 	unsigned int is_fptr:1;
 	unsigned int is_noreturn:1;
+	unsigned int has_structarg:1;
 };
 
 static const char *hdrfn;
 static int hdrfline = 0;
+
+static void pp_copy_arg(struct parsed_proto_arg *d,
+	const struct parsed_proto_arg *s);
 
 static int b_pp_c_handler(char *proto, const char *fname);
 
@@ -127,6 +132,7 @@ static const char *known_ptr_types[] = {
 	"HBITMAP",
 	"HCURSOR",
 	"HDC",
+	"HFONT",
 	"HGDIOBJ",
 	"HGLOBAL",
 	"HINSTANCE",
@@ -205,7 +211,7 @@ static int check_type(const char *name, struct parsed_type *type)
 		break;
 	}
 
-	if (n[0] == 'L' && n[1] == 'P')
+	if (n[0] == 'L' && n[1] == 'P' && strncmp(n, "LPARAM", 6))
 		type->is_ptr = 1;
 
 	// assume single word
@@ -246,6 +252,14 @@ static const char *map_reg(const char *reg)
 			return regs_f[i];
 
 	return reg;
+}
+
+static int check_struct_arg(struct parsed_proto_arg *arg)
+{
+	if (IS(arg->type.name, "POINT"))
+		return 2 - 1;
+
+	return 0;
 }
 
 static int parse_protostr(char *protostr, struct parsed_proto *pp)
@@ -454,7 +468,7 @@ static int parse_protostr(char *protostr, struct parsed_proto *pp)
 				return -1;
 			}
 			// we'll treat it as void * for non-calls
-			arg->type.name = "void *";
+			arg->type.name = strdup("void *");
 			arg->type.is_ptr = 1;
 
 			p = p1 + ret;
@@ -477,6 +491,18 @@ static int parse_protostr(char *protostr, struct parsed_proto *pp)
 			p = sskip(p);
 
 			arg->reg = strdup(map_reg(regparm));
+		}
+
+		ret = check_struct_arg(arg);
+		if (ret > 0) {
+			pp->has_structarg = 1;
+			arg->type.is_struct = 1;
+			free(arg->type.name);
+			arg->type.name = strdup("int");
+			for (l = 0; l < ret; l++) {
+				pp_copy_arg(&pp->arg[xarg], arg);
+				xarg++;
+			}
 		}
 	}
 
@@ -578,6 +604,26 @@ static const struct parsed_proto *proto_parse(FILE *fhdr, const char *sym)
 	return pp_ret;
 }
 
+static void pp_copy_arg(struct parsed_proto_arg *d,
+	const struct parsed_proto_arg *s)
+{
+	memcpy(d, s, sizeof(*d));
+
+	if (s->reg != NULL) {
+		d->reg = strdup(s->reg);
+		my_assert_not(d->reg, NULL);
+	}
+	if (s->type.name != NULL) {
+		d->type.name = strdup(s->type.name);
+		my_assert_not(d->type.name, NULL);
+	}
+	if (s->fptr != NULL) {
+		d->fptr = malloc(sizeof(*d->fptr));
+		my_assert_not(d->fptr, NULL);
+		memcpy(d->fptr, s->fptr, sizeof(*d->fptr));
+	}
+}
+
 struct parsed_proto *proto_clone(const struct parsed_proto *pp_c)
 {
 	struct parsed_proto *pp;
@@ -588,22 +634,8 @@ struct parsed_proto *proto_clone(const struct parsed_proto *pp_c)
 	memcpy(pp, pp_c, sizeof(*pp)); // lazy..
 
 	// do the actual deep copy..
-	for (i = 0; i < pp_c->argc; i++) {
-		if (pp_c->arg[i].reg != NULL) {
-			pp->arg[i].reg = strdup(pp_c->arg[i].reg);
-			my_assert_not(pp->arg[i].reg, NULL);
-		}
-		if (pp_c->arg[i].type.name != NULL) {
-			pp->arg[i].type.name = strdup(pp_c->arg[i].type.name);
-			my_assert_not(pp->arg[i].type.name, NULL);
-		}
-		if (pp_c->arg[i].fptr != NULL) {
-			pp->arg[i].fptr = malloc(sizeof(*pp->arg[i].fptr));
-			my_assert_not(pp->arg[i].fptr, NULL);
-			memcpy(pp->arg[i].fptr, pp_c->arg[i].fptr,
-				sizeof(*pp->arg[i].fptr));
-		}
-	}
+	for (i = 0; i < pp_c->argc; i++)
+		pp_copy_arg(&pp->arg[i], &pp_c->arg[i]);
 	if (pp_c->ret_type.name != NULL)
 		pp->ret_type.name = strdup(pp_c->ret_type.name);
 
