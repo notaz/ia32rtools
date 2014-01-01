@@ -1937,22 +1937,36 @@ static int scan_for_mod_opr0(struct parsed_op *po_test,
   return -1;
 }
 
-static int scan_for_flag_set(int i, int *branched, int *setters,
-  int *setter_cnt)
+static int scan_for_flag_set(int i, int magic, int *branched,
+  int *setters, int *setter_cnt)
 {
+  struct label_ref *lr;
   int ret;
 
   while (i >= 0) {
+    if (ops[i].cc_scratch == magic) {
+      ferr(&ops[i], "%s looped\n", __func__);
+      return -1;
+    }
+    ops[i].cc_scratch = magic;
+
     if (g_labels[i][0] != 0) {
       *branched = 1;
-      if (g_label_refs[i].next != NULL)
-        return -1;
+
+      lr = &g_label_refs[i];
+      for (; lr->next; lr = lr->next) {
+        ret = scan_for_flag_set(lr->i, magic,
+                branched, setters, setter_cnt);
+        if (ret < 0)
+          return ret;
+      }
+
       if (i > 0 && LAST_OP(i - 1)) {
         i = g_label_refs[i].i;
         continue;
       }
-      ret = scan_for_flag_set(g_label_refs[i].i, branched,
-              setters, setter_cnt);
+      ret = scan_for_flag_set(lr->i, magic,
+              branched, setters, setter_cnt);
       if (ret < 0)
         return ret;
     }
@@ -2160,6 +2174,21 @@ static void add_label_ref(struct label_ref *lr, int op_i)
   lr_new->i = op_i;
   lr_new->next = lr->next;
   lr->next = lr_new;
+}
+
+static void output_std_flags(FILE *fout, struct parsed_op *po,
+  int *pfomask, const char *dst_opr_text)
+{
+  if (*pfomask & (1 << PFO_Z)) {
+    fprintf(fout, "\n  cond_z = (%s%s == 0);",
+      lmod_cast_u(po, po->operand[0].lmod), dst_opr_text);
+    *pfomask &= ~(1 << PFO_Z);
+  }
+  if (*pfomask & (1 << PFO_S)) {
+    fprintf(fout, "\n  cond_s = (%s%s < 0);",
+      lmod_cast_s(po, po->operand[0].lmod), dst_opr_text);
+    *pfomask &= ~(1 << PFO_S);
+  }
 }
 
 static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
@@ -2547,7 +2576,8 @@ tailcall:
     {
       int setters[16], cnt = 0, branched = 0;
 
-      ret = scan_for_flag_set(i, &branched, setters, &cnt);
+      ret = scan_for_flag_set(i, i + opcnt * 6,
+              &branched, setters, &cnt);
       if (ret < 0 || cnt <= 0)
         ferr(po, "unable to trace flag setter(s)\n");
       if (cnt > ARRAY_SIZE(setters))
@@ -2570,16 +2600,19 @@ tailcall:
           pfomask = 1 << PFO_Z;
         }
         else {
-          if ((pfo != PFO_Z && pfo != PFO_S && pfo != PFO_P)
+          // see if we'll be able to handle based on op result
+          if ((tmp_op->op != OP_AND && tmp_op->op != OP_OR
+               && pfo != PFO_Z && pfo != PFO_S && pfo != PFO_P)
+              || branched
               || scan_for_mod_opr0(tmp_op, setters[j] + 1, i) >= 0)
             pfomask = 1 << pfo;
         }
         if (pfomask) {
           tmp_op->pfomask |= pfomask;
           cmp_result_vars |= pfomask;
-          // note: may overwrite, currently not a problem
-          po->datap = tmp_op;
         }
+        // note: may overwrite, currently not a problem
+        po->datap = tmp_op;
       }
 
       if (po->op == OP_ADC || po->op == OP_SBB)
@@ -2742,6 +2775,7 @@ tailcall:
       int is_inv = 0;
 
       pfo = split_cond(po, po->op, &is_inv);
+      tmp_op = po->datap;
 
       // we go through all this trouble to avoid using parsed_flag_op,
       // which makes generated code much nicer
@@ -2751,17 +2785,18 @@ tailcall:
         is_delayed = 1;
       }
       else if (last_arith_dst != NULL
-        && (pfo == PFO_Z || pfo == PFO_S || pfo == PFO_P))
+        && (pfo == PFO_Z || pfo == PFO_S || pfo == PFO_P
+           || (tmp_op && (tmp_op->op == OP_AND || tmp_op->op == OP_OR))
+           ))
       {
         out_src_opr_u32(buf3, sizeof(buf3), po, last_arith_dst);
         out_test_for_cc(buf1, sizeof(buf1), po, pfo, is_inv,
           last_arith_dst->lmod, buf3);
         is_delayed = 1;
       }
-      else if (po->datap != NULL) {
+      else if (tmp_op != NULL) {
         // use preprocessed flag calc results
-        tmp_op = po->datap;
-        if (!tmp_op || !(tmp_op->pfomask & (1 << pfo)))
+        if (!(tmp_op->pfomask & (1 << pfo)))
           ferr(po, "not prepared for pfo %d\n", pfo);
 
         // note: is_inv was not yet applied
@@ -2924,22 +2959,44 @@ tailcall:
       case OP_OR:
         propagate_lmod(po, &po->operand[0], &po->operand[1]);
         // fallthrough
-      case OP_SHL:
-      case OP_SHR:
       dualop_arith:
         assert_operand_cnt(2);
         fprintf(fout, "  %s %s= %s;",
             out_dst_opr(buf1, sizeof(buf1), po, &po->operand[0]),
             op_to_c(po),
             out_src_opr_u32(buf2, sizeof(buf2), po, &po->operand[1]));
-        if (pfomask & (1 << PFO_Z)) {
-          fprintf(fout, "\n  cond_z = (%s == 0);", buf1);
-          pfomask &= ~(1 << PFO_Z);
+        output_std_flags(fout, po, &pfomask, buf1);
+        last_arith_dst = &po->operand[0];
+        delayed_flag_op = NULL;
+        break;
+
+      case OP_SHL:
+      case OP_SHR:
+        assert_operand_cnt(2);
+        out_dst_opr(buf1, sizeof(buf1), po, &po->operand[0]);
+        if (pfomask & (1 << PFO_C)) {
+          if (po->operand[1].type == OPT_CONST) {
+            l = lmod_bytes(po, po->operand[0].lmod) * 8;
+            j = po->operand[1].val;
+            j %= l;
+            if (j != 0) {
+              if (po->op == OP_SHL)
+                j = l - j;
+              else
+                j -= 1;
+              fprintf(fout, "  cond_c = (%s & 0x%02x) ? 1 : 0;\n",
+                buf1, 1 << j);
+            }
+            else
+              ferr(po, "zero shift?\n");
+          }
+          else
+            ferr(po, "TODO\n");
+          pfomask &= ~(1 << PFO_C);
         }
-        if (pfomask & (1 << PFO_S)) {
-          fprintf(fout, "\n  cond_s = ((s32)%s < 0);", buf1);
-          pfomask &= ~(1 << PFO_S);
-        }
+        fprintf(fout, "  %s %s= %s;", buf1, op_to_c(po),
+            out_src_opr_u32(buf2, sizeof(buf2), po, &po->operand[1]));
+        output_std_flags(fout, po, &pfomask, buf1);
         last_arith_dst = &po->operand[0];
         delayed_flag_op = NULL;
         break;
@@ -2950,6 +3007,7 @@ tailcall:
         fprintf(fout, "  %s = %s%s >> %s;", buf1,
           lmod_cast_s(po, po->operand[0].lmod), buf1,
           out_src_opr_u32(buf2, sizeof(buf2), po, &po->operand[1]));
+        output_std_flags(fout, po, &pfomask, buf1);
         last_arith_dst = &po->operand[0];
         delayed_flag_op = NULL;
         break;
@@ -2969,6 +3027,7 @@ tailcall:
         }
         else
           ferr(po, "TODO\n");
+        output_std_flags(fout, po, &pfomask, buf1);
         last_arith_dst = &po->operand[0];
         delayed_flag_op = NULL;
         break;
