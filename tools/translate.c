@@ -38,6 +38,7 @@ enum op_flags {
   OPF_REPZ   = (1 << 8), /* rep is repe/repz */
   OPF_REPNZ  = (1 << 9), /* rep is repne/repnz */
   OPF_FARG   = (1 << 10), /* push collected as func arg (no reuse) */
+  OPF_EBP_S  = (1 << 11), /* ebp used as scratch, not BP */
 };
 
 enum op_op {
@@ -120,6 +121,7 @@ struct parsed_opr {
   enum opr_lenmod lmod;
   unsigned int is_ptr:1;   // pointer in C
   unsigned int is_array:1; // array in C
+  unsigned int type_from_var:1; // .. in header, sometimes wrong
   unsigned int size_mismatch:1; // type override differs from C
   unsigned int size_lt:1;  // type override is larger than C
   int reg;
@@ -468,7 +470,8 @@ static int guess_lmod_from_c_type(enum opr_lenmod *lmod,
   const struct parsed_type *c_type)
 {
   static const char *dword_types[] = {
-    "int", "_DWORD", "DWORD", "HANDLE", "HWND", "HMODULE",
+    "int", "_DWORD", "UINT_PTR",
+    "DWORD", "HANDLE", "HWND", "HMODULE",
     "WPARAM", "LPARAM", "UINT",
   };
   static const char *word_types[] = {
@@ -478,6 +481,7 @@ static int guess_lmod_from_c_type(enum opr_lenmod *lmod,
   static const char *byte_types[] = {
     "uint8_t", "int8_t", "char",
     "unsigned __int8", "__int8", "BYTE",
+    "_UNKNOWN",
   };
   const char *n;
   int i;
@@ -685,8 +689,10 @@ static int parse_operand(struct parsed_opr *opr,
         anote("unhandled C type '%s' for '%s'\n",
           pp->type.name, opr->name);
       
-      if (opr->lmod == OPLM_UNSPEC)
+      if (opr->lmod == OPLM_UNSPEC) {
         opr->lmod = tmplmod;
+        opr->type_from_var = 1;
+      }
       else if (opr->lmod != tmplmod) {
         opr->size_mismatch = 1;
         if (tmplmod < opr->lmod)
@@ -760,7 +766,7 @@ static const struct {
   { "idiv", OP_IDIV,   1, 1, OPF_DATA|OPF_FLAGS },
   { "test", OP_TEST,   2, 2, OPF_FLAGS },
   { "cmp",  OP_CMP,    2, 2, OPF_FLAGS },
-  { "retn", OP_RET,    0, 1, OPF_JMP|OPF_TAIL },
+  { "retn", OP_RET,    0, 1, OPF_TAIL },
   { "call", OP_CALL,   1, 1, OPF_JMP|OPF_DATA|OPF_FLAGS },
   { "jmp",  OP_JMP,    1, 1, OPF_JMP },
   { "jo",   OP_JO,     1, 1, OPF_JMP|OPF_CC }, // 70 OF=1
@@ -1185,26 +1191,34 @@ static void stack_frame_access(struct parsed_op *po,
   const char *p;
   char *endp = NULL;
   int i, arg_i, arg_s;
+  int unaligned = 0;
   int stack_ra = 0;
   int offset = 0;
   int sf_ofs;
   int lim;
 
-  if (!IS_START(name, "ebp-")) {
+  if (po->flags & OPF_EBP_S)
+    ferr(po, "stack_frame_access while ebp is scratch\n");
+
+  if (IS_START(name, "ebp-")
+   || (IS_START(name, "ebp+") && '0' <= name[4] && name[4] <= '9'))
+  {
+    p = name + 4;
+    if (IS_START(p, "0x"))
+      p += 2;
+    offset = strtoul(p, &endp, 16);
+    if (name[3] == '-')
+      offset = -offset;
+    if (*endp != 0)
+      ferr(po, "ebp- parse of '%s' failed\n", name);
+  }
+  else {
     bp_arg = parse_stack_el(name, ofs_reg);
     snprintf(g_comment, sizeof(g_comment), "%s", bp_arg);
     eq = equ_find(po, bp_arg, &offset);
     if (eq == NULL)
       ferr(po, "detected but missing eq\n");
     offset += eq->offset;
-  }
-  else {
-    p = name + 4;
-    if (IS_START(p, "0x"))
-      p += 2;
-    offset = -strtoul(p, &endp, 16);
-    if (*endp != 0)
-      ferr(po, "ebp- parse of '%s' failed\n", name);
   }
 
   if (!strncmp(name, "ebp", 3))
@@ -1259,9 +1273,17 @@ static void stack_frame_access(struct parsed_op *po,
     case OPLM_WORD:
       if (is_lea)
         ferr(po, "lea/word to arg?\n");
-      if (offset & 1)
-        ferr(po, "unaligned arg access\n");
-      if (is_src && (offset & 2) == 0)
+      if (offset & 1) {
+        unaligned = 1;
+        if (!is_src) {
+          if (offset & 2)
+            ferr(po, "problematic arg store\n");
+          snprintf(buf, buf_size, "*(u16 *)((char *)&a%d + 1)", i + 1);
+        }
+        else
+          ferr(po, "unaligned arg word load\n");
+      }
+      else if (is_src && (offset & 2) == 0)
         snprintf(buf, buf_size, "(u16)a%d", i + 1);
       else
         snprintf(buf, buf_size, "%sWORD(a%d)",
@@ -1273,14 +1295,19 @@ static void stack_frame_access(struct parsed_op *po,
         prefix = cast;
       else if (is_src)
         prefix = "(u32)";
+
       if (offset & 3) {
-        snprintf(g_comment, sizeof(g_comment), "%s unaligned", bp_arg);
+        unaligned = 1;
         if (is_lea)
           snprintf(buf, buf_size, "(u32)&a%d + %d",
             i + 1, offset & 3);
-        else
+        else if (!is_src)
+          ferr(po, "unaligned arg store\n");
+        else {
+          // mov edx, [ebp+arg_4+2]; movsx ecx, dx
           snprintf(buf, buf_size, "%s(a%d >> %d)",
             prefix, i + 1, (offset & 3) * 8);
+        }
       }
       else {
         snprintf(buf, buf_size, "%s%sa%d",
@@ -1292,9 +1319,12 @@ static void stack_frame_access(struct parsed_op *po,
       ferr(po, "bp_arg bad lmod: %d\n", popr->lmod);
     }
 
+    if (unaligned)
+      snprintf(g_comment, sizeof(g_comment), "%s unaligned", bp_arg);
+
     // common problem
     guess_lmod_from_c_type(&tmp_lmod, &g_func_pp->arg[i].type);
-    if ((offset & 3) && tmp_lmod != OPLM_DWORD)
+    if (unaligned && tmp_lmod != OPLM_DWORD)
       ferr(po, "bp_arg arg/w offset %d and type '%s'\n",
         offset, g_func_pp->arg[i].type.name);
   }
@@ -1401,7 +1431,8 @@ static char *out_src_opr(char *buf, size_t buf_size,
 
   case OPT_REGMEM:
     if (parse_stack_el(popr->name, NULL)
-      || (g_bp_frame && IS_START(popr->name, "ebp-")))
+      || (g_bp_frame && !(po->flags & OPF_EBP_S)
+          && IS_START(popr->name, "ebp")))
     {
       stack_frame_access(po, popr, buf, buf_size,
         popr->name, cast, 1, is_lea);
@@ -1498,7 +1529,8 @@ static char *out_dst_opr(char *buf, size_t buf_size,
 
   case OPT_REGMEM:
     if (parse_stack_el(popr->name, NULL)
-      || (g_bp_frame && IS_START(popr->name, "ebp-")))
+      || (g_bp_frame && !(po->flags & OPF_EBP_S)
+          && IS_START(popr->name, "ebp")))
     {
       stack_frame_access(po, popr, buf, buf_size,
         popr->name, "", 0, 0);
@@ -1705,8 +1737,23 @@ static void propagate_lmod(struct parsed_op *po, struct parsed_opr *popr1,
     popr1->lmod = popr2->lmod;
   else if (popr2->lmod == OPLM_UNSPEC)
     popr2->lmod = popr1->lmod;
-  else if (popr1->lmod != popr2->lmod)
-    ferr(po, "conflicting lmods: %d vs %d\n", popr1->lmod, popr2->lmod);
+  else if (popr1->lmod != popr2->lmod) {
+    if (popr1->type_from_var) {
+      popr1->size_mismatch = 1;
+      if (popr1->lmod < popr2->lmod)
+        popr1->size_lt = 1;
+      popr1->lmod = popr2->lmod;
+    }
+    else if (popr2->type_from_var) {
+      popr2->size_mismatch = 1;
+      if (popr2->lmod < popr1->lmod)
+        popr2->size_lt = 1;
+      popr2->lmod = popr1->lmod;
+    }
+    else
+      ferr(po, "conflicting lmods: %d vs %d\n",
+        popr1->lmod, popr2->lmod);
+  }
 }
 
 static const char *op_to_c(struct parsed_op *po)
@@ -2055,9 +2102,41 @@ static int scan_for_esp_adjust(int i, int opcnt, int *adj)
   return -1;
 }
 
+static void scan_fwd_set_flags(int i, int opcnt, int magic, int flags)
+{
+  struct parsed_op *po;
+  int j;
+
+  if (i < 0)
+    ferr(ops, "%s: followed bad branch?\n", __func__);
+
+  for (; i < opcnt; i++) {
+    po = &ops[i];
+    if (po->cc_scratch == magic)
+      return;
+    po->cc_scratch = magic;
+    po->flags |= flags;
+
+    if ((po->flags & OPF_JMP) && po->op != OP_CALL) {
+      if (po->btj != NULL) {
+        // jumptable
+        for (j = 0; j < po->btj->count; j++)
+          scan_fwd_set_flags(po->btj->d[j].bt_i, opcnt, magic, flags);
+        return;
+      }
+
+      scan_fwd_set_flags(po->bt_i, opcnt, magic, flags);
+      if (!(po->flags & OPF_CC))
+        return;
+    }
+    if (po->flags & OPF_TAIL)
+      return;
+  }
+}
+
 static int collect_call_args(struct parsed_op *po, int i,
   struct parsed_proto *pp, int *save_arg_vars, int arg,
-  int need_op_saving, int may_reuse)
+  int magic, int need_op_saving, int may_reuse)
 {
   struct parsed_proto *pp_tmp;
   struct label_ref *lr;
@@ -2065,15 +2144,29 @@ static int collect_call_args(struct parsed_op *po, int i,
   int ret = 0;
   int j;
 
-  if (i < 0)
+  if (i < 0) {
     ferr(po, "no refs for '%s'?\n", g_labels[i]);
+    return -1;
+  }
 
   for (; arg < pp->argc; arg++)
     if (pp->arg[arg].reg == NULL)
       break;
+  magic = (magic & 0xffffff) | (arg << 24);
 
   for (j = i; j >= 0 && arg < pp->argc; )
   {
+    if (((ops[j].cc_scratch ^ magic) & 0xffffff) == 0) {
+      if (ops[j].cc_scratch != magic) {
+        ferr(&ops[j], "arg collect hit same path with diff args for %s\n",
+           pp->name);
+        return -1;
+      }
+      // ok: have already been here
+      return 0;
+    }
+    ops[j].cc_scratch = magic;
+
     if (g_labels[j][0] != 0) {
       lr = &g_label_refs[j];
       if (lr->next != NULL)
@@ -2081,8 +2174,10 @@ static int collect_call_args(struct parsed_op *po, int i,
       for (; lr->next; lr = lr->next) {
         if ((ops[lr->i].flags & (OPF_JMP|OPF_CC)) != OPF_JMP)
           may_reuse = 1;
-        ret |= collect_call_args(po, lr->i, pp, save_arg_vars,
-                 arg, need_op_saving, may_reuse);
+        ret = collect_call_args(po, lr->i, pp, save_arg_vars,
+                arg, magic, need_op_saving, may_reuse);
+        if (ret < 0)
+          return ret;
       }
 
       if ((ops[lr->i].flags & (OPF_JMP|OPF_CC)) != OPF_JMP)
@@ -2093,8 +2188,10 @@ static int collect_call_args(struct parsed_op *po, int i,
         continue;
       }
       need_op_saving = 1;
-      ret |= collect_call_args(po, lr->i, pp, save_arg_vars,
-               arg, need_op_saving, may_reuse);
+      ret = collect_call_args(po, lr->i, pp, save_arg_vars,
+               arg, magic, need_op_saving, may_reuse);
+      if (ret < 0)
+        return ret;
     }
     j--;
 
@@ -2150,6 +2247,7 @@ static int collect_call_args(struct parsed_op *po, int i,
       for (arg++; arg < pp->argc; arg++)
         if (pp->arg[arg].reg == NULL)
           break;
+      magic = (magic & 0xffffff) | (arg << 24);
     }
   }
 
@@ -2204,10 +2302,12 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
   int save_arg_vars = 0;
   int cmp_result_vars = 0;
   int need_mul_var = 0;
+  int have_func_ret = 0;
   int had_decl = 0;
   int label_pending = 0;
   int regmask_save = 0;
   int regmask_arg = 0;
+  int regmask_now = 0;
   int regmask = 0;
   int pfomask = 0;
   int found = 0;
@@ -2516,10 +2616,13 @@ tailcall:
         }
       }
 
-      collect_call_args(po, i, pp, &save_arg_vars, 0, 0, 0);
+      collect_call_args(po, i, pp, &save_arg_vars,
+        0, i + opcnt * 2, 0, 0);
 
       if (strstr(pp->ret_type.name, "int64"))
         need_mul_var = 1;
+      if (!(po->flags & OPF_TAIL) && !IS(pp->ret_type.name, "void"))
+        have_func_ret = 1;
       po->datap = pp;
     }
   }
@@ -2544,7 +2647,7 @@ tailcall:
 
       depth = 0;
       ret = scan_for_pop(i + 1, opcnt,
-              po->operand[0].name, i + opcnt, 0, &depth, 0);
+              po->operand[0].name, i + opcnt * 3, 0, &depth, 0);
       if (ret == 1) {
         if (depth > 1)
           ferr(po, "too much depth: %d\n", depth);
@@ -2553,7 +2656,7 @@ tailcall:
 
         po->flags |= OPF_RMD;
         scan_for_pop(i + 1, opcnt, po->operand[0].name,
-          i + opcnt * 2, 0, &depth, 1);
+          i + opcnt * 4, 0, &depth, 1);
         continue;
       }
       ret = scan_for_pop_ret(i + 1, opcnt, po->operand[0].name, 0);
@@ -2570,7 +2673,18 @@ tailcall:
       }
     }
 
-    regmask |= po->regmask_src | po->regmask_dst;
+    regmask_now = po->regmask_src | po->regmask_dst;
+    if (regmask_now & (1 << xBP)) {
+      if (g_bp_frame && !(po->flags & OPF_EBP_S)) {
+        if (po->regmask_dst & (1 << xBP))
+          // compiler decided to drop bp frame and use ebp as scratch
+          scan_fwd_set_flags(i, opcnt, i + opcnt * 5, OPF_EBP_S);
+        else
+          regmask_now &= ~(1 << xBP);
+      }
+    }
+
+    regmask |= regmask_now;
 
     if (po->flags & OPF_CC)
     {
@@ -2686,7 +2800,7 @@ tailcall:
   }
 
   // declare other regs - special case for eax
-  if (!((regmask | regmask_arg) & 1)
+  if (!((regmask | regmask_arg) & 1) && have_func_ret
    && !IS(g_func_pp->ret_type.name, "void"))
   {
     fprintf(fout, "  u32 eax = 0;\n");
@@ -2695,8 +2809,6 @@ tailcall:
 
   regmask &= ~regmask_arg;
   regmask &= ~(1 << xSP);
-  if (g_bp_frame)
-    regmask &= ~(1 << xBP);
   if (regmask) {
     for (reg = 0; reg < 8; reg++) {
       if (regmask & (1 << reg)) {

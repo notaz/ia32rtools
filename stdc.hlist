@@ -71,6 +71,10 @@ int __cdecl  isxdigit(int);
 int __cdecl  tolower(int);
 int __cdecl  toupper(int);
 
+clock_t __cdecl 	clock (void);
+time_t __cdecl 		time (time_t*);
+double __cdecl 		difftime (time_t, time_t);
+time_t __cdecl 		mktime (struct tm*);
 char* __cdecl 		asctime (const struct tm*);
 char* __cdecl 		ctime (const time_t*);
 struct tm*  __cdecl 	gmtime (const time_t*);
