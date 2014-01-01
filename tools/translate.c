@@ -469,7 +469,7 @@ static int guess_lmod_from_c_type(enum opr_lenmod *lmod,
 {
   static const char *dword_types[] = {
     "int", "_DWORD", "DWORD", "HANDLE", "HWND", "HMODULE",
-    "WPARAM", "UINT",
+    "WPARAM", "LPARAM", "UINT",
   };
   static const char *word_types[] = {
     "uint16_t", "int16_t",
@@ -680,6 +680,7 @@ static int parse_operand(struct parsed_opr *opr,
       opr->is_ptr = 1;
     }
     else {
+      tmplmod = OPLM_UNSPEC;
       if (!guess_lmod_from_c_type(&tmplmod, &pp->type))
         anote("unhandled C type '%s' for '%s'\n",
           pp->type.name, opr->name);
@@ -1353,8 +1354,15 @@ static void stack_frame_access(struct parsed_op *po,
 
 static void check_label_read_ref(struct parsed_op *po, const char *name)
 {
-  if (IS_START(name, "sub_"))
-    ferr(po, "func reference?\n");
+  const struct parsed_proto *pp;
+
+  pp = proto_parse(g_fhdr, name);
+  if (pp == NULL)
+    ferr(po, "proto_parse failed for ref '%s'\n", name);
+
+  // currently we can take __cdecl and __stdcall
+  if (pp->is_func && pp->argc_reg != 0)
+    ferr(po, "reg-arg func reference?\n");
 }
 
 static char *out_src_opr(char *buf, size_t buf_size,
@@ -2363,7 +2371,8 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
         }
       }
       if (pd == NULL)
-        ferr(po, "label '%s' not parsed?\n", buf1);
+        //ferr(po, "label '%s' not parsed?\n", buf1);
+        goto tailcall;
       if (pd->type != OPT_OFFSET)
         ferr(po, "label '%s' with non-offset data?\n", buf1);
 
@@ -2393,14 +2402,15 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
     if (po->bt_i != -1)
       continue;
 
-    if (po->operand[0].type == OPT_LABEL) {
+    if (po->operand[0].type == OPT_LABEL)
       // assume tail call
-      po->op = OP_CALL;
-      po->flags |= OPF_TAIL;
-      continue;
-    }
+      goto tailcall;
 
     ferr(po, "unhandled branch\n");
+
+tailcall:
+    po->op = OP_CALL;
+    po->flags |= OPF_TAIL;
   }
 
   // pass3:
@@ -2922,6 +2932,14 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
             out_dst_opr(buf1, sizeof(buf1), po, &po->operand[0]),
             op_to_c(po),
             out_src_opr_u32(buf2, sizeof(buf2), po, &po->operand[1]));
+        if (pfomask & (1 << PFO_Z)) {
+          fprintf(fout, "\n  cond_z = (%s == 0);", buf1);
+          pfomask &= ~(1 << PFO_Z);
+        }
+        if (pfomask & (1 << PFO_S)) {
+          fprintf(fout, "\n  cond_s = ((s32)%s < 0);", buf1);
+          pfomask &= ~(1 << PFO_S);
+        }
         last_arith_dst = &po->operand[0];
         delayed_flag_op = NULL;
         break;
@@ -2972,10 +2990,19 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
       case OP_SBB:
         assert_operand_cnt(2);
         propagate_lmod(po, &po->operand[0], &po->operand[1]);
-        fprintf(fout, "  %s %s= %s + cond_c;",
+        if (po->op == OP_SBB
+          && IS(po->operand[0].name, po->operand[1].name))
+        {
+          // avoid use of unitialized var
+          fprintf(fout, "  %s = -cond_c;",
+            out_dst_opr(buf1, sizeof(buf1), po, &po->operand[0]));
+        }
+        else {
+          fprintf(fout, "  %s %s= %s + cond_c;",
             out_dst_opr(buf1, sizeof(buf1), po, &po->operand[0]),
             op_to_c(po),
             out_src_opr_u32(buf2, sizeof(buf2), po, &po->operand[1]));
+        }
         last_arith_dst = &po->operand[0];
         delayed_flag_op = NULL;
         break;
@@ -3115,9 +3142,11 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
         }
         else if (!IS(pp->ret_type.name, "void")) {
           if (po->flags & OPF_TAIL) {
-            fprintf(fout, "return ");
-            if (g_func_pp->ret_type.is_ptr != pp->ret_type.is_ptr)
-              fprintf(fout, "(%s)", g_func_pp->ret_type.name);
+            if (!IS(g_func_pp->ret_type.name, "void")) {
+              fprintf(fout, "return ");
+              if (g_func_pp->ret_type.is_ptr != pp->ret_type.is_ptr)
+                fprintf(fout, "(%s)", g_func_pp->ret_type.name);
+            }
           }
           else {
             fprintf(fout, "eax = ");
@@ -3172,9 +3201,16 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
 
         if (po->flags & OPF_TAIL) {
           strcpy(g_comment, "tailcall");
-          if (IS(pp->ret_type.name, "void")
-           && !(g_ida_func_attr & IDAFA_NORETURN))
-          {
+          ret = 0;
+          if (i == opcnt - 1)
+            ret = 0;
+          else if (IS(pp->ret_type.name, "void"))
+            ret = 1;
+          else if (IS(g_func_pp->ret_type.name, "void"))
+            ret = 1;
+          // else already handled as 'return f()'
+
+          if (ret) {
             fprintf(fout, "\n  return;");
             strcpy(g_comment, "^ tailcall");
           }

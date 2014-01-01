@@ -124,6 +124,7 @@ static const char *known_type_mod[] = {
 	"unsigned",
 	"struct",
 	"enum",
+	"CONST",
 };
 
 static const char *known_ptr_types[] = {
@@ -431,8 +432,14 @@ static int parse_protostr(char *protostr, struct parsed_proto *pp)
 			p++;
 			break;
 		}
-		if (*p == ',')
+		if (xarg > 0) {
+			if (*p != ',') {
+				printf("%s:%d:%zd: ',' expected\n",
+				 hdrfn, hdrfline, (p - protostr) + 1);
+				return -1;
+			}
 			p = sskip(p + 1);
+		}
 
 		if (!strncmp(p, "...", 3)) {
 			pp->is_vararg = 1;

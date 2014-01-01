@@ -8,4 +8,8 @@ T = asmproc cmpmrg_text mkbridge translate
 all: $(T)
 
 clean:
-	$(RM) $(T)
+	$(RM) $(T) *.o
+
+translate: translate.o
+mkbridge: mkbridge.o
+mkbridge.o translate.o: protoparse.h my_assert.h my_str.h
