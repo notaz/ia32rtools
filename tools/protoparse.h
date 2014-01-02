@@ -148,6 +148,8 @@ static const char *known_ptr_types[] = {
 	"PVOID",
 	"PCVOID",
 	"DLGPROC",
+	"TIMERPROC",
+	"WNDENUMPROC",
 	"va_list",
 	"__VALIST",
 };

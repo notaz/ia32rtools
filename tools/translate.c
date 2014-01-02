@@ -2035,7 +2035,18 @@ static int scan_for_flag_set(int i, int magic, int *branched,
 // scan back for cdq, if anything modifies edx, fail
 static int scan_for_cdq_edx(int i)
 {
-  for (; i >= 0; i--) {
+  while (i >= 0) {
+    if (g_labels[i][0] != 0) {
+      if (g_label_refs[i].next != NULL)
+        return -1;
+      if (i > 0 && LAST_OP(i - 1)) {
+        i = g_label_refs[i].i;
+        continue;
+      }
+      return -1;
+    }
+    i--;
+
     if (ops[i].op == OP_CDQ)
       return i;
 
@@ -2050,7 +2061,18 @@ static int scan_for_cdq_edx(int i)
 
 static int scan_for_reg_clear(int i, int reg)
 {
-  for (; i >= 0; i--) {
+  while (i >= 0) {
+    if (g_labels[i][0] != 0) {
+      if (g_label_refs[i].next != NULL)
+        return -1;
+      if (i > 0 && LAST_OP(i - 1)) {
+        i = g_label_refs[i].i;
+        continue;
+      }
+      return -1;
+    }
+    i--;
+
     if (ops[i].op == OP_XOR
      && ops[i].operand[0].lmod == OPLM_DWORD
      && ops[i].operand[0].reg == ops[i].operand[1].reg
@@ -2572,6 +2594,8 @@ tailcall:
         pp_c = proto_parse(fhdr, tmpname);
         if (pp_c == NULL)
           ferr(po, "proto_parse failed for call '%s'\n", tmpname);
+        if (pp_c->is_fptr && pp_c->argc_reg != 0)
+          ferr(po, "fptr call with reg arg\n");
         pp = proto_clone(pp_c);
       }
 
@@ -3233,9 +3257,9 @@ tailcall:
 
         // 32bit division is common, look for it
         if (po->op == OP_DIV)
-          ret = scan_for_reg_clear(i - 1, xDX);
+          ret = scan_for_reg_clear(i, xDX);
         else
-          ret = scan_for_cdq_edx(i - 1);
+          ret = scan_for_cdq_edx(i);
         if (ret >= 0) {
           out_src_opr_u32(buf1, sizeof(buf1), po, &po->operand[0]);
           strcpy(buf2, lmod_cast(po, po->operand[0].lmod,
@@ -3546,6 +3570,24 @@ struct chunk_item {
   int asmln;
 };
 
+static struct chunk_item *func_chunks;
+static int func_chunk_cnt;
+static int func_chunk_alloc;
+
+static void add_func_chunk(FILE *fasm, const char *name, int line)
+{
+  if (func_chunk_cnt >= func_chunk_alloc) {
+    func_chunk_alloc *= 2;
+    func_chunks = realloc(func_chunks,
+      func_chunk_alloc * sizeof(func_chunks[0]));
+    my_assert_not(func_chunks, NULL);
+  }
+  func_chunks[func_chunk_cnt].fptr = ftell(fasm);
+  func_chunks[func_chunk_cnt].name = strdup(name);
+  func_chunks[func_chunk_cnt].asmln = line;
+  func_chunk_cnt++;
+}
+
 static int cmp_chunks(const void *p1, const void *p2)
 {
   const struct chunk_item *c1 = p1, *c2 = p2;
@@ -3557,6 +3599,64 @@ static int cmpstringp(const void *p1, const void *p2)
   return strcmp(*(char * const *)p1, *(char * const *)p2);
 }
 
+static void scan_ahead(FILE *fasm)
+{
+  char words[2][256];
+  char line[256];
+  long oldpos;
+  int oldasmln;
+  int wordc;
+  char *p;
+  int i;
+
+  oldpos = ftell(fasm);
+  oldasmln = asmln;
+
+  while (fgets(line, sizeof(line), fasm))
+  {
+    wordc = 0;
+    asmln++;
+
+    p = sskip(line);
+    if (*p == 0)
+      continue;
+
+    if (*p == ';')
+    {
+      // get rid of random tabs
+      for (i = 0; line[i] != 0; i++)
+        if (line[i] == '\t')
+          line[i] = ' ';
+
+      if (p[2] == 'S' && IS_START(p, "; START OF FUNCTION CHUNK FOR "))
+      {
+        p += 30;
+        next_word(words[0], sizeof(words[0]), p);
+        if (words[0][0] == 0)
+          aerr("missing name for func chunk?\n");
+
+        add_func_chunk(fasm, words[0], asmln);
+      }
+      continue;
+    } // *p == ';'
+
+    for (wordc = 0; wordc < ARRAY_SIZE(words); wordc++) {
+      words[wordc][0] = 0;
+      p = sskip(next_word_s(words[wordc], sizeof(words[0]), p));
+      if (*p == 0 || *p == ';') {
+        wordc++;
+        break;
+      }
+    }
+
+    if (wordc == 2 && IS(words[1], "ends"))
+      break;
+  }
+
+  fseek(fasm, oldpos, SEEK_SET);
+  asmln = oldasmln;
+}
+
 int main(int argc, char *argv[])
 {
   FILE *fout, *fasm, *frlist;
@@ -3565,14 +3665,12 @@ int main(int argc, char *argv[])
   char **rlist = NULL;
   int rlist_len = 0;
   int rlist_alloc = 0;
-  struct chunk_item *func_chunks;
   int func_chunks_used = 0;
   int func_chunks_sorted = 0;
-  int func_chunk_cnt = 0;
-  int func_chunk_alloc;
   int func_chunk_i = -1;
   long func_chunk_ret = 0;
   int func_chunk_ret_ln = 0;
+  int scanned_ahead = 0;
   char line[256];
   char words[16][256];
   enum opr_lenmod lmod;
@@ -3718,18 +3816,12 @@ int main(int argc, char *argv[])
         p += 30;
         next_word(words[0], sizeof(words[0]), p);
         if (words[0][0] == 0)
-          aerr("missing nam for func chunk?\n");
-        if (func_chunk_cnt >= func_chunk_alloc) {
-          func_chunk_alloc *= 2;
-          func_chunks = realloc(func_chunks,
-            func_chunk_alloc * sizeof(func_chunks[0]));
-          my_assert_not(func_chunks, NULL);
+          aerr("missing name for func chunk?\n");
+
+        if (!scanned_ahead) {
+          add_func_chunk(fasm, words[0], asmln);
+          func_chunks_sorted = 0;
         }
-        func_chunks[func_chunk_cnt].fptr = ftell(fasm);
-        func_chunks[func_chunk_cnt].name = strdup(words[0]);
-        func_chunks[func_chunk_cnt].asmln = asmln;
-        func_chunk_cnt++;
-        func_chunks_sorted = 0;
       }
       else if (p[2] == 'E' && IS_START(p, "; END OF FUNCTION CHUNK"))
       {
@@ -3761,8 +3853,13 @@ int main(int argc, char *argv[])
         if (IS_START(g_func, "sub_")) {
           unsigned long addr = strtoul(p, NULL, 16);
           unsigned long f_addr = strtoul(g_func + 4, NULL, 16);
-          if (addr > f_addr)
-            aerr("need a chunk %lX that is after %s\n", addr, g_func);
+          if (addr > f_addr && !scanned_ahead) {
+            anote("scan_ahead caused by '%s', f_addr %lx\n",
+              g_func, f_addr);
+            scan_ahead(fasm);
+            scanned_ahead = 1;
+            func_chunks_sorted = 0;
+          }
         }
       }
       continue;
@@ -3770,7 +3867,7 @@ int main(int argc, char *argv[])
 
 parse_words:
     memset(words, 0, sizeof(words));
-    for (wordc = 0; wordc < 16; wordc++) {
+    for (wordc = 0; wordc < ARRAY_SIZE(words); wordc++) {
       p = sskip(next_word_s(words[wordc], sizeof(words[0]), p));
       if (*p == 0 || *p == ';') {
         wordc++;

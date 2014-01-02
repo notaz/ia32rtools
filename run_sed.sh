@@ -38,3 +38,4 @@ s/\<jmp\tsub_/jmp\tnear ptr sub_/;\
 # - search for 'dword_xx+N', make byte/word, also word->byte
 # - get rid of type propagation, regenerate as 'simple' var_
 # - convert ds:0[eax*4] -> [eax*4+0] (h hotkey)
+# - rm function chunks - they're funcs reached by tailcalls (usually)
