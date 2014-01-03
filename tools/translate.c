@@ -1784,15 +1784,11 @@ static const char *op_to_c(struct parsed_op *po)
   }
 }
 
-static void set_flag_no_dup(struct parsed_op *po, enum op_flags flag,
-  enum op_flags flag_check)
+static void op_set_clear_flag(struct parsed_op *po,
+  enum op_flags flag_set, enum op_flags flag_clear)
 {
-  if (po->flags & flag)
-    ferr(po, "flag %x already set\n", flag);
-  if (po->flags & flag_check)
-    ferr(po, "flag_check %x already set\n", flag_check);
-
-  po->flags |= flag;
+  po->flags |= flag_set;
+  po->flags &= ~flag_clear;
 }
 
 // last op in stream - unconditional branch or ret
@@ -1859,11 +1855,11 @@ static int scan_for_pop(int i, int opcnt, const char *reg,
         if (depth > *maxdepth)
           *maxdepth = depth;
         if (do_flags)
-          set_flag_no_dup(po, OPF_RSAVE, OPF_RMD);
+          op_set_clear_flag(po, OPF_RSAVE, OPF_RMD);
       }
       else if (depth == 0) {
         if (do_flags)
-          set_flag_no_dup(po, OPF_RMD, OPF_RSAVE);
+          op_set_clear_flag(po, OPF_RMD, OPF_RSAVE);
         return 1;
       }
       else {
@@ -1871,7 +1867,7 @@ static int scan_for_pop(int i, int opcnt, const char *reg,
         if (depth < 0) // should not happen
           ferr(po, "fail with depth\n");
         if (do_flags)
-          set_flag_no_dup(po, OPF_RSAVE, OPF_RMD);
+          op_set_clear_flag(po, OPF_RSAVE, OPF_RMD);
       }
     }
   }
@@ -2221,7 +2217,8 @@ static int collect_call_args(struct parsed_op *po, int i,
     {
       pp_tmp = ops[j].datap;
       if (pp_tmp == NULL)
-        ferr(po, "arg collect hit unparsed call\n");
+        ferr(po, "arg collect hit unparsed call '%s'\n",
+          ops[j].operand[0].name);
       if (may_reuse && pp_tmp->argc_stack > 0)
         ferr(po, "arg collect %d/%d hit '%s' with %d stack args\n",
           arg, pp->argc, opr_name(&ops[j], 0), pp_tmp->argc_stack);
@@ -2496,6 +2493,7 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
   }
 
   // pass2:
+  // - parse calls with labels
   // - resolve all branches
   for (i = 0; i < opcnt; i++)
   {
@@ -2503,8 +2501,25 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
     po->bt_i = -1;
     po->btj = NULL;
 
-    if ((po->flags & OPF_RMD) || !(po->flags & OPF_JMP)
-        || po->op == OP_CALL || po->op == OP_RET)
+    if (po->flags & OPF_RMD)
+      continue;
+
+    if (po->op == OP_CALL) {
+      if (po->operand[0].type == OPT_LABEL) {
+        tmpname = opr_name(po, 0);
+        pp_c = proto_parse(fhdr, tmpname);
+        if (pp_c == NULL)
+          ferr(po, "proto_parse failed for call '%s'\n", tmpname);
+        if (pp_c->is_fptr && pp_c->argc_reg != 0)
+          ferr(po, "fptr call with reg arg\n");
+        pp = proto_clone(pp_c);
+        my_assert_not(pp, NULL);
+        po->datap = pp;
+      }
+      continue;
+    }
+
+    if (!(po->flags & OPF_JMP) || po->op == OP_RET)
       continue;
 
     if (po->operand[0].type == OPT_REGMEM) {
@@ -2562,6 +2577,7 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
 tailcall:
     po->op = OP_CALL;
     po->flags |= OPF_TAIL;
+    i--; // reprocess
   }
 
   // pass3:
@@ -2574,11 +2590,13 @@ tailcall:
 
     if (po->op == OP_CALL)
     {
-      pp = calloc(1, sizeof(*pp));
-      my_assert_not(pp, NULL);
       tmpname = opr_name(po, 0);
-      if (po->operand[0].type != OPT_LABEL)
+      pp = po->datap;
+      if (pp == NULL)
       {
+        // indirect call
+        pp = calloc(1, sizeof(*pp));
+        my_assert_not(pp, NULL);
         ret = scan_for_esp_adjust(i + 1, opcnt, &j);
         if (ret < 0)
           ferr(po, "non-__cdecl indirect call unhandled yet\n");
@@ -2589,14 +2607,7 @@ tailcall:
         pp->argc = pp->argc_stack = j;
         for (arg = 0; arg < pp->argc; arg++)
           pp->arg[arg].type.name = strdup("int");
-      }
-      else {
-        pp_c = proto_parse(fhdr, tmpname);
-        if (pp_c == NULL)
-          ferr(po, "proto_parse failed for call '%s'\n", tmpname);
-        if (pp_c->is_fptr && pp_c->argc_reg != 0)
-          ferr(po, "fptr call with reg arg\n");
-        pp = proto_clone(pp_c);
+        po->datap = pp;
       }
 
       // look for and make use of esp adjust
@@ -2647,7 +2658,6 @@ tailcall:
         need_mul_var = 1;
       if (!(po->flags & OPF_TAIL) && !IS(pp->ret_type.name, "void"))
         have_func_ret = 1;
-      po->datap = pp;
     }
   }
 
@@ -2660,6 +2670,15 @@ tailcall:
     po = &ops[i];
     if (po->flags & OPF_RMD)
       continue;
+
+    if (po->op == OP_PUSH && (po->flags & OPF_RSAVE)) {
+      reg = po->operand[0].reg;
+      if (!(regmask & (1 << reg)))
+        // not a reg save after all, rerun scan_for_pop
+        po->flags &= ~OPF_RSAVE;
+      else
+        regmask_save |= 1 << reg;
+    }
 
     if (po->op == OP_PUSH
         && po->argnum == 0 && !(po->flags & OPF_RSAVE)
@@ -2675,8 +2694,6 @@ tailcall:
       if (ret == 1) {
         if (depth > 1)
           ferr(po, "too much depth: %d\n", depth);
-        if (depth > 0)
-          regmask_save |= 1 << reg;
 
         po->flags |= OPF_RMD;
         scan_for_pop(i + 1, opcnt, po->operand[0].name,

@@ -12,7 +12,7 @@ for sym in $usyms; do
 done
 
 echo "\
-s/^\([ ]\?loc[r_].*[0-9A-F]:\)[^:]\(.*\;\)/\1:\t\2/g;\
+s/^\([ +-]\?loc[r_].*[0-9A-F]:\)[^:]\(.*\;\)/\1:\t\2/g;\
 s/dd[[:blank:]]rva/dd/;\
 s/\<fldcw\>\t\[esp+4+var_4\]/fldcw\tword ptr \[esp\]/;\
 s/\<large \(.*fs:\)/\1/;\

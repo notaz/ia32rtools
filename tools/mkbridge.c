@@ -108,8 +108,10 @@ static void out_fromasm_x86(FILE *f, const char *sym,
 	const struct parsed_proto *pp)
 {
 	int sarg_ofs = 1; // stack offset to args, in DWORDs
+	int saved_regs = 0;
 	int argc_repush;
 	int stack_args;
+	int ret64;
 	int i;
 
 	argc_repush = pp->argc;
@@ -119,8 +121,12 @@ static void out_fromasm_x86(FILE *f, const char *sym,
 		stack_args = argc_repush - pp->argc_reg;
 	}
 
-	fprintf(f, "# %s\n", pp->is_stdcall ? "__stdcall" : "__cdecl");
-	fprintf(f, ".global %s\n", sym);
+	ret64 = strstr(pp->ret_type.name, "int64") != NULL;
+
+	fprintf(f, "# %s", pp->is_stdcall ? "__stdcall" : "__cdecl");
+	if (ret64)
+		 fprintf(f, " ret64");
+	fprintf(f, "\n.global %s\n", sym);
 	fprintf(f, "%s:\n", sym);
 
 	if (pp->argc_reg == 0) {
@@ -132,22 +138,30 @@ static void out_fromasm_x86(FILE *f, const char *sym,
 		return;
 	}
 
-	// scratch reg, must not be eax or edx (for ret edx:eax)
-	fprintf(f, "\tpushl %%ebx\n");
+	// at least sc sub_47B150 needs edx to be preserved
+	// int64 returns use edx:eax - no edx save
+	// we use ecx also as scratch
+	fprintf(f, "\tpushl %%ecx\n");
+	saved_regs++;
 	sarg_ofs++;
+	if (!ret64) {
+		fprintf(f, "\tpushl %%edx\n");
+		saved_regs++;
+		sarg_ofs++;
+	}
 
 	// construct arg stack
 	for (i = argc_repush - 1; i >= 0; i--) {
 		if (pp->arg[i].reg == NULL) {
-			fprintf(f, "\tmovl %d(%%esp), %%ebx\n",
+			fprintf(f, "\tmovl %d(%%esp), %%ecx\n",
 				(sarg_ofs + stack_args - 1) * 4);
-			fprintf(f, "\tpushl %%ebx\n");
+			fprintf(f, "\tpushl %%ecx\n");
 			stack_args--;
 		}
 		else {
-			if (IS(pp->arg[i].reg, "ebx"))
-				// must reload original ebx
-				fprintf(f, "\tmovl %d(%%esp), %%ebx\n",
+			if (IS(pp->arg[i].reg, "ecx"))
+				// must reload original ecx
+				fprintf(f, "\tmovl %d(%%esp), %%ecx\n",
 					(sarg_ofs - 2) * 4);
 
 			fprintf(f, "\tpushl %%%s\n", pp->arg[i].reg);
@@ -158,10 +172,13 @@ static void out_fromasm_x86(FILE *f, const char *sym,
 	// no worries about calling conventions - always __cdecl
 	fprintf(f, "\n\tcall _%s\n\n", sym);
 
-	if (sarg_ofs > 2)
-		fprintf(f, "\tadd $%d,%%esp\n", (sarg_ofs - 2) * 4);
+	if (sarg_ofs > saved_regs + 1)
+		fprintf(f, "\tadd $%d,%%esp\n",
+			(sarg_ofs - (saved_regs + 1)) * 4);
 
-	fprintf(f, "\tpopl %%ebx\n");
+	if (!ret64)
+		fprintf(f, "\tpopl %%edx\n");
+	fprintf(f, "\tpopl %%ecx\n");
 
 	if (pp->is_stdcall && pp->argc_stack)
 		fprintf(f, "\tret $%d\n\n", pp->argc_stack * 4);
