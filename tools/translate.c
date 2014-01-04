@@ -1224,7 +1224,7 @@ static void stack_frame_access(struct parsed_op *po,
   if (!strncmp(name, "ebp", 3))
     stack_ra = 4;
 
-  if (stack_ra <= offset && offset < stack_ra + 4)
+  if (ofs_reg[0] == 0 && stack_ra <= offset && offset < stack_ra + 4)
     ferr(po, "reference to ra? %d %d\n", offset, stack_ra);
 
   if (offset > stack_ra)
@@ -2005,7 +2005,7 @@ static int scan_for_flag_set(int i, int magic, int *branched,
       }
 
       if (i > 0 && LAST_OP(i - 1)) {
-        i = g_label_refs[i].i;
+        i = lr->i;
         continue;
       }
       ret = scan_for_flag_set(lr->i, magic,
@@ -3208,6 +3208,8 @@ tailcall:
           // avoid use of unitialized var
           fprintf(fout, "  %s = -cond_c;",
             out_dst_opr(buf1, sizeof(buf1), po, &po->operand[0]));
+          // carry remains what it was
+          pfomask &= ~(1 << PFO_C);
         }
         else {
           fprintf(fout, "  %s %s= %s + cond_c;",
@@ -3871,8 +3873,8 @@ int main(int argc, char *argv[])
           unsigned long addr = strtoul(p, NULL, 16);
           unsigned long f_addr = strtoul(g_func + 4, NULL, 16);
           if (addr > f_addr && !scanned_ahead) {
-            anote("scan_ahead caused by '%s', f_addr %lx\n",
-              g_func, f_addr);
+            anote("scan_ahead caused by '%s', addr %lx\n",
+              g_func, addr);
             scan_ahead(fasm);
             scanned_ahead = 1;
             func_chunks_sorted = 0;
