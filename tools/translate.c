@@ -197,6 +197,7 @@ static char g_func[256];
 static char g_comment[256];
 static int g_bp_frame;
 static int g_sp_frame;
+static int g_stack_frame_used;
 static int g_stack_fsz;
 static int g_ida_func_attr;
 #define ferr(op_, fmt, ...) do { \
@@ -1142,6 +1143,46 @@ static const char *opr_reg_p(struct parsed_op *po, struct parsed_opr *popr)
   return regs_r32[popr->reg];
 }
 
+// cast1 is the "final" cast
+static const char *simplify_cast(const char *cast1, const char *cast2)
+{
+  static char buf[256];
+
+  if (cast1[0] == 0)
+    return cast2;
+  if (cast2[0] == 0)
+    return cast1;
+  if (IS(cast1, cast2))
+    return cast1;
+  if (IS(cast1, "(s8)") && IS(cast2, "(u8)"))
+    return cast1;
+  if (IS(cast1, "(s16)") && IS(cast2, "(u16)"))
+    return cast1;
+  if (IS(cast1, "(u8)") && IS_START(cast2, "*(u8 *)"))
+    return cast2;
+  if (IS(cast1, "(u16)") && IS_START(cast2, "*(u16 *)"))
+    return cast2;
+
+  snprintf(buf, sizeof(buf), "%s%s", cast1, cast2);
+  return buf;
+}
+
+static const char *simplify_cast_num(const char *cast, unsigned int val)
+{
+  if (IS(cast, "(u8)") && val < 0x100)
+    return "";
+  if (IS(cast, "(s8)") && val < 0x80)
+    return "";
+  if (IS(cast, "(u16)") && val < 0x10000)
+    return "";
+  if (IS(cast, "(s16)") && val < 0x8000)
+    return "";
+  if (IS(cast, "(s32)") && val < 0x80000000)
+    return "";
+
+  return cast;
+}
+
 static struct parsed_equ *equ_find(struct parsed_op *po, const char *name,
   int *extra_offs)
 {
@@ -1265,9 +1306,11 @@ static void stack_frame_access(struct parsed_op *po,
       if (is_lea)
         ferr(po, "lea/byte to arg?\n");
       if (is_src && (offset & 3) == 0)
-        snprintf(buf, buf_size, "(u8)a%d", i + 1);
+        snprintf(buf, buf_size, "%sa%d",
+          simplify_cast(cast, "(u8)"), i + 1);
       else
-        snprintf(buf, buf_size, "BYTE%d(a%d)", offset & 3, i + 1);
+        snprintf(buf, buf_size, "%sBYTE%d(a%d)",
+          cast, offset & 3, i + 1);
       break;
 
     case OPLM_WORD:
@@ -1278,16 +1321,18 @@ static void stack_frame_access(struct parsed_op *po,
         if (!is_src) {
           if (offset & 2)
             ferr(po, "problematic arg store\n");
-          snprintf(buf, buf_size, "*(u16 *)((char *)&a%d + 1)", i + 1);
+          snprintf(buf, buf_size, "%s((char *)&a%d + 1)",
+            simplify_cast(cast, "*(u16 *)"), i + 1);
         }
         else
           ferr(po, "unaligned arg word load\n");
       }
       else if (is_src && (offset & 2) == 0)
-        snprintf(buf, buf_size, "(u16)a%d", i + 1);
+        snprintf(buf, buf_size, "%sa%d",
+          simplify_cast(cast, "(u16)"), i + 1);
       else
-        snprintf(buf, buf_size, "%sWORD(a%d)",
-          (offset & 2) ? "HI" : "LO", i + 1);
+        snprintf(buf, buf_size, "%s%sWORD(a%d)",
+          cast, (offset & 2) ? "HI" : "LO", i + 1);
       break;
 
     case OPLM_DWORD:
@@ -1324,14 +1369,18 @@ static void stack_frame_access(struct parsed_op *po,
 
     // common problem
     guess_lmod_from_c_type(&tmp_lmod, &g_func_pp->arg[i].type);
-    if (unaligned && tmp_lmod != OPLM_DWORD)
-      ferr(po, "bp_arg arg/w offset %d and type '%s'\n",
-        offset, g_func_pp->arg[i].type.name);
+    if (tmp_lmod != OPLM_DWORD
+      && (unaligned || (!is_src && tmp_lmod < popr->lmod)))
+    {
+      ferr(po, "bp_arg arg%d/w offset %d and type '%s' is too small\n",
+        i + 1, offset, g_func_pp->arg[i].type.name);
+    }
   }
   else
   {
     if (g_stack_fsz == 0)
       ferr(po, "stack var access without stackframe\n");
+    g_stack_frame_used = 1;
 
     sf_ofs = g_stack_fsz + offset;
     lim = (ofs_reg[0] != 0) ? -4 : 0;
@@ -1401,6 +1450,7 @@ static char *out_src_opr(char *buf, size_t buf_size,
 {
   char tmp1[256], tmp2[256];
   char expr[256];
+  char *p;
   int ret;
 
   if (cast == NULL)
@@ -1416,13 +1466,16 @@ static char *out_src_opr(char *buf, size_t buf_size,
       snprintf(buf, buf_size, "%s%s", cast, opr_reg_p(po, popr));
       break;
     case OPLM_WORD:
-      snprintf(buf, buf_size, "(u16)%s", opr_reg_p(po, popr));
+      snprintf(buf, buf_size, "%s%s",
+        simplify_cast(cast, "(u16)"), opr_reg_p(po, popr));
       break;
     case OPLM_BYTE:
       if (popr->name[1] == 'h') // XXX..
-        snprintf(buf, buf_size, "(u8)(%s >> 8)", opr_reg_p(po, popr));
+        snprintf(buf, buf_size, "%s(%s >> 8)",
+          simplify_cast(cast, "(u8)"), opr_reg_p(po, popr));
       else
-        snprintf(buf, buf_size, "(u8)%s", opr_reg_p(po, popr));
+        snprintf(buf, buf_size, "%s%s",
+          simplify_cast(cast, "(u8)"), opr_reg_p(po, popr));
       break;
     default:
       ferr(po, "invalid src lmod: %d\n", popr->lmod);
@@ -1445,6 +1498,14 @@ static char *out_src_opr(char *buf, size_t buf_size,
       ret = sscanf(expr, "%[^[][%[^]]]", tmp1, tmp2);
       if (ret != 2)
         ferr(po, "parse failure for '%s'\n", expr);
+      if (tmp1[0] == '(') {
+        // (off_4FFF50+3)[eax]
+        p = strchr(tmp1 + 1, ')');
+        if (p == NULL || p[1] != 0)
+          ferr(po, "parse failure (2) for '%s'\n", expr);
+        *p = 0;
+        memmove(tmp1, tmp1 + 1, strlen(tmp1));
+      }
       snprintf(expr, sizeof(expr), "(u32)&%s + %s", tmp1, tmp2);
     }
 
@@ -1454,9 +1515,8 @@ static char *out_src_opr(char *buf, size_t buf_size,
       break;
     }
 
-    if (cast[0] == 0)
-      cast = lmod_cast_u_ptr(po, popr->lmod);
-    snprintf(buf, buf_size, "%s(%s)", cast, expr);
+    snprintf(buf, buf_size, "%s(%s)",
+      simplify_cast(cast, lmod_cast_u_ptr(po, popr->lmod)), expr);
     break;
 
   case OPT_LABEL:
@@ -1489,9 +1549,9 @@ static char *out_src_opr(char *buf, size_t buf_size,
     if (is_lea)
       ferr(po, "lea from const?\n");
 
-    snprintf(buf, buf_size, "%s", cast);
-    ret = strlen(buf);
-    printf_number(buf + ret, buf_size - ret, popr->val);
+    printf_number(tmp1, sizeof(tmp1), popr->val);
+    snprintf(buf, buf_size, "%s%s",
+      simplify_cast_num(cast, popr->val), tmp1);
     break;
 
   default:
@@ -1653,50 +1713,85 @@ static void out_test_for_cc(char *buf, size_t buf_size,
 }
 
 static void out_cmp_for_cc(char *buf, size_t buf_size,
-  struct parsed_op *po, enum parsed_flag_op pfo, int is_inv,
-  enum opr_lenmod lmod, const char *expr1, const char *expr2)
+  struct parsed_op *po, enum parsed_flag_op pfo, int is_inv)
 {
-  const char *cast, *scast;
+  const char *cast, *scast, *cast_use;
+  char buf1[256], buf2[256];
+  enum opr_lenmod lmod;
+
+  if (po->operand[0].lmod != po->operand[1].lmod)
+    ferr(po, "%s: lmod mismatch: %d %d\n", __func__,
+      po->operand[0].lmod, po->operand[1].lmod);
+  lmod = po->operand[0].lmod;
 
   cast = lmod_cast_u(po, lmod);
   scast = lmod_cast_s(po, lmod);
 
   switch (pfo) {
   case PFO_C:
+  case PFO_Z:
+  case PFO_BE: // !a
+    cast_use = cast;
+    break;
+
+  case PFO_S:
+  case PFO_L: // !ge
+  case PFO_LE:
+    cast_use = scast;
+    break;
+
+  default:
+    ferr(po, "%s: unhandled parsed_flag_op: %d\n", __func__, pfo);
+  }
+
+  out_src_opr(buf1, sizeof(buf1), po, &po->operand[0], cast_use, 0);
+  out_src_opr(buf2, sizeof(buf2), po, &po->operand[1], cast_use, 0);
+
+  switch (pfo) {
+  case PFO_C:
     // note: must be unsigned compare
-    snprintf(buf, buf_size, "(%s%s %s %s%s)",
-      cast, expr1, is_inv ? ">=" : "<", cast, expr2);
+    snprintf(buf, buf_size, "(%s %s %s)",
+      buf1, is_inv ? ">=" : "<", buf2);
     break;
 
   case PFO_Z:
-    snprintf(buf, buf_size, "(%s%s %s %s%s)",
-      cast, expr1, is_inv ? "!=" : "==", cast, expr2);
+    snprintf(buf, buf_size, "(%s %s %s)",
+      buf1, is_inv ? "!=" : "==", buf2);
     break;
 
   case PFO_BE: // !a
     // note: must be unsigned compare
-    snprintf(buf, buf_size, "(%s%s %s %s%s)",
-      cast, expr1, is_inv ? ">" : "<=", cast, expr2);
+    snprintf(buf, buf_size, "(%s %s %s)",
+      buf1, is_inv ? ">" : "<=", buf2);
+
+    // annoying case
+    if (is_inv && lmod == OPLM_BYTE
+      && po->operand[1].type == OPT_CONST
+      && po->operand[1].val == 0xff)
+    {
+      snprintf(g_comment, sizeof(g_comment), "if %s", buf);
+      snprintf(buf, buf_size, "(0)");
+    }
     break;
 
   // note: must be signed compare
   case PFO_S:
     snprintf(buf, buf_size, "(%s(%s - %s) %s 0)",
-      scast, expr1, expr2, is_inv ? ">=" : "<");
+      scast, buf1, buf2, is_inv ? ">=" : "<");
     break;
 
   case PFO_L: // !ge
-    snprintf(buf, buf_size, "(%s%s %s %s%s)",
-      scast, expr1, is_inv ? ">=" : "<", scast, expr2);
+    snprintf(buf, buf_size, "(%s %s %s)",
+      buf1, is_inv ? ">=" : "<", buf2);
     break;
 
   case PFO_LE:
-    snprintf(buf, buf_size, "(%s%s %s %s%s)",
-      scast, expr1, is_inv ? ">" : "<=", scast, expr2);
+    snprintf(buf, buf_size, "(%s %s %s)",
+      buf1, is_inv ? ">" : "<=", buf2);
     break;
 
   default:
-    ferr(po, "%s: unhandled parsed_flag_op: %d\n", __func__, pfo);
+    break;
   }
 }
 
@@ -1718,10 +1813,7 @@ static void out_cmp_test(char *buf, size_t buf_size,
       po->operand[0].lmod, buf3);
   }
   else if (po->op == OP_CMP) {
-    out_src_opr_u32(buf2, sizeof(buf2), po, &po->operand[0]);
-    out_src_opr_u32(buf3, sizeof(buf3), po, &po->operand[1]);
-    out_cmp_for_cc(buf, buf_size, po, pfo, is_inv,
-      po->operand[0].lmod, buf2, buf3);
+    out_cmp_for_cc(buf, buf_size, po, pfo, is_inv);
   }
   else
     ferr(po, "%s: unhandled op: %d\n", __func__, po->op);
@@ -2088,10 +2180,14 @@ static int scan_for_reg_clear(int i, int reg)
 static int scan_for_esp_adjust(int i, int opcnt, int *adj)
 {
   struct parsed_op *po;
+  int i_first = i;
   *adj = 0;
 
   for (; i < opcnt; i++) {
     po = &ops[i];
+
+    if (g_labels[i][0] != 0)
+      break;
 
     if (po->op == OP_ADD && po->operand[0].reg == xSP) {
       if (po->operand[1].type != OPT_CONST)
@@ -2107,14 +2203,19 @@ static int scan_for_esp_adjust(int i, int opcnt, int *adj)
       *adj += lmod_bytes(po, po->operand[0].lmod);
     else if (po->flags & (OPF_JMP|OPF_TAIL)) {
       if (po->op != OP_CALL)
-        return -1;
+        break;
       if (po->operand[0].type != OPT_LABEL)
-        return -1;
+        break;
       // TODO: should only allow combining __cdecl calls..
     }
+  }
 
-    if (g_labels[i][0] != 0)
-      return -1;
+  if (*adj == 4 && ops[i_first].op == OP_POP
+    && ops[i_first].operand[0].type == OPT_REG
+    && ops[i_first].operand[0].reg == xCX)
+  {
+    // probably 'pop ecx' was used..
+    return i_first;
   }
 
   return -1;
@@ -2163,7 +2264,7 @@ static int collect_call_args(struct parsed_op *po, int i,
   int j;
 
   if (i < 0) {
-    ferr(po, "no refs for '%s'?\n", g_labels[i]);
+    ferr(po, "dead label encountered\n");
     return -1;
   }
 
@@ -2185,7 +2286,7 @@ static int collect_call_args(struct parsed_op *po, int i,
     }
     ops[j].cc_scratch = magic;
 
-    if (g_labels[j][0] != 0) {
+    if (g_labels[j][0] != 0 && g_label_refs[j].i != -1) {
       lr = &g_label_refs[j];
       if (lr->next != NULL)
         need_op_saving = 1;
@@ -2322,6 +2423,7 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
   int cmp_result_vars = 0;
   int need_mul_var = 0;
   int have_func_ret = 0;
+  int have_normal_ret = 0;
   int had_decl = 0;
   int label_pending = 0;
   int regmask_save = 0;
@@ -2339,6 +2441,7 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
   int ret;
 
   g_bp_frame = g_sp_frame = g_stack_fsz = 0;
+  g_stack_frame_used = 0;
 
   g_func_pp = proto_parse(fhdr, funcn);
   if (g_func_pp == NULL)
@@ -2581,9 +2684,13 @@ tailcall:
   }
 
   // pass3:
+  // - remove dead labels
   // - process calls
   for (i = 0; i < opcnt; i++)
   {
+    if (g_labels[i][0] != 0 && g_label_refs[i].i == -1)
+      g_labels[i][0] = 0;
+
     po = &ops[i];
     if (po->flags & OPF_RMD)
       continue;
@@ -2789,6 +2896,8 @@ tailcall:
       }
       fprintf(fout, ");\n");
     }
+    else if (po->op == OP_RET)
+      have_normal_ret = 1;
   }
 
   // output LUTs/jumptables
@@ -2841,7 +2950,8 @@ tailcall:
   }
 
   // declare other regs - special case for eax
-  if (!((regmask | regmask_arg) & 1) && have_func_ret
+  if (!((regmask | regmask_arg) & 1)
+   && (have_func_ret || have_normal_ret)
    && !IS(g_func_pp->ret_type.name, "void"))
   {
     fprintf(fout, "  u32 eax = 0;\n");
@@ -2903,7 +3013,7 @@ tailcall:
   // output ops
   for (i = 0; i < opcnt; i++)
   {
-    if (g_labels[i][0] != 0 && g_label_refs[i].i != -1) {
+    if (g_labels[i][0] != 0) {
       fprintf(fout, "\n%s:\n", g_labels[i]);
       label_pending = 1;
 
@@ -3018,10 +3128,10 @@ tailcall:
         default:
           ferr(po, "invalid src lmod: %d\n", po->operand[1].lmod);
         }
-        fprintf(fout, "  %s = %s%s;",
+        fprintf(fout, "  %s = %s;",
             out_dst_opr(buf1, sizeof(buf1), po, &po->operand[0]),
-            buf3,
-            out_src_opr_u32(buf2, sizeof(buf2), po, &po->operand[1]));
+            out_src_opr(buf2, sizeof(buf2), po, &po->operand[1],
+              buf3, 0));
         break;
 
       case OP_NOT:
@@ -3202,21 +3312,20 @@ tailcall:
       case OP_SBB:
         assert_operand_cnt(2);
         propagate_lmod(po, &po->operand[0], &po->operand[1]);
+        out_dst_opr(buf1, sizeof(buf1), po, &po->operand[0]);
         if (po->op == OP_SBB
           && IS(po->operand[0].name, po->operand[1].name))
         {
           // avoid use of unitialized var
-          fprintf(fout, "  %s = -cond_c;",
-            out_dst_opr(buf1, sizeof(buf1), po, &po->operand[0]));
+          fprintf(fout, "  %s = -cond_c;", buf1);
           // carry remains what it was
           pfomask &= ~(1 << PFO_C);
         }
         else {
-          fprintf(fout, "  %s %s= %s + cond_c;",
-            out_dst_opr(buf1, sizeof(buf1), po, &po->operand[0]),
-            op_to_c(po),
+          fprintf(fout, "  %s %s= %s + cond_c;", buf1, op_to_c(po),
             out_src_opr_u32(buf2, sizeof(buf2), po, &po->operand[1]));
         }
+        output_std_flags(fout, po, &pfomask, buf1);
         last_arith_dst = &po->operand[0];
         delayed_flag_op = NULL;
         break;
@@ -3232,6 +3341,7 @@ tailcall:
           strcpy(buf2, po->op == OP_INC ? "+" : "-");
           fprintf(fout, "  %s %s= 1;", buf1, buf2);
         }
+        output_std_flags(fout, po, &pfomask, buf1);
         last_arith_dst = &po->operand[0];
         delayed_flag_op = NULL;
         break;
@@ -3425,6 +3535,8 @@ tailcall:
           // else already handled as 'return f()'
 
           if (ret) {
+            if (!IS(g_func_pp->ret_type.name, "void"))
+              ferr(po, "int func -> void func tailcall?\n");
             fprintf(fout, "\n  return;");
             strcpy(g_comment, "^ tailcall");
           }
@@ -3520,6 +3632,9 @@ tailcall:
 
     label_pending = 0;
   }
+
+  if (g_stack_fsz && !g_stack_frame_used)
+    fprintf(fout, "  (void)sf;\n");
 
   fprintf(fout, "}\n\n");
 
@@ -3691,7 +3806,7 @@ int main(int argc, char *argv[])
   int func_chunk_ret_ln = 0;
   int scanned_ahead = 0;
   char line[256];
-  char words[16][256];
+  char words[20][256];
   enum opr_lenmod lmod;
   int in_func = 0;
   int pending_endp = 0;
@@ -3737,6 +3852,8 @@ int main(int argc, char *argv[])
   func_chunk_alloc = 32;
   func_chunks = malloc(func_chunk_alloc * sizeof(func_chunks[0]));
   my_assert_not(func_chunks, NULL);
+
+  memset(words, 0, sizeof(words));
 
   for (; arg < argc; arg++) {
     frlist = fopen(argv[arg], "r");
@@ -3885,7 +4002,8 @@ int main(int argc, char *argv[])
     } // *p == ';'
 
 parse_words:
-    memset(words, 0, sizeof(words));
+    for (i = wordc; i < ARRAY_SIZE(words); i++)
+      words[i][0] = 0;
     for (wordc = 0; wordc < ARRAY_SIZE(words); wordc++) {
       p = sskip(next_word_s(words[wordc], sizeof(words[0]), p));
       if (*p == 0 || *p == ';') {
@@ -3893,6 +4011,8 @@ parse_words:
         break;
       }
     }
+    if (*p != 0 && *p != ';')
+      aerr("too many words\n");
 
     // alow asm patches in comments
     if (*p == ';' && IS_START(p, "; sctpatch:")) {
@@ -4054,6 +4174,9 @@ do_pending_endp:
       pending_endp = 1;
       continue;
     }
+
+    if (wordc == 2 && IS(words[1], "ends"))
+      break;
 
     p = strchr(words[0], ':');
     if (p != NULL) {

@@ -143,9 +143,11 @@ static const char *known_ptr_types[] = {
 	"HKEY",
 	"HMENU",
 	"HWND",
+	"PCRITICAL_SECTION",
 	"PDWORD",
 	"PHKEY",
 	"PLONG",
+	"PMEMORY_BASIC_INFORMATION",
 	"PVOID",
 	"PCVOID",
 	"DLGPROC",
@@ -236,6 +238,9 @@ static int check_type(const char *name, struct parsed_type *type)
 
 	ret = n1 - name;
 	type->name = strndup(name, ret);
+	if (IS(type->name, "VOID"))
+		memcpy(type->name, "void", 4);
+
 	return ret;
 }
 
