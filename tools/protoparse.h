@@ -137,6 +137,7 @@ static const char *known_ptr_types[] = {
 	"HGDIOBJ",
 	"HGLOBAL",
 	"HINSTANCE",
+	"HIMC",
 	"HMODULE",
 	"HRGN",
 	"HRSRC",
