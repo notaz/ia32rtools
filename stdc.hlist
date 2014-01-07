@@ -5,7 +5,7 @@ void* __cdecl 	malloc	(size_t);
 void* __cdecl 	realloc	(void*, size_t);
 void __cdecl 	free	(void*);
 void __cdecl 	abort	(void);
-void __cdecl 	exit	(int);
+DECLSPEC_NORETURN void __cdecl 	exit	(int);
 int __cdecl 	atexit	(void (__cdecl *)(void));
 int __cdecl 	system	(const char*);
 char* __cdecl 	getenv	(const char*);
@@ -184,6 +184,9 @@ int __cdecl _mbsncmp (const unsigned char*, const unsigned char*, size_t);
 int __cdecl _mbsnicmp (const unsigned char*, const unsigned char*, size_t);
 int __cdecl _mbsnbcmp (const unsigned char*, const unsigned char*, size_t);
 int __cdecl _mbsnbicmp (const unsigned char*, const unsigned char*, size_t);
+
+void * __cdecl signal (int, void *);
+int __cdecl raise (int);
 
 void* __cdecl  	memcpy_0 (void*, const void*, size_t);
 

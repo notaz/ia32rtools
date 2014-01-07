@@ -149,6 +149,7 @@ static const char *known_ptr_types[] = {
 	"PHKEY",
 	"PLONG",
 	"PMEMORY_BASIC_INFORMATION",
+	"PUINT",
 	"PVOID",
 	"PCVOID",
 	"DLGPROC",

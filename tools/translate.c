@@ -1403,6 +1403,8 @@ static void stack_frame_access(struct parsed_op *po,
       ferr(po, "bp_arg arg%d/w offset %d and type '%s' is too small\n",
         i + 1, offset, g_func_pp->arg[i].type.name);
     }
+    if (popr->is_ptr && popr->lmod != OPLM_DWORD)
+      ferr(po, "bp_arg arg%d: non-dword ptr access\n", i + 1);
   }
   else
   {
@@ -2202,7 +2204,7 @@ static int scan_for_reg_clear(int i, int reg)
 static int scan_for_esp_adjust(int i, int opcnt, int *adj)
 {
   struct parsed_op *po;
-  int i_first = i;
+  int first_pop = -1;
   *adj = 0;
 
   for (; i < opcnt; i++) {
@@ -2219,10 +2221,16 @@ static int scan_for_esp_adjust(int i, int opcnt, int *adj)
         ferr(&ops[i], "unaligned esp adjust: %x\n", *adj);
       return i;
     }
-    else if (po->op == OP_PUSH)
+    else if (po->op == OP_PUSH) {
+      if (first_pop == -1)
+        first_pop = -2; // none
       *adj -= lmod_bytes(po, po->operand[0].lmod);
-    else if (po->op == OP_POP)
+    }
+    else if (po->op == OP_POP) {
+      if (first_pop == -1)
+        first_pop = i;
       *adj += lmod_bytes(po, po->operand[0].lmod);
+    }
     else if (po->flags & (OPF_JMP|OPF_TAIL)) {
       if (po->op != OP_CALL)
         break;
@@ -2232,12 +2240,12 @@ static int scan_for_esp_adjust(int i, int opcnt, int *adj)
     }
   }
 
-  if (*adj == 4 && ops[i_first].op == OP_POP
-    && ops[i_first].operand[0].type == OPT_REG
-    && ops[i_first].operand[0].reg == xCX)
+  if (*adj == 4 && first_pop >= 0 && ops[first_pop].op == OP_POP
+    && ops[first_pop].operand[0].type == OPT_REG
+    && ops[first_pop].operand[0].reg == xCX)
   {
     // probably 'pop ecx' was used..
-    return i_first;
+    return first_pop;
   }
 
   return -1;
@@ -2308,9 +2316,9 @@ static const struct parsed_proto *try_recover_pp(
 
     pp = g_func_pp->arg[arg].fptr;
     if (pp == NULL)
-      ferr(po, "icall: arg%d is not a fptr?\n", arg + 1);
+      ferr(po, "icall sa: arg%d is not a fptr?\n", arg + 1);
     if (pp->argc_reg != 0)
-      ferr(po, "icall: reg arg in arg-call unhandled yet\n");
+      ferr(po, "icall sa: reg arg in arg-call unhandled yet\n");
   }
   else if (opr->type == OPT_OFFSET || opr->type == OPT_LABEL) {
     pp = proto_parse(g_fhdr, opr->name);
@@ -2339,12 +2347,8 @@ static void scan_for_call_type(int i, struct parsed_opr *opr,
       lr = &g_label_refs[i];
       for (; lr != NULL; lr = lr->next)
         scan_for_call_type(lr->i, opr, magic, pp_found);
-      if (i > 0) {
-        if (LAST_OP(i - 1))
-          return;
-        scan_for_call_type(i - 1, opr, magic, pp_found);
-      }
-      return;
+      if (i > 0 && LAST_OP(i - 1))
+        return;
     }
     i--;
 
@@ -2380,7 +2384,8 @@ static void scan_for_call_type(int i, struct parsed_opr *opr,
       return;
     pp = g_func_pp->arg[i].fptr;
     if (pp == NULL)
-      ferr(po, "icall: arg%d is not a fptr?\n", i + 1);
+      ferr(po, "icall: arg%d (%s) is not a fptr?\n",
+        i + 1, g_func_pp->arg[i].reg);
     if (pp->argc_reg != 0)
       ferr(po, "icall: reg arg in arg-call unhandled yet\n");
   }
@@ -2776,6 +2781,8 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
     if (po->op == OP_CALL) {
       if (po->operand[0].type == OPT_LABEL) {
         tmpname = opr_name(po, 0);
+        if (IS_START(tmpname, "loc_"))
+          ferr(po, "call to loc_*\n");
         pp_c = proto_parse(fhdr, tmpname);
         if (pp_c == NULL)
           ferr(po, "proto_parse failed for call '%s'\n", tmpname);
