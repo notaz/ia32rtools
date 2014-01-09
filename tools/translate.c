@@ -26,6 +26,8 @@ static FILE *g_fhdr;
 	exit(1); \
 } while (0)
 
+#include "masm_tools.h"
+
 enum op_flags {
   OPF_RMD    = (1 << 0), /* removed or optimized out */
   OPF_DATA   = (1 << 1), /* data processing - writes to dst opr */
@@ -279,36 +281,6 @@ static int parse_reg(enum opr_lenmod *reg_lmod, const char *s)
   }
 
   return -1;
-}
-
-static unsigned long parse_number(const char *number)
-{
-  int len = strlen(number);
-  const char *p = number;
-  char *endp = NULL;
-  unsigned long ret;
-  int neg = 0;
-  int bad;
-
-  if (*p == '-') {
-    neg = 1;
-    p++;
-  }
-  if (len > 1 && *p == '0')
-    p++;
-  if (number[len - 1] == 'h') {
-    ret = strtoul(p, &endp, 16);
-    bad = (*endp != 'h');
-  }
-  else {
-    ret = strtoul(p, &endp, 10);
-    bad = (*endp != 0);
-  }
-  if (bad)
-    aerr("number parsing failed\n");
-  if (neg)
-    ret = -ret;
-  return ret;
 }
 
 static int parse_indmode(char *name, int *regmask, int need_c_cvt)
