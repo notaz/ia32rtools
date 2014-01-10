@@ -14,8 +14,8 @@
 
 static const char *asmfn;
 static int asmln;
-static FILE *g_fhdr;
 
+// note: must be in ascending order
 enum dx_type {
   DXT_UNSPEC,
   DXT_BYTE,
@@ -25,6 +25,8 @@ enum dx_type {
   DXT_TEN,
 };
 
+#define anote(fmt, ...) \
+	printf("%s:%d: note: " fmt, asmfn, asmln, ##__VA_ARGS__)
 #define aerr(fmt, ...) do { \
 	printf("%s:%d: error: " fmt, asmfn, asmln, ##__VA_ARGS__); \
   fcloseall(); \
@@ -136,6 +138,21 @@ static const char *type_name(enum dx_type type)
   return "<bad>";
 }
 
+static const char *type_name_float(enum dx_type type)
+{
+  switch (type) {
+  case DXT_DWORD:
+    return ".float";
+  case DXT_QUAD:
+    return ".double";
+  case DXT_TEN:
+    return ".tfloat";
+  default:
+    break;
+  }
+  return "<bad_float>";
+}
+
 static int type_size(enum dx_type type)
 {
   switch (type) {
@@ -177,11 +194,61 @@ static char *escape_string(char *s)
   return strcpy(s, buf);
 }
 
+static void check_sym(FILE *fhdr, const char *name)
+{
+  const struct parsed_proto *pp;
+  char buf[256];
+  int i, l;
+
+  pp = proto_parse(fhdr, name, 1);
+  if (pp == NULL) {
+    if (IS_START(name, "sub_"))
+      aerr("sub_ sym missing proto: '%s'\n", name);
+    return;
+  }
+
+  if (!pp->is_func && !pp->is_fptr)
+    return;
+  if (pp->argc_reg == 0)
+    return;
+  if (pp->argc_reg == 1 && pp->argc_stack == 0
+    && IS(pp->arg[0].reg, "ecx"))
+  {
+    return;
+  }
+  if (pp->argc_reg == 2
+    && IS(pp->arg[0].reg, "ecx")
+    && IS(pp->arg[1].reg, "edx"))
+  {
+    return;
+  }
+  snprintf(buf, sizeof(buf), "%s %s(",
+    pp->ret_type.name, name);
+  l = strlen(buf);
+
+  for (i = 0; i < pp->argc_reg; i++) {
+    snprintf(buf + l, sizeof(buf) - l, "%s%s",
+      i == 0 ? "" : ", ", pp->arg[i].reg);
+    l = strlen(buf);
+  }
+  if (pp->argc_stack > 0) {
+    snprintf(buf + l, sizeof(buf) - l, ", {%d stack}", pp->argc_stack);
+    l = strlen(buf);
+  }
+  snprintf(buf + l, sizeof(buf) - l, ")");
+    
+  aerr("unhandled reg call: %s\n", buf);
+}
+
+static int cmpstringp(const void *p1, const void *p2)
+{
+  return strcmp(*(char * const *)p1, *(char * const *)p2);
+}
+
 int main(int argc, char *argv[])
 {
-  FILE *fout, *fasm;
+  FILE *fout, *fasm, *fhdr, *frlist;
   char words[20][256];
-  //int sep_after[20];
   char word[256];
   char line[256];
   char comment[256];
@@ -189,18 +256,25 @@ int main(int argc, char *argv[])
   unsigned long cnt;
   const char *sym;
   enum dx_type type;
+  char **pub_syms;
+  int pub_sym_cnt = 0;
+  int pub_sym_alloc;
+  char **rlist;
+  int rlist_cnt = 0;
+  int rlist_alloc;
   int is_label;
+  int is_bss;
   int wordc;
   int first;
   int arg_out;
   int arg = 1;
   int len;
-  int w;
+  int w, i;
   char *p;
   char *p2;
 
-  if (argc != 4) {
-    printf("usage:\n%s <.s> <.asm> <hdrf>\n",
+  if (argc < 4) {
+    printf("usage:\n%s <.s> <.asm> <hdrf> [rlist]*\n",
       argv[0]);
     return 1;
   }
@@ -212,16 +286,54 @@ int main(int argc, char *argv[])
   my_assert_not(fasm, NULL);
 
   hdrfn = argv[arg++];
-  g_fhdr = fopen(hdrfn, "r");
-  my_assert_not(g_fhdr, NULL);
+  fhdr = fopen(hdrfn, "r");
+  my_assert_not(fhdr, NULL);
 
   fout = fopen(argv[arg_out], "w");
   my_assert_not(fout, NULL);
 
   comment[0] = 0;
 
-  while (!feof(fasm)) {
+  pub_sym_alloc = 64;
+  pub_syms = malloc(pub_sym_alloc * sizeof(pub_syms[0]));
+  my_assert_not(pub_syms, NULL);
+
+  rlist_alloc = 64;
+  rlist = malloc(rlist_alloc * sizeof(rlist[0]));
+  my_assert_not(rlist, NULL);
+
+  for (; arg < argc; arg++) {
+    frlist = fopen(argv[arg], "r");
+    my_assert_not(frlist, NULL);
+
+    while (fgets(line, sizeof(line), frlist)) {
+      p = sskip(line);
+      if (*p == 0 || *p == ';')
+        continue;
+
+      p = next_word(words[0], sizeof(words[0]), p);
+      if (words[0][0] == 0)
+        continue;
+
+      if (rlist_cnt >= rlist_alloc) {
+        rlist_alloc = rlist_alloc * 2 + 64;
+        rlist = realloc(rlist, rlist_alloc * sizeof(rlist[0]));
+        my_assert_not(rlist, NULL);
+      }
+      rlist[rlist_cnt++] = strdup(words[0]);
+    }
+
+    fclose(frlist);
+    frlist = NULL;
+  }
+
+  if (rlist_cnt > 0)
+    qsort(rlist, rlist_cnt, sizeof(rlist[0]), cmpstringp);
+
+  while (1) {
     next_section(fasm, line);
+    if (feof(fasm))
+      break;
     if (IS(line + 1, "text"))
       continue;
 
@@ -244,19 +356,19 @@ int main(int argc, char *argv[])
         continue;
 
       for (wordc = 0; wordc < ARRAY_SIZE(words); wordc++) {
-        //sep_after[wordc] = 0;
         p = sskip(next_word_s(words[wordc], sizeof(words[0]), p));
         if (*p == 0 || *p == ';') {
           wordc++;
           break;
         }
         if (*p == ',') {
-          //sep_after[wordc] = 1;
           p = sskip(p + 1);
         }
       }
 
       if (wordc == 2 && IS(words[1], "ends"))
+        break;
+      if (wordc <= 2 && IS(words[0], "end"))
         break;
       if (wordc < 2)
         aerr("unhandled: '%s'\n", words[0]);
@@ -282,6 +394,14 @@ int main(int argc, char *argv[])
         aerr("unhandled decl: '%s %s'\n", words[0], words[1]);
 
       if (sym != NULL) {
+        // public/global name
+        if (pub_sym_cnt >= pub_sym_alloc) {
+          pub_sym_alloc *= 2;
+          pub_syms = realloc(pub_syms, pub_sym_alloc * sizeof(pub_syms[0]));
+          my_assert_not(pub_syms, NULL);
+        }
+        pub_syms[pub_sym_cnt++] = strdup(sym);
+
         len = strlen(sym);
         fprintf(fout, "_%s:", sym);
 
@@ -338,7 +458,10 @@ int main(int argc, char *argv[])
             aerr("bad dup?\n");
           memmove(word, p, p2 - p);
           word[p2 - p] = 0;
-          val = parse_number(word);
+
+          val = 0;
+          if (!IS(word, "?"))
+            val = parse_number(word);
 
           fprintf(fout, ".fill 0x%02lx,%d,0x%02lx",
             cnt, type_size(type), val);
@@ -359,14 +482,12 @@ int main(int argc, char *argv[])
         goto fin;
       }
 
-      if ((type == DXT_QUAD || type == DXT_TEN)
-          && strchr(words[w], '.'))
+      if (type >= DXT_DWORD && strchr(words[w], '.'))
       {
         if (w != wordc - 1)
           aerr("TODO\n");
 
-        fprintf(fout, type == DXT_TEN ? ".tfloat " : ".double ");
-        fprintf(fout, "%s", words[w]);
+        fprintf(fout, "%s %s", type_name_float(type), words[w]);
         goto fin;
       }
 
@@ -377,10 +498,13 @@ int main(int argc, char *argv[])
         if (!first)
           fprintf(fout, ", ");
 
-        is_label = 0;
-        if (w >= wordc - 2 && IS(words[w], "offset")) {
+        is_label = is_bss = 0;
+        if (w <= wordc - 2 && IS(words[w], "offset")) {
           is_label = 1;
           w++;
+        }
+        else if (IS(words[w], "?")) {
+          is_bss = 1;
         }
         else if (type == DXT_DWORD
                  && !('0' <= words[w][0] && words[w][0] <= '9'))
@@ -389,15 +513,22 @@ int main(int argc, char *argv[])
           is_label = 1;
         }
 
-        if (is_label) {
+        if (is_bss) {
+          fprintf(fout, "0");
+        }
+        else if (is_label) {
           p = words[w];
-          if (IS_START(p, "loc_") || strchr(p, '?') || strchr(p, '@'))
+          if (IS_START(p, "loc_") || strchr(p, '?') || strchr(p, '@')
+             || bsearch(&p, rlist, rlist_cnt, sizeof(rlist[0]),
+                  cmpstringp))
           {
             fprintf(fout, "0");
-            snprintf(comment, sizeof(comment), "%s", words[w + 1]);
-            goto fin;
+            snprintf(comment, sizeof(comment), "%s", p);
           }
-          fprintf(fout, "_%s", p);
+          else {
+            check_sym(fhdr, p);
+            fprintf(fout, "_%s", p);
+          }
         }
         else {
           val = parse_number(words[w]);
@@ -420,9 +551,15 @@ fin:
     }
   }
 
+  fprintf(fout, "\n");
+
+  // dump public syms
+  for (i = 0; i < pub_sym_cnt; i++)
+    fprintf(fout, ".global _%s\n", pub_syms[i]);
+
   fclose(fout);
   fclose(fasm);
-  fclose(g_fhdr);
+  fclose(fhdr);
 
   return 0;
 }

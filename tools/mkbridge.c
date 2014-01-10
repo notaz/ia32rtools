@@ -230,7 +230,7 @@ int main(int argc, char *argv[])
 		if (p != NULL)
 			*p = 0;
 
-		pp = proto_parse(fhdr, sym_noat);
+		pp = proto_parse(fhdr, sym_noat, 0);
 		if (pp == NULL)
 			goto out;
 
@@ -245,7 +245,7 @@ int main(int argc, char *argv[])
 		if (sym[0] == 0 || sym[0] == ';' || sym[0] == '#')
 			continue;
 
-		pp = proto_parse(fhdr, sym);
+		pp = proto_parse(fhdr, sym, 0);
 		if (pp == NULL)
 			goto out;
 

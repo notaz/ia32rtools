@@ -650,7 +650,7 @@ static int parse_operand(struct parsed_opr *opr,
   // most likely var in data segment
   opr->type = OPT_LABEL;
 
-  pp = proto_parse(g_fhdr, opr->name);
+  pp = proto_parse(g_fhdr, opr->name, 0);
   if (pp != NULL) {
     if (pp->is_fptr || pp->is_func) {
       opr->lmod = OPLM_DWORD;
@@ -1437,7 +1437,7 @@ static void check_label_read_ref(struct parsed_op *po, const char *name)
 {
   const struct parsed_proto *pp;
 
-  pp = proto_parse(g_fhdr, name);
+  pp = proto_parse(g_fhdr, name, 0);
   if (pp == NULL)
     ferr(po, "proto_parse failed for ref '%s'\n", name);
 
@@ -2293,7 +2293,7 @@ static const struct parsed_proto *try_recover_pp(
       ferr(po, "icall sa: reg arg in arg-call unhandled yet\n");
   }
   else if (opr->type == OPT_OFFSET || opr->type == OPT_LABEL) {
-    pp = proto_parse(g_fhdr, opr->name);
+    pp = proto_parse(g_fhdr, opr->name, 0);
     if (pp == NULL)
       ferr(po, "proto_parse failed for icall from '%s'\n", opr->name);
     if (pp->argc_reg != 0)
@@ -2586,7 +2586,7 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
   g_bp_frame = g_sp_frame = g_stack_fsz = 0;
   g_stack_frame_used = 0;
 
-  g_func_pp = proto_parse(fhdr, funcn);
+  g_func_pp = proto_parse(fhdr, funcn, 0);
   if (g_func_pp == NULL)
     ferr(ops, "proto_parse failed for '%s'\n", funcn);
 
@@ -2755,7 +2755,7 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
         tmpname = opr_name(po, 0);
         if (IS_START(tmpname, "loc_"))
           ferr(po, "call to loc_*\n");
-        pp_c = proto_parse(fhdr, tmpname);
+        pp_c = proto_parse(fhdr, tmpname, 0);
         if (pp_c == NULL)
           ferr(po, "proto_parse failed for call '%s'\n", tmpname);
         if (pp_c->is_fptr && pp_c->argc_reg != 0)

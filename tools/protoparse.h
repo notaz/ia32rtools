@@ -46,6 +46,8 @@ static int do_protostrs(FILE *fhdr, const char *fname)
 	const char *finc_name;
 	const char *hdrfn_saved;
 	char protostr[256];
+	char path[256];
+	char fname_inc[256];
 	FILE *finc;
 	int line = 0;
 	int ret;
@@ -63,10 +65,19 @@ static int do_protostrs(FILE *fhdr, const char *fname)
 			if (p != NULL)
 				*p = 0;
 
-			finc = fopen(finc_name, "r");
+			path[0] = 0;
+			p = strrchr(hdrfn_saved, '/');
+			if (p) {
+				memcpy(path, hdrfn_saved,
+					p - hdrfn_saved + 1);
+				path[p - hdrfn_saved + 1] = 0;
+			}
+			snprintf(fname_inc, sizeof(fname_inc), "%s%s", 
+				path, finc_name);
+			finc = fopen(fname_inc, "r");
 			if (finc == NULL) {
 				printf("%s:%d: can't open '%s'\n",
-					fname, line, finc_name);
+					fname_inc, line, finc_name);
 				continue;
 			}
 			ret = do_protostrs(finc, finc_name);
@@ -601,7 +612,8 @@ static void build_pp_cache(FILE *fhdr)
 	qsort(pp_cache, pp_cache_size, sizeof(pp_cache[0]), pp_name_cmp);
 }
 
-static const struct parsed_proto *proto_parse(FILE *fhdr, const char *sym)
+static const struct parsed_proto *proto_parse(FILE *fhdr, const char *sym,
+	int quiet)
 {
 	const struct parsed_proto *pp_ret;
 	struct parsed_proto pp_search;
@@ -615,7 +627,7 @@ static const struct parsed_proto *proto_parse(FILE *fhdr, const char *sym)
 	strcpy(pp_search.name, sym);
 	pp_ret = bsearch(&pp_search, pp_cache, pp_cache_size,
 			sizeof(pp_cache[0]), pp_name_cmp);
-	if (pp_ret == NULL)
+	if (pp_ret == NULL && !quiet)
 		printf("%s: sym '%s' is missing\n", hdrfn, sym);
 
 	return pp_ret;
