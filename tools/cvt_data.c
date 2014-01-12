@@ -15,6 +15,10 @@
 static const char *asmfn;
 static int asmln;
 
+static const struct parsed_proto *g_func_sym_pp;
+static char g_comment[256];
+static int g_warn_cnt;
+
 // note: must be in ascending order
 enum dx_type {
   DXT_UNSPEC,
@@ -27,6 +31,13 @@ enum dx_type {
 
 #define anote(fmt, ...) \
 	printf("%s:%d: note: " fmt, asmfn, asmln, ##__VA_ARGS__)
+#define awarn(fmt, ...) do { \
+	printf("%s:%d: warning: " fmt, asmfn, asmln, ##__VA_ARGS__); \
+  if (++g_warn_cnt == 10) { \
+    fcloseall(); \
+	  exit(1); \
+  } \
+} while (0)
 #define aerr(fmt, ...) do { \
 	printf("%s:%d: error: " fmt, asmfn, asmln, ##__VA_ARGS__); \
   fcloseall(); \
@@ -194,50 +205,129 @@ static char *escape_string(char *s)
   return strcpy(s, buf);
 }
 
-static void check_sym(FILE *fhdr, const char *name)
+static void sprint_pp(const struct parsed_proto *pp, char *buf,
+  size_t buf_size)
 {
-  const struct parsed_proto *pp;
-  char buf[256];
-  int i, l;
+  size_t l;
+  int i;
 
-  pp = proto_parse(fhdr, name, 1);
+  snprintf(buf, buf_size, "%s %s(", pp->ret_type.name, pp->name);
+  l = strlen(buf);
+
+  for (i = 0; i < pp->argc_reg; i++) {
+    snprintf(buf + l, buf_size - l, "%s%s",
+      i == 0 ? "" : ", ", pp->arg[i].reg);
+    l = strlen(buf);
+  }
+  if (pp->argc_stack > 0) {
+    snprintf(buf + l, buf_size - l, "%s{%d stack}",
+      i == 0 ? "" : ", ", pp->argc_stack);
+    l = strlen(buf);
+  }
+  snprintf(buf + l, buf_size - l, ")");
+}
+
+static void sprint_pp_short(const struct parsed_proto *pp, char *buf,
+  size_t buf_size)
+{
+  char *p = buf;
+  size_t l;
+  int i;
+
+  if (pp->ret_type.is_ptr)
+    *p++ = 'p';
+  else if (IS(pp->ret_type.name, "void"))
+    *p++ = 'v';
+  else
+    *p++ = 'i';
+  *p++ = '(';
+  l = 2;
+
+  for (i = 0; i < pp->argc; i++) {
+    if (pp->arg[i].reg != NULL)
+      snprintf(buf + l, buf_size - l, "%s%s",
+        i == 0 ? "" : ",", pp->arg[i].reg);
+    else
+      snprintf(buf + l, buf_size - l, "%sa%d",
+        i == 0 ? "" : ",", i + 1);
+    l = strlen(buf);
+  }
+  snprintf(buf + l, buf_size - l, ")");
+}
+
+static void check_var(FILE *fhdr, const char *sym, const char *varname)
+{
+  const struct parsed_proto *pp, *pp_sym;
+  char fp_sym[256], fp_var[256];
+  int i, bad = 0;
+
+  pp = proto_parse(fhdr, varname, 1);
   if (pp == NULL) {
-    if (IS_START(name, "sub_"))
-      aerr("sub_ sym missing proto: '%s'\n", name);
+    if (IS_START(varname, "sub_"))
+      awarn("sub_ sym missing proto: '%s'\n", varname);
     return;
   }
 
   if (!pp->is_func && !pp->is_fptr)
     return;
+
+  sprint_pp(pp, fp_var, sizeof(fp_var));
+
   if (pp->argc_reg == 0)
-    return;
+    goto check_sym;
   if (pp->argc_reg == 1 && pp->argc_stack == 0
     && IS(pp->arg[0].reg, "ecx"))
   {
-    return;
+    goto check_sym;
   }
-  if (pp->argc_reg == 2
-    && IS(pp->arg[0].reg, "ecx")
-    && IS(pp->arg[1].reg, "edx"))
+  if (pp->argc_reg != 2
+    || !IS(pp->arg[0].reg, "ecx")
+    || !IS(pp->arg[1].reg, "edx"))
   {
-    return;
+    awarn("unhandled reg call: %s\n", fp_var);
   }
-  snprintf(buf, sizeof(buf), "%s %s(",
-    pp->ret_type.name, name);
-  l = strlen(buf);
 
-  for (i = 0; i < pp->argc_reg; i++) {
-    snprintf(buf + l, sizeof(buf) - l, "%s%s",
-      i == 0 ? "" : ", ", pp->arg[i].reg);
-    l = strlen(buf);
+check_sym:
+  sprint_pp_short(pp, g_comment, sizeof(g_comment));
+
+  if (sym != NULL) {
+    g_func_sym_pp = NULL;
+    pp_sym = proto_parse(fhdr, sym, 1);
+    if (pp_sym == NULL)
+      return;
+    if (!pp_sym->is_fptr)
+      aerr("func ptr data, but label '%s' !is_fptr\n", pp_sym->name);
+    g_func_sym_pp = pp_sym;
   }
-  if (pp->argc_stack > 0) {
-    snprintf(buf + l, sizeof(buf) - l, ", {%d stack}", pp->argc_stack);
-    l = strlen(buf);
+  else {
+    pp_sym = g_func_sym_pp;
+    if (pp_sym == NULL)
+      return;
   }
-  snprintf(buf + l, sizeof(buf) - l, ")");
-    
-  aerr("unhandled reg call: %s\n", buf);
+
+  if (pp->argc != pp_sym->argc || pp->argc_reg != pp_sym->argc_reg)
+    bad = 1;
+  else {
+    for (i = 0; i < pp->argc; i++) {
+      if ((pp->arg[i].reg != NULL) != (pp_sym->arg[i].reg != NULL)) {
+        bad = 1;
+        break;
+      }
+      if ((pp->arg[i].reg != NULL)
+        && !IS(pp->arg[i].reg, pp_sym->arg[i].reg))
+      {
+        bad = 1;
+        break;
+      }
+    }
+  }
+
+  if (bad) {
+    sprint_pp(pp_sym, fp_sym, sizeof(fp_sym));
+    anote("var: %s\n", fp_var);
+    anote("sym: %s\n", fp_sym);
+    awarn("^ mismatch\n");
+  }
 }
 
 static int cmpstringp(const void *p1, const void *p2)
@@ -248,10 +338,10 @@ static int cmpstringp(const void *p1, const void *p2)
 int main(int argc, char *argv[])
 {
   FILE *fout, *fasm, *fhdr, *frlist;
+  const struct parsed_proto *pp;
   char words[20][256];
   char word[256];
   char line[256];
-  char comment[256];
   unsigned long val;
   unsigned long cnt;
   const char *sym;
@@ -291,8 +381,6 @@ int main(int argc, char *argv[])
 
   fout = fopen(argv[arg_out], "w");
   my_assert_not(fout, NULL);
-
-  comment[0] = 0;
 
   pub_sym_alloc = 64;
   pub_syms = malloc(pub_sym_alloc * sizeof(pub_syms[0]));
@@ -366,6 +454,12 @@ int main(int argc, char *argv[])
         }
       }
 
+      if (*p == ';') {
+        p = sskip(p + 1);
+        if (IS_START(p, "sctclrtype"))
+          g_func_sym_pp = NULL;
+      }
+
       if (wordc == 2 && IS(words[1], "ends"))
         break;
       if (wordc <= 2 && IS(words[0], "end"))
@@ -401,6 +495,10 @@ int main(int argc, char *argv[])
           my_assert_not(pub_syms, NULL);
         }
         pub_syms[pub_sym_cnt++] = strdup(sym);
+
+        pp = proto_parse(fhdr, sym, 1);
+        if (pp != NULL)
+          g_func_sym_pp = NULL;
 
         len = strlen(sym);
         fprintf(fout, "_%s:", sym);
@@ -478,7 +576,7 @@ int main(int argc, char *argv[])
         p = words[w];
         val = (p[1] << 24) | (p[2] << 16) | (p[3] << 8) | p[4];
         fprintf(fout, ".long 0x%lx", val);
-        snprintf(comment, sizeof(comment), "%s", words[w]);
+        snprintf(g_comment, sizeof(g_comment), "%s", words[w]);
         goto fin;
       }
 
@@ -523,10 +621,10 @@ int main(int argc, char *argv[])
                   cmpstringp))
           {
             fprintf(fout, "0");
-            snprintf(comment, sizeof(comment), "%s", p);
+            snprintf(g_comment, sizeof(g_comment), "%s", p);
           }
           else {
-            check_sym(fhdr, p);
+            check_var(fhdr, sym, p);
             fprintf(fout, "_%s", p);
           }
         }
@@ -542,12 +640,11 @@ int main(int argc, char *argv[])
       }
 
 fin:
-      if (comment[0] != 0) {
-        fprintf(fout, "\t\t# %s", comment);
-        comment[0] = 0;
+      if (g_comment[0] != 0) {
+        fprintf(fout, "\t\t# %s", g_comment);
+        g_comment[0] = 0;
       }
       fprintf(fout, "\n");
-      (void)proto_parse;
     }
   }
 
