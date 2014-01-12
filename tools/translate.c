@@ -2397,7 +2397,7 @@ static const struct parsed_proto *resolve_call(int i, int opcnt)
 }
 
 static int collect_call_args(struct parsed_op *po, int i,
-  struct parsed_proto *pp, int *save_arg_vars, int arg,
+  struct parsed_proto *pp, int *regmask, int *save_arg_vars, int arg,
   int magic, int need_op_saving, int may_reuse)
 {
   struct parsed_proto *pp_tmp;
@@ -2436,7 +2436,7 @@ static int collect_call_args(struct parsed_op *po, int i,
       for (; lr->next; lr = lr->next) {
         if ((ops[lr->i].flags & (OPF_JMP|OPF_CC)) != OPF_JMP)
           may_reuse = 1;
-        ret = collect_call_args(po, lr->i, pp, save_arg_vars,
+        ret = collect_call_args(po, lr->i, pp, regmask, save_arg_vars,
                 arg, magic, need_op_saving, may_reuse);
         if (ret < 0)
           return ret;
@@ -2450,7 +2450,7 @@ static int collect_call_args(struct parsed_op *po, int i,
         continue;
       }
       need_op_saving = 1;
-      ret = collect_call_args(po, lr->i, pp, save_arg_vars,
+      ret = collect_call_args(po, lr->i, pp, regmask, save_arg_vars,
                arg, magic, need_op_saving, may_reuse);
       if (ret < 0)
         return ret;
@@ -2511,6 +2511,10 @@ static int collect_call_args(struct parsed_op *po, int i,
         if (pp->arg[arg].reg == NULL)
           break;
       magic = (magic & 0xffffff) | (arg << 24);
+
+      // tracking reg usage
+      if (ops[j].operand[0].type == OPT_REG)
+        *regmask |= 1 << ops[j].operand[0].reg;
     }
   }
 
@@ -2565,8 +2569,6 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
   int save_arg_vars = 0;
   int cmp_result_vars = 0;
   int need_mul_var = 0;
-  int have_func_ret = 0;
-  int have_normal_ret = 0;
   int had_decl = 0;
   int label_pending = 0;
   int regmask_save = 0;
@@ -2899,22 +2901,27 @@ tailcall:
         ferr(po, "missing esp_adjust for vararg func '%s'\n",
           pp->name);
 
-      // can't call functions with non-__cdecl callbacks yet
       for (arg = 0; arg < pp->argc; arg++) {
+        if (pp->arg[arg].reg != NULL) {
+          reg = char_array_i(regs_r32,
+                  ARRAY_SIZE(regs_r32), pp->arg[arg].reg);
+          if (reg < 0)
+            ferr(ops, "arg '%s' is not a reg?\n", pp->arg[arg].reg);
+          regmask |= 1 << reg;
+        }
         if (pp->arg[arg].fptr != NULL) {
+          // can't call functions with non-__cdecl callbacks yet
           pp_tmp = pp->arg[arg].fptr;
           if (pp_tmp->argc_reg != 0)
             ferr(po, "'%s' has a callback with reg-args\n", tmpname);
         }
       }
 
-      collect_call_args(po, i, pp, &save_arg_vars,
+      collect_call_args(po, i, pp, &regmask, &save_arg_vars,
         0, i + opcnt * 2, 0, 0);
 
       if (strstr(pp->ret_type.name, "int64"))
         need_mul_var = 1;
-      if (!(po->flags & OPF_TAIL) && !IS(pp->ret_type.name, "void"))
-        have_func_ret = 1;
     }
   }
 
@@ -3049,8 +3056,8 @@ tailcall:
       }
       fprintf(fout, ");\n");
     }
-    else if (po->op == OP_RET)
-      have_normal_ret = 1;
+    else if (po->op == OP_RET && !IS(g_func_pp->ret_type.name, "void"))
+      regmask |= 1 << xAX;
   }
 
   // output LUTs/jumptables
@@ -3096,26 +3103,22 @@ tailcall:
         ferr(ops, "arg '%s' is not a reg?\n", g_func_pp->arg[i].reg);
 
       regmask_arg |= 1 << reg;
-      fprintf(fout, "  u32 %s = (u32)a%d;\n",
-        g_func_pp->arg[i].reg, i + 1);
+      if (regmask & (1 << reg)) {
+        fprintf(fout, "  u32 %s = (u32)a%d;\n",
+          g_func_pp->arg[i].reg, i + 1);
+      }
+      else
+        fprintf(fout, "  // %s = a%d; // unused\n",
+          g_func_pp->arg[i].reg, i + 1);
       had_decl = 1;
     }
   }
 
-  // declare other regs - special case for eax
-  if (!((regmask | regmask_arg) & 1)
-   && (have_func_ret || have_normal_ret)
-   && !IS(g_func_pp->ret_type.name, "void"))
-  {
-    fprintf(fout, "  u32 eax = 0;\n");
-    had_decl = 1;
-  }
-
-  regmask &= ~regmask_arg;
-  regmask &= ~(1 << xSP);
-  if (regmask) {
+  regmask_now = regmask & ~regmask_arg;
+  regmask_now &= ~(1 << xSP);
+  if (regmask_now) {
     for (reg = 0; reg < 8; reg++) {
-      if (regmask & (1 << reg)) {
+      if (regmask_now & (1 << reg)) {
         fprintf(fout, "  u32 %s;\n", regs_r32[reg]);
         had_decl = 1;
       }
@@ -3626,7 +3629,7 @@ tailcall:
                 fprintf(fout, "(%s)", g_func_pp->ret_type.name);
             }
           }
-          else {
+          else if (regmask & (1 << xAX)) {
             fprintf(fout, "eax = ");
             if (pp->ret_type.is_ptr)
               fprintf(fout, "(u32)");
