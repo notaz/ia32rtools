@@ -202,6 +202,7 @@ static int g_sp_frame;
 static int g_stack_frame_used;
 static int g_stack_fsz;
 static int g_ida_func_attr;
+static int g_allow_regfunc;
 #define ferr(op_, fmt, ...) do { \
   printf("error:%s:#%zd: '%s': " fmt, g_func, (op_) - ops, \
     dump_op(op_), ##__VA_ARGS__); \
@@ -448,12 +449,12 @@ static int guess_lmod_from_c_type(enum opr_lenmod *lmod,
     "WPARAM", "LPARAM", "UINT",
   };
   static const char *word_types[] = {
-    "uint16_t", "int16_t",
+    "uint16_t", "int16_t", "_WORD",
     "unsigned __int16", "__int16",
   };
   static const char *byte_types[] = {
     "uint8_t", "int8_t", "char",
-    "unsigned __int8", "__int8", "BYTE",
+    "unsigned __int8", "__int8", "BYTE", "_BYTE",
     "_UNKNOWN",
   };
   const char *n;
@@ -522,9 +523,10 @@ static int parse_operand(struct parsed_opr *opr,
   const struct parsed_proto *pp;
   enum opr_lenmod tmplmod;
   unsigned long number;
+  char buf[256];
   int ret, len;
   int wordc_in;
-  char *tmp;
+  char *p;
   int i;
 
   if (w >= wordc)
@@ -589,7 +591,7 @@ static int parse_operand(struct parsed_opr *opr,
       return wordc;
     }
     if (IS(words[w], "(offset")) {
-      char *p = strchr(words[w + 1], ')');
+      p = strchr(words[w + 1], ')');
       if (p == NULL)
         aerr("parse of bracketed offset failed\n");
       *p = 0;
@@ -602,10 +604,9 @@ static int parse_operand(struct parsed_opr *opr,
   if (wordc_in != 1)
     aerr("parse_operand 1 word expected\n");
 
-  tmp = words[w];
-  if (IS_START(tmp, "ds:"))
-    tmp += 3;
-  strcpy(opr->name, tmp);
+  if (IS_START(words[w], "ds:"))
+    memmove(words[w], words[w] + 3, strlen(words[w]) - 2);
+  strcpy(opr->name, words[w]);
 
   if (words[w][0] == '[') {
     opr->type = OPT_REGMEM;
@@ -625,11 +626,13 @@ static int parse_operand(struct parsed_opr *opr,
   }
   else if (strchr(words[w], '[')) {
     // label[reg] form
+    p = strchr(words[w], '[');
     opr->type = OPT_REGMEM;
-    if (opr->lmod == OPLM_UNSPEC)
-      guess_lmod_from_name(opr);
-    parse_indmode(strchr(words[w], '['), regmask_indirect, 0);
-    return wordc;
+    parse_indmode(p, regmask_indirect, 0);
+    strncpy(buf, words[w], p - words[w]);
+    buf[p - words[w]] = 0;
+    pp = proto_parse(g_fhdr, buf, 1);
+    goto do_label;
   }
   else if (('0' <= words[w][0] && words[w][0] <= '9')
     || words[w][0] == '-')
@@ -649,8 +652,9 @@ static int parse_operand(struct parsed_opr *opr,
 
   // most likely var in data segment
   opr->type = OPT_LABEL;
-
   pp = proto_parse(g_fhdr, opr->name, 0);
+
+do_label:
   if (pp != NULL) {
     if (pp->is_fptr || pp->is_func) {
       opr->lmod = OPLM_DWORD;
@@ -964,6 +968,11 @@ static void parse_op(struct parsed_op *op, char words[16][256], int wordc)
       if (IS(buf, op->operand[1].name))
         op->flags |= OPF_RMD;
     }
+    break;
+
+  case OP_CALL:
+    // trashed regs must be explicitly detected later
+    op->regmask_dst = 0;
     break;
 
   default:
@@ -1433,6 +1442,18 @@ static void stack_frame_access(struct parsed_op *po,
   }
 }
 
+static void check_func_pp(struct parsed_op *po,
+  const struct parsed_proto *pp, const char *pfx)
+{
+  if (pp->argc_reg != 0) {
+    if (!g_allow_regfunc)
+      ferr(po, "%s: reg arg in arg-call unhandled yet\n", pfx);
+    if (pp->argc_stack > 0 && pp->argc_reg != 2)
+      ferr(po, "%s: %d reg arg(s) with %d stack arg(s)\n",
+        pfx, pp->argc_reg, pp->argc_stack);
+  }
+}
+
 static void check_label_read_ref(struct parsed_op *po, const char *name)
 {
   const struct parsed_proto *pp;
@@ -1441,9 +1462,8 @@ static void check_label_read_ref(struct parsed_op *po, const char *name)
   if (pp == NULL)
     ferr(po, "proto_parse failed for ref '%s'\n", name);
 
-  // currently we can take __cdecl and __stdcall
-  if (pp->is_func && pp->argc_reg != 0)
-    ferr(po, "reg-arg func reference?\n");
+  if (pp->is_func)
+    check_func_pp(po, pp, "ref");
 }
 
 static char *out_src_opr(char *buf, size_t buf_size,
@@ -1886,6 +1906,7 @@ static void op_set_clear_flag(struct parsed_op *po,
 static int scan_for_pop(int i, int opcnt, const char *reg,
   int magic, int depth, int *maxdepth, int do_flags)
 {
+  const struct parsed_proto *pp;
   struct parsed_op *po;
   int ret = 0;
   int j;
@@ -1896,8 +1917,15 @@ static int scan_for_pop(int i, int opcnt, const char *reg,
       break; // already checked
     po->cc_scratch = magic;
 
-    if (po->flags & OPF_TAIL)
+    if (po->flags & OPF_TAIL) {
+      if (po->op == OP_CALL) {
+        pp = proto_parse(g_fhdr, po->operand[0].name, 0);
+        if (pp != NULL && pp->is_noreturn)
+          // no stack cleanup for noreturn
+          return ret;
+      }
       return -1; // deadend
+    }
 
     if ((po->flags & OPF_RMD)
         || (po->op == OP_PUSH && po->argnum != 0)) // arg push
@@ -2000,14 +2028,26 @@ static int scan_for_pop_ret(int i, int opcnt, const char *reg,
 static int is_opr_modified(const struct parsed_opr *opr,
   const struct parsed_op *po)
 {
+  int mask;
+
   if ((po->flags & OPF_RMD) || !(po->flags & OPF_DATA))
     return 0;
 
-  if (opr->type == OPT_REG && po->operand[0].type == OPT_REG) {
-    if (po->regmask_dst & (1 << opr->reg))
-      return 1;
-    else
-      return 0;
+  if (opr->type == OPT_REG) {
+    if (po->op == OP_CALL) {
+      mask = (1 << xAX) | (1 << xCX) | (1 << xDX);
+      if ((1 << opr->reg) & mask)
+        return 1;
+      else
+        return 0;
+    }
+
+    if (po->operand[0].type == OPT_REG) {
+      if (po->regmask_dst & (1 << opr->reg))
+        return 1;
+      else
+        return 0;
+    }
   }
 
   return IS(po->operand[0].name, opr->name);
@@ -2015,8 +2055,9 @@ static int is_opr_modified(const struct parsed_opr *opr,
 
 // is any operand of parsed_op 'po_test' modified by parsed_op 'po'?
 static int is_any_opr_modified(const struct parsed_op *po_test,
-  const struct parsed_op *po)
+  const struct parsed_op *po, int c_mode)
 {
+  int mask;
   int i;
 
   if ((po->flags & OPF_RMD) || !(po->flags & OPF_DATA))
@@ -2030,9 +2071,12 @@ static int is_any_opr_modified(const struct parsed_op *po_test,
 
   // in reality, it can wreck any register, but in decompiled C
   // version it can only overwrite eax or edx:eax
+  mask = (1 << xAX) | (1 << xDX);
+  if (!c_mode)
+    mask |= 1 << xCX;
+
   if (po->op == OP_CALL
-   && ((po_test->regmask_src | po_test->regmask_dst)
-       & ((1 << xAX)|(1 << xDX))))
+   && ((po_test->regmask_src | po_test->regmask_dst) & mask))
     return 1;
 
   for (i = 0; i < po_test->operand_cnt; i++)
@@ -2043,13 +2087,14 @@ static int is_any_opr_modified(const struct parsed_op *po_test,
 }
 
 // scan for any po_test operand modification in range given
-static int scan_for_mod(struct parsed_op *po_test, int i, int opcnt)
+static int scan_for_mod(struct parsed_op *po_test, int i, int opcnt,
+  int c_mode)
 {
   if (po_test->operand_cnt == 1 && po_test->operand[0].type == OPT_CONST)
     return -1;
 
   for (; i < opcnt; i++) {
-    if (is_any_opr_modified(po_test, &ops[i]))
+    if (is_any_opr_modified(po_test, &ops[i], c_mode))
       return i;
   }
 
@@ -2175,6 +2220,7 @@ static int scan_for_reg_clear(int i, int reg)
 // scan for positive, constant esp adjust
 static int scan_for_esp_adjust(int i, int opcnt, int *adj)
 {
+  const struct parsed_proto *pp;
   struct parsed_op *po;
   int first_pop = -1;
   *adj = 0;
@@ -2208,7 +2254,9 @@ static int scan_for_esp_adjust(int i, int opcnt, int *adj)
         break;
       if (po->operand[0].type != OPT_LABEL)
         break;
-      // TODO: should only allow combining __cdecl calls..
+      pp = po->datap;
+      if (pp != NULL && pp->is_stdcall)
+        break;
     }
   }
 
@@ -2259,6 +2307,8 @@ static const struct parsed_proto *try_recover_pp(
   struct parsed_op *po, const struct parsed_opr *opr)
 {
   const struct parsed_proto *pp = NULL;
+  char buf[256];
+  char *p;
 
   // maybe an arg of g_func?
   if (opr->type == OPT_REGMEM && is_stack_access(po, opr))
@@ -2289,22 +2339,27 @@ static const struct parsed_proto *try_recover_pp(
     pp = g_func_pp->arg[arg].fptr;
     if (pp == NULL)
       ferr(po, "icall sa: arg%d is not a fptr?\n", arg + 1);
-    if (pp->argc_reg != 0)
-      ferr(po, "icall sa: reg arg in arg-call unhandled yet\n");
+    check_func_pp(po, pp, "icall arg");
+  }
+  else if (opr->type == OPT_REGMEM && strchr(opr->name + 1, '[')) {
+    // label[index]
+    p = strchr(opr->name + 1, '[');
+    memcpy(buf, opr->name, p - opr->name);
+    buf[p - opr->name] = 0;
+    pp = proto_parse(g_fhdr, buf, 0);
   }
   else if (opr->type == OPT_OFFSET || opr->type == OPT_LABEL) {
     pp = proto_parse(g_fhdr, opr->name, 0);
     if (pp == NULL)
       ferr(po, "proto_parse failed for icall from '%s'\n", opr->name);
-    if (pp->argc_reg != 0)
-      ferr(po, "arg-call unhandled yet for '%s'\n", opr->name);
+    check_func_pp(po, pp, "reg-fptr ref");
   }
 
   return pp;
 }
 
 static void scan_for_call_type(int i, struct parsed_opr *opr,
-  int magic, const struct parsed_proto **pp_found)
+  int magic, const struct parsed_proto **pp_found, int *multi)
 {
   const struct parsed_proto *pp = NULL;
   struct parsed_op *po;
@@ -2318,7 +2373,7 @@ static void scan_for_call_type(int i, struct parsed_opr *opr,
     if (g_labels[i][0] != 0) {
       lr = &g_label_refs[i];
       for (; lr != NULL; lr = lr->next)
-        scan_for_call_type(lr->i, opr, magic, pp_found);
+        scan_for_call_type(lr->i, opr, magic, pp_found, multi);
       if (i > 0 && LAST_OP(i - 1))
         return;
     }
@@ -2358,29 +2413,33 @@ static void scan_for_call_type(int i, struct parsed_opr *opr,
     if (pp == NULL)
       ferr(po, "icall: arg%d (%s) is not a fptr?\n",
         i + 1, g_func_pp->arg[i].reg);
-    if (pp->argc_reg != 0)
-      ferr(po, "icall: reg arg in arg-call unhandled yet\n");
+    check_func_pp(po, pp, "icall reg-arg");
   }
   else
     pp = try_recover_pp(po, opr);
 
-  if (*pp_found != NULL && pp != NULL) {
+  if (*pp_found != NULL && pp != NULL && *pp_found != pp) {
     if (!IS((*pp_found)->ret_type.name, pp->ret_type.name)
       || (*pp_found)->is_stdcall != pp->is_stdcall
+      || (*pp_found)->is_fptr != pp->is_fptr
       || (*pp_found)->argc != pp->argc
       || (*pp_found)->argc_reg != pp->argc_reg
       || (*pp_found)->argc_stack != pp->argc_stack)
     {
       ferr(po, "icall: parsed_proto mismatch\n");
     }
+    *multi = 1;
   }
   if (pp != NULL)
     *pp_found = pp;
 }
 
-static const struct parsed_proto *resolve_call(int i, int opcnt)
+static const struct parsed_proto *resolve_icall(int i, int opcnt,
+  int *multi_src)
 {
   const struct parsed_proto *pp = NULL;
+
+  *multi_src = 0;
 
   switch (ops[i].operand[0].type) {
   case OPT_REGMEM:
@@ -2389,14 +2448,15 @@ static const struct parsed_proto *resolve_call(int i, int opcnt)
     pp = try_recover_pp(&ops[i], &ops[i].operand[0]);
     break;
   default:
-    scan_for_call_type(i, &ops[i].operand[0], i + opcnt * 9, &pp);
+    scan_for_call_type(i, &ops[i].operand[0], i + opcnt * 9, &pp,
+      multi_src);
     break;
   }
 
   return pp;
 }
 
-static int collect_call_args(struct parsed_op *po, int i,
+static int collect_call_args_r(struct parsed_op *po, int i,
   struct parsed_proto *pp, int *regmask, int *save_arg_vars, int arg,
   int magic, int need_op_saving, int may_reuse)
 {
@@ -2416,7 +2476,7 @@ static int collect_call_args(struct parsed_op *po, int i,
       break;
   magic = (magic & 0xffffff) | (arg << 24);
 
-  for (j = i; j >= 0 && arg < pp->argc; )
+  for (j = i; j >= 0 && (arg < pp->argc || pp->is_unresolved); )
   {
     if (((ops[j].cc_scratch ^ magic) & 0xffffff) == 0) {
       if (ops[j].cc_scratch != magic) {
@@ -2436,7 +2496,7 @@ static int collect_call_args(struct parsed_op *po, int i,
       for (; lr->next; lr = lr->next) {
         if ((ops[lr->i].flags & (OPF_JMP|OPF_CC)) != OPF_JMP)
           may_reuse = 1;
-        ret = collect_call_args(po, lr->i, pp, regmask, save_arg_vars,
+        ret = collect_call_args_r(po, lr->i, pp, regmask, save_arg_vars,
                 arg, magic, need_op_saving, may_reuse);
         if (ret < 0)
           return ret;
@@ -2450,7 +2510,7 @@ static int collect_call_args(struct parsed_op *po, int i,
         continue;
       }
       need_op_saving = 1;
-      ret = collect_call_args(po, lr->i, pp, regmask, save_arg_vars,
+      ret = collect_call_args_r(po, lr->i, pp, regmask, save_arg_vars,
                arg, magic, need_op_saving, may_reuse);
       if (ret < 0)
         return ret;
@@ -2459,6 +2519,9 @@ static int collect_call_args(struct parsed_op *po, int i,
 
     if (ops[j].op == OP_CALL)
     {
+      if (pp->is_unresolved)
+        break;
+
       pp_tmp = ops[j].datap;
       if (pp_tmp == NULL)
         ferr(po, "arg collect hit unparsed call '%s'\n",
@@ -2468,22 +2531,34 @@ static int collect_call_args(struct parsed_op *po, int i,
           arg, pp->argc, opr_name(&ops[j], 0), pp_tmp->argc_stack);
     }
     else if (ops[j].op == OP_ADD && ops[j].operand[0].reg == xSP) {
+      if (pp->is_unresolved)
+        break;
+
       ferr(po, "arg collect %d/%d hit esp adjust\n",
         arg, pp->argc);
     }
     else if (ops[j].op == OP_POP) {
+      if (pp->is_unresolved)
+        break;
+
       ferr(po, "arg collect %d/%d hit pop\n", arg, pp->argc);
     }
     else if ((ops[j].flags & (OPF_JMP|OPF_CC)) == (OPF_JMP|OPF_CC))
     {
+      if (pp->is_unresolved)
+        break;
+
       may_reuse = 1;
     }
     else if (ops[j].op == OP_PUSH && !(ops[j].flags & OPF_FARG))
     {
+      if (pp->is_unresolved && (ops[j].flags & OPF_RMD))
+        break;
+
       pp->arg[arg].datap = &ops[j];
       need_to_save_current = 0;
       if (!need_op_saving) {
-        ret = scan_for_mod(&ops[j], j + 1, i);
+        ret = scan_for_mod(&ops[j], j + 1, i, 1);
         need_to_save_current = (ret >= 0);
       }
       if (need_op_saving || need_to_save_current) {
@@ -2506,10 +2581,13 @@ static int collect_call_args(struct parsed_op *po, int i,
       if (!may_reuse)
         ops[j].flags |= OPF_FARG;
 
-      // next arg
-      for (arg++; arg < pp->argc; arg++)
-        if (pp->arg[arg].reg == NULL)
-          break;
+      arg++;
+      if (!pp->is_unresolved) {
+        // next arg
+        for (; arg < pp->argc; arg++)
+          if (pp->arg[arg].reg == NULL)
+            break;
+      }
       magic = (magic & 0xffffff) | (arg << 24);
 
       // tracking reg usage
@@ -2521,9 +2599,51 @@ static int collect_call_args(struct parsed_op *po, int i,
   if (arg < pp->argc) {
     ferr(po, "arg collect failed for '%s': %d/%d\n",
       pp->name, arg, pp->argc);
-    ret = -1;
+    return -1;
   }
+
+  return arg;
+}
+
+static int collect_call_args(struct parsed_op *po, int i,
+  struct parsed_proto *pp, int *regmask, int *save_arg_vars,
+  int magic)
+{
+  int ret;
+  int a;
+
+  ret = collect_call_args_r(po, i, pp, regmask, save_arg_vars,
+          0, magic, 0, 0);
+  if (ret < 0)
+    return ret;
+
+  if (pp->is_unresolved) {
+    pp->argc += ret;
+    pp->argc_stack += ret;
+    for (a = 0; a < pp->argc; a++)
+      if (pp->arg[a].type.name == NULL)
+        pp->arg[a].type.name = strdup("int");
+  }
+
   return ret;
+}
+
+static void pp_insert_reg_arg(struct parsed_proto *pp, const char *reg)
+{
+  int i;
+
+  for (i = 0; i < pp->argc; i++)
+    if (pp->arg[i].reg == NULL)
+      break;
+
+  if (pp->argc_stack)
+    memmove(&pp->arg[i + 1], &pp->arg[i],
+      sizeof(pp->arg[0]) * pp->argc_stack);
+  memset(&pp->arg[i], 0, sizeof(pp->arg[i]));
+  pp->arg[i].reg = strdup(reg);
+  pp->arg[i].type.name = strdup("int");
+  pp->argc++;
+  pp->argc_reg++;
 }
 
 static void add_label_ref(struct label_ref *lr, int op_i)
@@ -2562,7 +2682,7 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
   struct parsed_opr *last_arith_dst = NULL;
   char buf1[256], buf2[256], buf3[256], cast[64];
   const struct parsed_proto *pp_c;
-  struct parsed_proto *pp, *pp_tmp;
+  struct parsed_proto *pp;
   struct parsed_data *pd;
   const char *tmpname;
   enum parsed_flag_op pfo;
@@ -2620,6 +2740,13 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
     }
     else {
       fprintf(fout, "%s a%d", g_func_pp->arg[i].type.name, i + 1);
+    }
+    if (g_func_pp->arg[i].reg != NULL) {
+      reg = char_array_i(regs_r32,
+              ARRAY_SIZE(regs_r32), g_func_pp->arg[i].reg);
+      if (reg < 0)
+        ferr(ops, "arg '%s' is not a reg?\n", g_func_pp->arg[i].reg);
+      regmask_arg |= 1 << reg;
     }
   }
   if (g_func_pp->is_vararg) {
@@ -2775,7 +2902,7 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
     if (po->operand[0].type == OPT_REGMEM) {
       char *p = strchr(po->operand[0].name, '[');
       if (p == NULL)
-        ferr(po, "unhandled indirect branch\n");
+        goto tailcall;
       ret = p - po->operand[0].name;
       strncpy(buf1, po->operand[0].name, ret);
       buf1[ret] = 0;
@@ -2849,18 +2976,28 @@ tailcall:
       if (pp == NULL)
       {
         // indirect call
-        pp_c = resolve_call(i, opcnt);
-        if (pp_c != NULL)
+        pp_c = resolve_icall(i, opcnt, &l);
+        if (pp_c != NULL) {
           pp = proto_clone(pp_c);
+          my_assert_not(pp, NULL);
+          if (l)
+            // not resolved just to single func
+            pp->is_fptr = 1;
+        }
         if (pp == NULL) {
           pp = calloc(1, sizeof(*pp));
           my_assert_not(pp, NULL);
+          pp->is_fptr = 1;
           ret = scan_for_esp_adjust(i + 1, opcnt, &j);
-          if (ret < 0)
-            ferr(po, "non-__cdecl indirect call unhandled yet\n");
+          if (ret < 0) {
+            if (!g_allow_regfunc)
+              ferr(po, "non-__cdecl indirect call unhandled yet\n");
+            pp->is_unresolved = 1;
+            j = 0;
+          }
           j /= 4;
           if (j > ARRAY_SIZE(pp->arg))
-            ferr(po, "esp adjust too large?\n");
+            ferr(po, "esp adjust too large: %d\n", j);
           pp->ret_type.name = strdup("int");
           pp->argc = pp->argc_stack = j;
           for (arg = 0; arg < pp->argc; arg++)
@@ -2909,16 +3046,22 @@ tailcall:
             ferr(ops, "arg '%s' is not a reg?\n", pp->arg[arg].reg);
           regmask |= 1 << reg;
         }
+#if 0
         if (pp->arg[arg].fptr != NULL) {
           // can't call functions with non-__cdecl callbacks yet
+          struct parsed_proto *pp_tmp;
           pp_tmp = pp->arg[arg].fptr;
           if (pp_tmp->argc_reg != 0)
             ferr(po, "'%s' has a callback with reg-args\n", tmpname);
         }
+#endif
       }
 
-      collect_call_args(po, i, pp, &regmask, &save_arg_vars,
-        0, i + opcnt * 2, 0, 0);
+      if (!pp->is_unresolved) {
+        // since we know the args, collect them
+        collect_call_args(po, i, pp, &regmask, &save_arg_vars,
+          i + opcnt * 2);
+      }
 
       if (strstr(pp->ret_type.name, "int64"))
         need_mul_var = 1;
@@ -2929,6 +3072,7 @@ tailcall:
   // - find POPs for PUSHes, rm both
   // - scan for all used registers
   // - find flag set ops for their users
+  // - do unreselved calls
   // - declare indirect functions
   for (i = 0; i < opcnt; i++) {
     po = &ops[i];
@@ -3012,7 +3156,7 @@ tailcall:
         // if we can't because of operand modification, or if we
         // have math op, or branch, make it calculate flags explicitly
         if (tmp_op->op == OP_TEST || tmp_op->op == OP_CMP) {
-          if (branched || scan_for_mod(tmp_op, setters[j] + 1, i) >= 0)
+          if (branched || scan_for_mod(tmp_op, setters[j] + 1, i, 0) >= 0)
             pfomask = 1 << pfo;
         }
         else if (tmp_op->op == OP_CMPS) {
@@ -3042,19 +3186,47 @@ tailcall:
     {
       need_mul_var = 1;
     }
-    else if (po->op == OP_CALL && po->operand[0].type != OPT_LABEL) {
+    else if (po->op == OP_CALL) {
       pp = po->datap;
-      my_assert_not(pp, NULL);
-      fprintf(fout, "  %s (", pp->ret_type.name);
-      if (pp->is_stdcall && pp->argc_reg == 0)
-        fprintf(fout, "__stdcall ");
-      fprintf(fout, "*icall%d)(", i);
-      for (j = 0; j < pp->argc; j++) {
-        if (j > 0)
-          fprintf(fout, ", ");
-        fprintf(fout, "%s a%d", pp->arg[j].type.name, j + 1);
+      if (pp == NULL)
+        ferr(po, "NULL pp\n");
+
+      if (pp->is_unresolved) {
+        int regmask_push = 0;
+        collect_call_args(po, i, pp, &regmask_push, &save_arg_vars,
+          i + opcnt * 2);
+
+        if (!((regmask_push & (1 << xCX))
+          && (regmask_push & (1 << xDX))))
+        {
+          if (pp->argc_stack != 0
+           || ((regmask | regmask_arg) & (1 << xCX)))
+          {
+            pp_insert_reg_arg(pp, "ecx");
+            regmask |= 1 << xCX;
+          }
+          if (pp->argc_stack != 0
+           || ((regmask | regmask_arg) & (1 << xDX)))
+          {
+            pp_insert_reg_arg(pp, "edx");
+            regmask |= 1 << xDX;
+          }
+        }
+        regmask |= regmask_push;
       }
-      fprintf(fout, ");\n");
+
+      if (pp->is_fptr) {
+        fprintf(fout, "  %s (", pp->ret_type.name);
+        if (pp->is_stdcall && pp->argc_reg == 0)
+          fprintf(fout, "__stdcall ");
+        fprintf(fout, "*icall%d)(", i);
+        for (j = 0; j < pp->argc; j++) {
+          if (j > 0)
+            fprintf(fout, ", ");
+          fprintf(fout, "%s a%d", pp->arg[j].type.name, j + 1);
+        }
+        fprintf(fout, ");\n");
+      }
     }
     else if (po->op == OP_RET && !IS(g_func_pp->ret_type.name, "void"))
       regmask |= 1 << xAX;
@@ -3099,10 +3271,6 @@ tailcall:
     if (g_func_pp->arg[i].reg != NULL) {
       reg = char_array_i(regs_r32,
               ARRAY_SIZE(regs_r32), g_func_pp->arg[i].reg);
-      if (reg < 0)
-        ferr(ops, "arg '%s' is not a reg?\n", g_func_pp->arg[i].reg);
-
-      regmask_arg |= 1 << reg;
       if (regmask & (1 << reg)) {
         fprintf(fout, "  u32 %s = (u32)a%d;\n",
           g_func_pp->arg[i].reg, i + 1);
@@ -3607,10 +3775,9 @@ tailcall:
       case OP_CALL:
         assert_operand_cnt(1);
         pp = po->datap;
-        if (pp == NULL)
-          ferr(po, "NULL pp\n");
+        my_assert_not(pp, NULL);
 
-        if (po->operand[0].type != OPT_LABEL)
+        if (pp->is_fptr)
           fprintf(fout, "  icall%d = %s;\n", i,
             out_src_opr(buf1, sizeof(buf1), po, &po->operand[0],
               "(void *)", 0));
@@ -3636,7 +3803,7 @@ tailcall:
           }
         }
 
-        if (po->operand[0].type != OPT_LABEL) {
+        if (pp->is_fptr) {
           fprintf(fout, "icall%d(", i);
         }
         else {
@@ -3680,8 +3847,13 @@ tailcall:
           fprintf(fout, "  eax = mul_tmp;");
         }
 
+        if (pp->is_unresolved) {
+          snprintf(buf3, sizeof(buf3), "unresoved %dreg ",
+            pp->argc_reg);
+          strcat(g_comment, buf3);
+        }
+
         if (po->flags & OPF_TAIL) {
-          strcpy(g_comment, "tailcall");
           ret = 0;
           if (i == opcnt - 1)
             ret = 0;
@@ -3695,8 +3867,10 @@ tailcall:
             if (!IS(g_func_pp->ret_type.name, "void"))
               ferr(po, "int func -> void func tailcall?\n");
             fprintf(fout, "\n  return;");
-            strcpy(g_comment, "^ tailcall");
+            strcat(g_comment, "^ tailcall");
           }
+          else
+            strcat(g_comment, "tailcall");
         }
         delayed_flag_op = NULL;
         last_arith_dst = NULL;
@@ -3778,7 +3952,7 @@ tailcall:
 
     // see is delayed flag stuff is still valid
     if (delayed_flag_op != NULL && delayed_flag_op != po) {
-      if (is_any_opr_modified(delayed_flag_op, po))
+      if (is_any_opr_modified(delayed_flag_op, po, 0))
         delayed_flag_op = NULL;
     }
 
@@ -3972,20 +4146,24 @@ int main(int argc, char *argv[])
   int eq_alloc;
   int verbose = 0;
   int arg_out;
-  int arg = 1;
+  int arg;
   int pi = 0;
   int i, j;
   int ret, len;
   char *p;
   int wordc;
 
-  if (argv[1] && IS(argv[1], "-v")) {
-    verbose = 1;
-    arg++;
+  for (arg = 1; arg < argc; arg++) {
+    if (IS(argv[arg], "-v"))
+      verbose = 1;
+    else if (IS(argv[arg], "-rf"))
+      g_allow_regfunc = 1;
+    else
+      break;
   }
 
   if (argc < arg + 3) {
-    printf("usage:\n%s [-v] <.c> <.asm> <hdrf> [rlist]*\n",
+    printf("usage:\n%s [-v] [-rf] <.c> <.asm> <hdrf> [rlist]*\n",
       argv[0]);
     return 1;
   }
@@ -4021,8 +4199,11 @@ int main(int argc, char *argv[])
       if (*p == 0 || *p == ';')
         continue;
       if (*p == '#') {
-        if (IS_START(p, "#if 0"))
+        if (IS_START(p, "#if 0")
+         || (g_allow_regfunc && IS_START(p, "#if NO_REGFUNC")))
+        {
           skip_func = 1;
+        }
         else if (IS_START(p, "#endif"))
           skip_func = 0;
         continue;

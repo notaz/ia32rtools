@@ -30,6 +30,7 @@ struct parsed_proto {
 	unsigned int is_vararg:1;
 	unsigned int is_fptr:1;
 	unsigned int is_noreturn:1;
+	unsigned int is_unresolved:1;
 	unsigned int has_structarg:1;
 };
 
@@ -311,6 +312,10 @@ static int parse_protostr(char *protostr, struct parsed_proto *pp)
 	if (!strncmp(p, "DECLSPEC_NORETURN ", 18)) {
 		pp->is_noreturn = 1;
 		p = sskip(p + 18);
+	}
+	else if (!strncmp(p, "noreturn ", 9)) {
+		pp->is_noreturn = 1;
+		p = sskip(p + 9);
 	}
 
 	for (i = 0; i < ARRAY_SIZE(ignored_keywords); i++) {
