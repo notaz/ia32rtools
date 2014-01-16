@@ -40,7 +40,7 @@ enum op_flags {
   OPF_REPZ   = (1 << 8), /* rep is repe/repz */
   OPF_REPNZ  = (1 << 9), /* rep is repne/repnz */
   OPF_FARG   = (1 << 10), /* push collected as func arg (no reuse) */
-  OPF_EBP_S  = (1 << 11), /* ebp used as scratch, not BP */
+  OPF_EBP_S  = (1 << 11), /* ebp used as scratch here, not BP */
 };
 
 enum op_op {
@@ -444,9 +444,9 @@ static int guess_lmod_from_c_type(enum opr_lenmod *lmod,
   const struct parsed_type *c_type)
 {
   static const char *dword_types[] = {
-    "int", "_DWORD", "UINT_PTR",
-    "DWORD", "HANDLE", "HWND", "HMODULE",
+    "int", "_DWORD", "UINT_PTR", "DWORD",
     "WPARAM", "LPARAM", "UINT",
+    "HIMC",
   };
   static const char *word_types[] = {
     "uint16_t", "int16_t", "_WORD",
@@ -1934,15 +1934,13 @@ static int scan_for_pop(int i, int opcnt, const char *reg,
     if ((po->flags & OPF_JMP) && po->op != OP_CALL) {
       if (po->btj != NULL) {
         // jumptable
-        for (j = 0; j < po->btj->count - 1; j++) {
+        for (j = 0; j < po->btj->count; j++) {
           ret |= scan_for_pop(po->btj->d[j].bt_i, opcnt, reg, magic,
                    depth, maxdepth, do_flags);
           if (ret < 0)
             return ret; // dead end
         }
-        // follow last jumptable entry
-        i = po->btj->d[j].bt_i - 1;
-        continue;
+        return ret;
       }
 
       if (po->bt_i < 0) {
@@ -1966,24 +1964,26 @@ static int scan_for_pop(int i, int opcnt, const char *reg,
         && po->operand[0].type == OPT_REG
         && IS(po->operand[0].name, reg))
     {
-      if (po->op == OP_PUSH) {
+      if (po->op == OP_PUSH && !(po->flags & OPF_FARG)) {
         depth++;
         if (depth > *maxdepth)
           *maxdepth = depth;
         if (do_flags)
           op_set_clear_flag(po, OPF_RSAVE, OPF_RMD);
       }
-      else if (depth == 0) {
-        if (do_flags)
-          op_set_clear_flag(po, OPF_RMD, OPF_RSAVE);
-        return 1;
-      }
-      else {
-        depth--;
-        if (depth < 0) // should not happen
-          ferr(po, "fail with depth\n");
-        if (do_flags)
-          op_set_clear_flag(po, OPF_RSAVE, OPF_RMD);
+      else if (po->op == OP_POP) {
+        if (depth == 0) {
+          if (do_flags)
+            op_set_clear_flag(po, OPF_RMD, OPF_RSAVE);
+          return 1;
+        }
+        else {
+          depth--;
+          if (depth < 0) // should not happen
+            ferr(po, "fail with depth\n");
+          if (do_flags)
+            op_set_clear_flag(po, OPF_RSAVE, OPF_RMD);
+        }
       }
     }
   }
@@ -2181,8 +2181,6 @@ static int scan_for_cdq_edx(int i)
 
     if (ops[i].regmask_dst & (1 << xDX))
       return -1;
-    if (g_labels[i][0] != 0)
-      return -1;
   }
 
   return -1;
@@ -2209,8 +2207,6 @@ static int scan_for_reg_clear(int i, int reg)
       return i;
 
     if (ops[i].regmask_dst & (1 << reg))
-      return -1;
-    if (g_labels[i][0] != 0)
       return -1;
   }
 
@@ -2304,7 +2300,7 @@ static void scan_fwd_set_flags(int i, int opcnt, int magic, int flags)
 }
 
 static const struct parsed_proto *try_recover_pp(
-  struct parsed_op *po, const struct parsed_opr *opr)
+  struct parsed_op *po, const struct parsed_opr *opr, int *search_instead)
 {
   const struct parsed_proto *pp = NULL;
   char buf[256];
@@ -2322,8 +2318,12 @@ static const struct parsed_proto *try_recover_pp(
       &offset, &stack_ra, NULL);
     if (ofs_reg[0] != 0)
       ferr(po, "offset reg on arg access?\n");
-    if (offset <= stack_ra)
-      ferr(po, "stack var call unhandled yet\n");
+    if (offset <= stack_ra) {
+      // search who set the stack var instead
+      if (search_instead != NULL)
+        *search_instead = 1;
+      return NULL;
+    }
 
     arg_i = (offset - stack_ra - 4) / 4;
     for (arg = arg_s = 0; arg < g_func_pp->argc; arg++) {
@@ -2358,7 +2358,7 @@ static const struct parsed_proto *try_recover_pp(
   return pp;
 }
 
-static void scan_for_call_type(int i, struct parsed_opr *opr,
+static void scan_for_call_type(int i, const struct parsed_opr *opr,
   int magic, const struct parsed_proto **pp_found, int *multi)
 {
   const struct parsed_proto *pp = NULL;
@@ -2416,7 +2416,7 @@ static void scan_for_call_type(int i, struct parsed_opr *opr,
     check_func_pp(po, pp, "icall reg-arg");
   }
   else
-    pp = try_recover_pp(po, opr);
+    pp = try_recover_pp(po, opr, NULL);
 
   if (*pp_found != NULL && pp != NULL && *pp_found != pp) {
     if (!IS((*pp_found)->ret_type.name, pp->ret_type.name)
@@ -2438,6 +2438,7 @@ static const struct parsed_proto *resolve_icall(int i, int opcnt,
   int *multi_src)
 {
   const struct parsed_proto *pp = NULL;
+  int search_advice = 0;
 
   *multi_src = 0;
 
@@ -2445,8 +2446,10 @@ static const struct parsed_proto *resolve_icall(int i, int opcnt,
   case OPT_REGMEM:
   case OPT_LABEL:
   case OPT_OFFSET:
-    pp = try_recover_pp(&ops[i], &ops[i].operand[0]);
-    break;
+    pp = try_recover_pp(&ops[i], &ops[i].operand[0], &search_advice);
+    if (!search_advice)
+      break;
+    // fallthrough
   default:
     scan_for_call_type(i, &ops[i].operand[0], i + opcnt * 9, &pp,
       multi_src);
@@ -2580,6 +2583,8 @@ static int collect_call_args_r(struct parsed_op *po, int i,
       // can be removed from future searches (handles nested calls)
       if (!may_reuse)
         ops[j].flags |= OPF_FARG;
+
+      ops[j].flags &= ~OPF_RSAVE;
 
       arg++;
       if (!pp->is_unresolved) {
@@ -2887,8 +2892,11 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
         pp_c = proto_parse(fhdr, tmpname, 0);
         if (pp_c == NULL)
           ferr(po, "proto_parse failed for call '%s'\n", tmpname);
-        if (pp_c->is_fptr && pp_c->argc_reg != 0)
-          ferr(po, "fptr call with reg arg\n");
+        if (pp_c->is_fptr)
+          check_func_pp(po, pp_c, "fptr var call");
+        if (pp_c->is_noreturn)
+          po->flags |= OPF_TAIL;
+
         pp = proto_clone(pp_c);
         my_assert_not(pp, NULL);
         po->datap = pp;
@@ -3231,6 +3239,22 @@ tailcall:
     else if (po->op == OP_RET && !IS(g_func_pp->ret_type.name, "void"))
       regmask |= 1 << xAX;
   }
+
+  // pass4:
+  // - confirm regmask_save, it might have been reduced
+  if (regmask_save != 0)
+  {
+    regmask_save = 0;
+    for (i = 0; i < opcnt; i++) {
+      po = &ops[i];
+      if (po->flags & OPF_RMD)
+        continue;
+
+      if (po->op == OP_PUSH && (po->flags & OPF_RSAVE))
+        regmask_save |= 1 << po->operand[0].reg;
+    }
+  }
+
 
   // output LUTs/jumptables
   for (i = 0; i < g_func_pd_cnt; i++) {
@@ -3864,10 +3888,15 @@ tailcall:
           // else already handled as 'return f()'
 
           if (ret) {
-            if (!IS(g_func_pp->ret_type.name, "void"))
-              ferr(po, "int func -> void func tailcall?\n");
-            fprintf(fout, "\n  return;");
-            strcat(g_comment, "^ tailcall");
+            if (!IS(g_func_pp->ret_type.name, "void")) {
+              if (!pp->is_noreturn)
+                ferr(po, "int func -> void func tailcall?\n");
+              strcat(g_comment, "tailcall noreturn");
+            }
+            else {
+              fprintf(fout, "\n  return;");
+              strcat(g_comment, "^ tailcall");
+            }
           }
           else
             strcat(g_comment, "tailcall");
@@ -4410,6 +4439,11 @@ do_pending_endp:
           i = 2;
         }
         else {
+          if (pd == NULL) {
+            if (verbose)
+              anote("skipping alignment byte?\n");
+            continue;
+          }
           lmod = lmod_from_directive(words[0]);
           if (lmod != pd->lmod)
             aerr("lmod change? %d->%d\n", pd->lmod, lmod);

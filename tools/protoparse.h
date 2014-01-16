@@ -140,6 +140,7 @@ static const char *known_type_mod[] = {
 };
 
 static const char *known_ptr_types[] = {
+	"FARPROC",
 	"HACCEL",
 	"HANDLE",
 	"HBITMAP",
@@ -148,9 +149,11 @@ static const char *known_ptr_types[] = {
 	"HFONT",
 	"HGDIOBJ",
 	"HGLOBAL",
+	"HICON",
 	"HINSTANCE",
-	"HIMC",
+	//"HIMC", // DWORD
 	"HMODULE",
+	"HPALETTE",
 	"HRGN",
 	"HRSRC",
 	"HKEY",
@@ -313,10 +316,6 @@ static int parse_protostr(char *protostr, struct parsed_proto *pp)
 		pp->is_noreturn = 1;
 		p = sskip(p + 18);
 	}
-	else if (!strncmp(p, "noreturn ", 9)) {
-		pp->is_noreturn = 1;
-		p = sskip(p + 9);
-	}
 
 	for (i = 0; i < ARRAY_SIZE(ignored_keywords); i++) {
 		l = strlen(ignored_keywords[i]);
@@ -331,6 +330,11 @@ static int parse_protostr(char *protostr, struct parsed_proto *pp)
 		return -1;
 	}
 	p = sskip(p + ret);
+
+	if (!strncmp(p, "noreturn ", 9)) {
+		pp->is_noreturn = 1;
+		p = sskip(p + 9);
+	}
 
 	if (!strchr(p, ')')) {
 		p = next_idt(buf, sizeof(buf), p);
