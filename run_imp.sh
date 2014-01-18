@@ -2,8 +2,8 @@
 
 grep 'extrn ' StarCraft.asm | awk '{print $2}' | awk -F: '{print $1}' > implist
 
-echo ".data" > tramp.s
-echo ".align 4" >> tramp.s
+echo ".data" > $1
+echo ".align 4" >> $1
 
 cat implist | while read i; do
   rm -f tmpsym
@@ -30,8 +30,8 @@ cat implist | while read i; do
     exit 1
   fi
 
-  echo ".globl $i" >> tramp.s
-  echo "$i:" >> tramp.s
-  echo "  .long $sym" >> tramp.s
-  echo >> tramp.s
+  echo ".globl $i" >> $1
+  echo "$i:" >> $1
+  echo "  .long $sym" >> $1
+  echo >> $1
 done

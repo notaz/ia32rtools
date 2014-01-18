@@ -610,8 +610,10 @@ static int b_pp_c_handler(char *proto, const char *fname)
 
 static void build_pp_cache(FILE *fhdr)
 {
+	long pos;
 	int ret;
 
+	pos = ftell(fhdr);
 	rewind(fhdr);
 
 	ret = do_protostrs(fhdr, hdrfn);
@@ -619,6 +621,7 @@ static void build_pp_cache(FILE *fhdr)
 		exit(1);
 
 	qsort(pp_cache, pp_cache_size, sizeof(pp_cache[0]), pp_name_cmp);
+	fseek(fhdr, pos, SEEK_SET);
 }
 
 static const struct parsed_proto *proto_parse(FILE *fhdr, const char *sym,
