@@ -255,7 +255,8 @@ static void sprint_pp_short(const struct parsed_proto *pp, char *buf,
   snprintf(buf + l, buf_size - l, ")");
 }
 
-static void check_var(FILE *fhdr, const char *sym, const char *varname)
+static const struct parsed_proto *check_var(FILE *fhdr,
+  const char *sym, const char *varname)
 {
   const struct parsed_proto *pp, *pp_sym;
   char fp_sym[256], fp_var[256];
@@ -265,11 +266,11 @@ static void check_var(FILE *fhdr, const char *sym, const char *varname)
   if (pp == NULL) {
     if (IS_START(varname, "sub_"))
       awarn("sub_ sym missing proto: '%s'\n", varname);
-    return;
+    return NULL;
   }
 
   if (!pp->is_func && !pp->is_fptr)
-    return;
+    return NULL;
 
   sprint_pp(pp, fp_var, sizeof(fp_var));
 
@@ -294,7 +295,7 @@ check_sym:
     g_func_sym_pp = NULL;
     pp_sym = proto_parse(fhdr, sym, 1);
     if (pp_sym == NULL)
-      return;
+      return pp;
     if (!pp_sym->is_fptr)
       aerr("func ptr data, but label '%s' !is_fptr\n", pp_sym->name);
     g_func_sym_pp = pp_sym;
@@ -302,7 +303,7 @@ check_sym:
   else {
     pp_sym = g_func_sym_pp;
     if (pp_sym == NULL)
-      return;
+      return pp;
   }
 
   if (pp->argc != pp_sym->argc || pp->argc_reg != pp_sym->argc_reg)
@@ -328,6 +329,8 @@ check_sym:
     anote("sym: %s\n", fp_sym);
     awarn("^ mismatch\n");
   }
+
+  return pp;
 }
 
 static int cmpstringp(const void *p1, const void *p2)
@@ -625,10 +628,12 @@ int main(int argc, char *argv[])
             snprintf(g_comment, sizeof(g_comment), "%s", p);
           }
           else {
-            check_var(fhdr, sym, p);
+            pp = check_var(fhdr, sym, p);
             if (p[0] != '_')
-              fprintf(fout, "_");
+              fprintf(fout, (pp && pp->is_fastcall) ? "@" : "_");
             fprintf(fout, "%s", p);
+            if (pp && pp->is_stdcall && pp->argc > 0)
+              fprintf(fout, "@%d", pp->argc * 4);
           }
         }
         else {

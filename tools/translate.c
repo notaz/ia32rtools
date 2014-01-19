@@ -1451,7 +1451,7 @@ static void check_func_pp(struct parsed_op *po,
   const struct parsed_proto *pp, const char *pfx)
 {
   if (pp->argc_reg != 0) {
-    if (!g_allow_regfunc)
+    if (!g_allow_regfunc && !pp->is_fastcall)
       ferr(po, "%s: reg arg in arg-call unhandled yet\n", pfx);
     if (pp->argc_stack > 0 && pp->argc_reg != 2)
       ferr(po, "%s: %d reg arg(s) with %d stack arg(s)\n",
@@ -2689,6 +2689,17 @@ static void output_std_flags(FILE *fout, struct parsed_op *po,
   }
 }
 
+static void output_pp_attrs(FILE *fout, const struct parsed_proto *pp,
+  int is_noreturn)
+{
+  if (pp->is_fastcall)
+    fprintf(fout, "__fastcall ");
+  else if (pp->is_stdcall && pp->argc_reg == 0)
+    fprintf(fout, "__stdcall ");
+  if (pp->is_noreturn || is_noreturn)
+    fprintf(fout, "noreturn ");
+}
+
 static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
 {
   struct parsed_op *po, *delayed_flag_op = NULL, *tmp_op;
@@ -2727,10 +2738,7 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
     ferr(ops, "proto_parse failed for '%s'\n", funcn);
 
   fprintf(fout, "%s ", g_func_pp->ret_type.name);
-  if (g_func_pp->is_stdcall && g_func_pp->argc_reg == 0)
-    fprintf(fout, "__stdcall ");
-  if (g_ida_func_attr & IDAFA_NORETURN)
-    fprintf(fout, "noreturn ");
+  output_pp_attrs(fout, g_func_pp, g_ida_func_attr & IDAFA_NORETURN);
   fprintf(fout, "%s(", funcn);
 
   for (i = 0; i < g_func_pp->argc; i++) {
@@ -2740,8 +2748,7 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
       // func pointer..
       pp = g_func_pp->arg[i].fptr;
       fprintf(fout, "%s (", pp->ret_type.name);
-      if (pp->is_stdcall && pp->argc_reg == 0)
-        fprintf(fout, "__stdcall ");
+      output_pp_attrs(fout, pp, 0);
       fprintf(fout, "*a%d)(", i + 1);
       for (j = 0; j < pp->argc; j++) {
         if (j > 0)
@@ -3213,9 +3220,10 @@ tailcall:
           && (regmask_stack & (1 << xDX))))
         {
           if (pp->argc_stack != 0
-           || ((regmask | regmask_arg) & (1 << xCX)))
+           || ((regmask | regmask_arg) & ((1 << xCX)|(1 << xDX))))
           {
             pp_insert_reg_arg(pp, "ecx");
+            pp->is_fastcall = 1;
             regmask_init |= 1 << xCX;
             regmask |= 1 << xCX;
           }
@@ -3228,6 +3236,10 @@ tailcall:
           }
         }
         regmask |= regmask_stack;
+
+        // note: __cdecl doesn't fall into is_unresolved category
+        if (pp->argc_stack > 0)
+          pp->is_stdcall = 1;
       }
 
       for (arg = 0; arg < pp->argc; arg++) {
@@ -3265,8 +3277,7 @@ tailcall:
           snprintf(pp->name, sizeof(pp->name), "icall%d", i);
 
         fprintf(fout, "  %s (", pp->ret_type.name);
-        if (pp->is_stdcall && pp->argc_reg == 0)
-          fprintf(fout, "__stdcall ");
+        output_pp_attrs(fout, pp, 0);
         fprintf(fout, "*%s)(", pp->name);
         for (j = 0; j < pp->argc; j++) {
           if (j > 0)

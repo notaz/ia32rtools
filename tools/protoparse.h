@@ -27,6 +27,7 @@ struct parsed_proto {
 	int argc_reg;
 	unsigned int is_func:1;
 	unsigned int is_stdcall:1;
+	unsigned int is_fastcall:1;
 	unsigned int is_vararg:1;
 	unsigned int is_fptr:1;
 	unsigned int is_noreturn:1;
@@ -372,8 +373,10 @@ static int parse_protostr(char *protostr, struct parsed_proto *pp)
 		pp->is_stdcall = 0;
 	else if (IS(cconv, "__stdcall"))
 		pp->is_stdcall = 1;
-	else if (IS(cconv, "__fastcall"))
-		pp->is_stdcall = 1;
+	else if (IS(cconv, "__fastcall")) {
+		pp->is_fastcall = 1;
+		pp->is_stdcall = 1; // sort of..
+	}
 	else if (IS(cconv, "__thiscall"))
 		pp->is_stdcall = 1;
 	else if (IS(cconv, "__userpurge"))
@@ -559,11 +562,6 @@ static int parse_protostr(char *protostr, struct parsed_proto *pp)
 		pp->arg[1].reg = strdup("edx");
 	}
 
-	if (pp->is_vararg && pp->is_stdcall) {
-		printf("%s:%d: vararg stdcall?\n", hdrfn, hdrfline);
-		return -1;
-	}
-
 	pp->argc = xarg;
 
 	for (i = 0; i < pp->argc; i++) {
@@ -571,6 +569,23 @@ static int parse_protostr(char *protostr, struct parsed_proto *pp)
 			pp->argc_stack++;
 		else
 			pp->argc_reg++;
+	}
+
+	if (pp->argc == 1 && pp->arg[0].reg != NULL
+	    && IS(pp->arg[0].reg, "ecx"))
+	{
+		pp->is_fastcall = 1;
+	}
+	else if (pp->argc_reg == 2
+	  && pp->arg[0].reg != NULL && IS(pp->arg[0].reg, "ecx")
+	  && pp->arg[1].reg != NULL && IS(pp->arg[1].reg, "edx"))
+	{
+		pp->is_fastcall = 1;
+	}
+
+	if (pp->is_vararg && (pp->is_stdcall || pp->is_fastcall)) {
+		printf("%s:%d: vararg %s?\n", hdrfn, hdrfline, cconv);
+		return -1;
 	}
 
 	return p - protostr;

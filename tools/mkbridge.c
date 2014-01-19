@@ -41,10 +41,13 @@ static void out_toasm_x86(FILE *f, const char *sym_in,
 			must_save |= is_x86_reg_saved(pp->arg[i].reg);
 	}
 
-	fprintf(f, ".global _%s\n", sym_in);
-	fprintf(f, "_%s:\n", sym_in);
+	fprintf(f, ".global %s%s\n", pp->is_fastcall ? "@" : "_", sym_in);
+	fprintf(f, "%s%s:\n", pp->is_fastcall ? "@" : "_", sym_in);
 
-	if (pp->argc_reg == 0) {
+	if (pp->argc_reg == 0 || pp->is_fastcall) {
+		fprintf(f, "\t# %s\n",
+		  pp->is_fastcall ? "__fastcall" :
+		  (pp->is_stdcall ? "__stdcall" : "__cdecl"));
 		fprintf(f, "\tjmp %s\n\n", sym_out);
 		return;
 	}
@@ -123,15 +126,17 @@ static void out_fromasm_x86(FILE *f, const char *sym,
 
 	ret64 = strstr(pp->ret_type.name, "int64") != NULL;
 
-	fprintf(f, "# %s", pp->is_stdcall ? "__stdcall" : "__cdecl");
+	fprintf(f, "# %s",
+	  pp->is_fastcall ? "__fastcall" :
+	  (pp->is_stdcall ? "__stdcall" : "__cdecl"));
 	if (ret64)
 		 fprintf(f, " ret64");
 	fprintf(f, "\n.global %s\n", sym);
 	fprintf(f, "%s:\n", sym);
 
-	if (pp->argc_reg == 0) {
-		//fprintf(f, "\tjmp _%s\n\n", sym);
-		fprintf(f, "\tjmp _%s", sym);
+	if (pp->argc_reg == 0 || pp->is_fastcall) {
+		fprintf(f, "\tjmp %s%s",
+			pp->is_fastcall ? "@" : "_", sym);
 		if (pp->is_stdcall && pp->argc > 0)
 			fprintf(f, "@%d", pp->argc * 4);
 		fprintf(f, "\n\n");
