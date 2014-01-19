@@ -616,7 +616,8 @@ int main(int argc, char *argv[])
         }
         else if (is_label) {
           p = words[w];
-          if (IS_START(p, "loc_") || strchr(p, '?') || strchr(p, '@')
+          if (IS_START(p, "loc_") || IS_START(p, "__imp")
+             || strchr(p, '?') || strchr(p, '@')
              || bsearch(&p, rlist, rlist_cnt, sizeof(rlist[0]),
                   cmpstringp))
           {
@@ -625,7 +626,9 @@ int main(int argc, char *argv[])
           }
           else {
             check_var(fhdr, sym, p);
-            fprintf(fout, "_%s", p);
+            if (p[0] != '_')
+              fprintf(fout, "_");
+            fprintf(fout, "%s", p);
           }
         }
         else {

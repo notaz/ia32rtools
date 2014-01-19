@@ -126,6 +126,7 @@ struct parsed_opr {
   unsigned int type_from_var:1; // .. in header, sometimes wrong
   unsigned int size_mismatch:1; // type override differs from C
   unsigned int size_lt:1;  // type override is larger than C
+  unsigned int had_ds:1;   // had ds: prefix
   int reg;
   unsigned int val;
   char name[256];
@@ -147,7 +148,7 @@ struct parsed_op {
 };
 
 // datap:
-// OP_CALL - ptr to parsed_proto
+// OP_CALL - parser proto hint (str), ptr to struct parsed_proto
 // (OPF_CC) - point to one of (OPF_FLAGS) that affects cc op
 
 struct parsed_equ {
@@ -562,8 +563,10 @@ static int parse_operand(struct parsed_opr *opr,
 
     if (label != NULL) {
       opr->type = OPT_LABEL;
-      if (IS_START(label, "ds:"))
+      if (IS_START(label, "ds:")) {
+        opr->had_ds = 1;
         label += 3;
+      }
       strcpy(opr->name, label);
       return wordc;
     }
@@ -604,8 +607,10 @@ static int parse_operand(struct parsed_opr *opr,
   if (wordc_in != 1)
     aerr("parse_operand 1 word expected\n");
 
-  if (IS_START(words[w], "ds:"))
+  if (IS_START(words[w], "ds:")) {
+    opr->had_ds = 1;
     memmove(words[w], words[w] + 3, strlen(words[w]) - 2);
+  }
   strcpy(opr->name, words[w]);
 
   if (words[w][0] == '[') {
@@ -1569,8 +1574,11 @@ static char *out_src_opr(char *buf, size_t buf_size,
       ferr(po, "lea from const?\n");
 
     printf_number(tmp1, sizeof(tmp1), popr->val);
-    snprintf(buf, buf_size, "%s%s",
-      simplify_cast_num(cast, popr->val), tmp1);
+    if (popr->val == 0 && strchr(cast, '*'))
+      snprintf(buf, buf_size, "NULL");
+    else
+      snprintf(buf, buf_size, "%s%s",
+        simplify_cast_num(cast, popr->val), tmp1);
     break;
 
   default:
@@ -2687,7 +2695,7 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
   struct parsed_opr *last_arith_dst = NULL;
   char buf1[256], buf2[256], buf3[256], cast[64];
   const struct parsed_proto *pp_c;
-  struct parsed_proto *pp;
+  struct parsed_proto *pp, *pp_tmp;
   struct parsed_data *pd;
   const char *tmpname;
   enum parsed_flag_op pfo;
@@ -2699,6 +2707,7 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
   int regmask_save = 0;
   int regmask_arg = 0;
   int regmask_now = 0;
+  int regmask_init = 0;
   int regmask = 0;
   int pfomask = 0;
   int found = 0;
@@ -2885,6 +2894,8 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
       continue;
 
     if (po->op == OP_CALL) {
+      pp = NULL;
+
       if (po->operand[0].type == OPT_LABEL) {
         tmpname = opr_name(po, 0);
         if (IS_START(tmpname, "loc_"))
@@ -2892,13 +2903,26 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
         pp_c = proto_parse(fhdr, tmpname, 0);
         if (pp_c == NULL)
           ferr(po, "proto_parse failed for call '%s'\n", tmpname);
-        if (pp_c->is_fptr)
-          check_func_pp(po, pp_c, "fptr var call");
-        if (pp_c->is_noreturn)
-          po->flags |= OPF_TAIL;
 
         pp = proto_clone(pp_c);
         my_assert_not(pp, NULL);
+      }
+      else if (po->datap != NULL) {
+        pp = calloc(1, sizeof(*pp));
+        my_assert_not(pp, NULL);
+
+        ret = parse_protostr(po->datap, pp);
+        if (ret < 0)
+          ferr(po, "bad protostr supplied: %s\n", (char *)po->datap);
+        free(po->datap);
+        po->datap = NULL;
+      }
+
+      if (pp != NULL) {
+        if (pp->is_fptr)
+          check_func_pp(po, pp, "fptr var call");
+        if (pp->is_noreturn)
+          po->flags |= OPF_TAIL;
         po->datap = pp;
       }
       continue;
@@ -3046,25 +3070,6 @@ tailcall:
         ferr(po, "missing esp_adjust for vararg func '%s'\n",
           pp->name);
 
-      for (arg = 0; arg < pp->argc; arg++) {
-        if (pp->arg[arg].reg != NULL) {
-          reg = char_array_i(regs_r32,
-                  ARRAY_SIZE(regs_r32), pp->arg[arg].reg);
-          if (reg < 0)
-            ferr(ops, "arg '%s' is not a reg?\n", pp->arg[arg].reg);
-          regmask |= 1 << reg;
-        }
-#if 0
-        if (pp->arg[arg].fptr != NULL) {
-          // can't call functions with non-__cdecl callbacks yet
-          struct parsed_proto *pp_tmp;
-          pp_tmp = pp->arg[arg].fptr;
-          if (pp_tmp->argc_reg != 0)
-            ferr(po, "'%s' has a callback with reg-args\n", tmpname);
-        }
-#endif
-      }
-
       if (!pp->is_unresolved) {
         // since we know the args, collect them
         collect_call_args(po, i, pp, &regmask, &save_arg_vars,
@@ -3200,34 +3205,69 @@ tailcall:
         ferr(po, "NULL pp\n");
 
       if (pp->is_unresolved) {
-        int regmask_push = 0;
-        collect_call_args(po, i, pp, &regmask_push, &save_arg_vars,
+        int regmask_stack = 0;
+        collect_call_args(po, i, pp, &regmask_stack, &save_arg_vars,
           i + opcnt * 2);
 
-        if (!((regmask_push & (1 << xCX))
-          && (regmask_push & (1 << xDX))))
+        if (!((regmask_stack & (1 << xCX))
+          && (regmask_stack & (1 << xDX))))
         {
           if (pp->argc_stack != 0
            || ((regmask | regmask_arg) & (1 << xCX)))
           {
             pp_insert_reg_arg(pp, "ecx");
+            regmask_init |= 1 << xCX;
             regmask |= 1 << xCX;
           }
           if (pp->argc_stack != 0
            || ((regmask | regmask_arg) & (1 << xDX)))
           {
             pp_insert_reg_arg(pp, "edx");
+            regmask_init |= 1 << xDX;
             regmask |= 1 << xDX;
           }
         }
-        regmask |= regmask_push;
+        regmask |= regmask_stack;
+      }
+
+      for (arg = 0; arg < pp->argc; arg++) {
+        if (pp->arg[arg].reg != NULL) {
+          reg = char_array_i(regs_r32,
+                  ARRAY_SIZE(regs_r32), pp->arg[arg].reg);
+          if (reg < 0)
+            ferr(ops, "arg '%s' is not a reg?\n", pp->arg[arg].reg);
+          if (!(regmask & (1 << reg))) {
+            regmask_init |= 1 << reg;
+            regmask |= 1 << reg;
+          }
+        }
       }
 
       if (pp->is_fptr) {
+        if (pp->name[0] != 0) {
+          memmove(pp->name + 2, pp->name, strlen(pp->name) + 1);
+          memcpy(pp->name, "i_", 2);
+
+          // might be declared already
+          found = 0;
+          for (j = 0; j < i; j++) {
+            if (ops[j].op == OP_CALL && (pp_tmp = ops[j].datap)) {
+              if (pp_tmp->is_fptr && IS(pp->name, pp_tmp->name)) {
+                found = 1;
+                break;
+              }
+            }
+          }
+          if (found)
+            continue;
+        }
+        else
+          snprintf(pp->name, sizeof(pp->name), "icall%d", i);
+
         fprintf(fout, "  %s (", pp->ret_type.name);
         if (pp->is_stdcall && pp->argc_reg == 0)
           fprintf(fout, "__stdcall ");
-        fprintf(fout, "*icall%d)(", i);
+        fprintf(fout, "*%s)(", pp->name);
         for (j = 0; j < pp->argc; j++) {
           if (j > 0)
             fprintf(fout, ", ");
@@ -3311,7 +3351,10 @@ tailcall:
   if (regmask_now) {
     for (reg = 0; reg < 8; reg++) {
       if (regmask_now & (1 << reg)) {
-        fprintf(fout, "  u32 %s;\n", regs_r32[reg]);
+        fprintf(fout, "  u32 %s", regs_r32[reg]);
+        if (regmask_init & (1 << reg))
+          fprintf(fout, " = 0");
+        fprintf(fout, ";\n");
         had_decl = 1;
       }
     }
@@ -3802,7 +3845,7 @@ tailcall:
         my_assert_not(pp, NULL);
 
         if (pp->is_fptr)
-          fprintf(fout, "  icall%d = %s;\n", i,
+          fprintf(fout, "  %s = %s;\n", pp->name,
             out_src_opr(buf1, sizeof(buf1), po, &po->operand[0],
               "(void *)", 0));
 
@@ -3827,15 +3870,10 @@ tailcall:
           }
         }
 
-        if (pp->is_fptr) {
-          fprintf(fout, "icall%d(", i);
-        }
-        else {
-          if (pp->name[0] == 0)
-            ferr(po, "missing pp->name\n");
-          fprintf(fout, "%s%s(", pp->name,
-            pp->has_structarg ? "_sa" : "");
-        }
+        if (pp->name[0] == 0)
+          ferr(po, "missing pp->name\n");
+        fprintf(fout, "%s%s(", pp->name,
+          pp->has_structarg ? "_sa" : "");
 
         for (arg = 0; arg < pp->argc; arg++) {
           if (arg > 0)
@@ -3872,14 +3910,14 @@ tailcall:
         }
 
         if (pp->is_unresolved) {
-          snprintf(buf3, sizeof(buf3), "unresoved %dreg ",
+          snprintf(buf3, sizeof(buf3), " unresoved %dreg",
             pp->argc_reg);
           strcat(g_comment, buf3);
         }
 
         if (po->flags & OPF_TAIL) {
           ret = 0;
-          if (i == opcnt - 1)
+          if (i == opcnt - 1 || pp->is_noreturn)
             ret = 0;
           else if (IS(pp->ret_type.name, "void"))
             ret = 1;
@@ -3889,18 +3927,18 @@ tailcall:
 
           if (ret) {
             if (!IS(g_func_pp->ret_type.name, "void")) {
-              if (!pp->is_noreturn)
-                ferr(po, "int func -> void func tailcall?\n");
-              strcat(g_comment, "tailcall noreturn");
+              ferr(po, "int func -> void func tailcall?\n");
             }
             else {
               fprintf(fout, "\n  return;");
-              strcat(g_comment, "^ tailcall");
+              strcat(g_comment, " ^ tailcall");
             }
           }
           else
-            strcat(g_comment, "tailcall");
+            strcat(g_comment, " tailcall");
         }
+        if (pp->is_noreturn)
+          strcat(g_comment, " noreturn");
         delayed_flag_op = NULL;
         last_arith_dst = NULL;
         break;
@@ -3962,7 +4000,10 @@ tailcall:
     }
 
     if (g_comment[0] != 0) {
-      fprintf(fout, "  // %s", g_comment);
+      char *p = g_comment;
+      while (my_isblank(*p))
+        p++;
+      fprintf(fout, "  // %s", p);
       g_comment[0] = 0;
       no_output = 0;
     }
@@ -4168,6 +4209,7 @@ int main(int argc, char *argv[])
   char line[256];
   char words[20][256];
   enum opr_lenmod lmod;
+  char *sctproto = NULL;
   int in_func = 0;
   int pending_endp = 0;
   int skip_func = 0;
@@ -4392,11 +4434,16 @@ parse_words:
       aerr("too many words\n");
 
     // alow asm patches in comments
-    if (*p == ';' && IS_START(p, "; sctpatch:")) {
-      p = sskip(p + 11);
-      if (*p == 0 || *p == ';')
-        continue;
-      goto parse_words; // lame
+    if (*p == ';') {
+      if (IS_START(p, "; sctpatch:")) {
+        p = sskip(p + 11);
+        if (*p == 0 || *p == ';')
+          continue;
+        goto parse_words; // lame
+      }
+      if (IS_START(p, "; sctproto:")) {
+        sctproto = strdup(p + 11);
+      }
     }
 
     if (wordc == 0) {
@@ -4509,8 +4556,7 @@ do_pending_endp:
         aerr("proc '%s' while in_func '%s'?\n",
           words[0], g_func);
       p = words[0];
-      if ((g_ida_func_attr & IDAFA_THUNK)
-       || bsearch(&p, rlist, rlist_len, sizeof(rlist[0]), cmpstringp))
+      if (bsearch(&p, rlist, rlist_len, sizeof(rlist[0]), cmpstringp))
         skip_func = 1;
       strcpy(g_func, words[0]);
       set_label(0, words[0]);
@@ -4525,6 +4571,13 @@ do_pending_endp:
       if (!IS(g_func, words[0]))
         aerr("endp '%s' while in_func '%s'?\n",
           words[0], g_func);
+
+      if ((g_ida_func_attr & IDAFA_THUNK) && pi == 1
+        && ops[0].op == OP_JMP && ops[0].operand[0].had_ds)
+      {
+        // import jump
+        skip_func = 1;
+      }
 
       if (!skip_func && func_chunks_used) {
         // start processing chunks
@@ -4576,7 +4629,8 @@ do_pending_endp:
       continue;
     }
 
-    if (wordc > 1 && IS(words[1], "=")) {
+    if (wordc > 1 && IS(words[1], "="))
+    {
       if (wordc != 5)
         aerr("unhandled equ, wc=%d\n", wordc);
       if (g_eqcnt >= eq_alloc) {
@@ -4610,6 +4664,12 @@ do_pending_endp:
       aerr("too many ops\n");
 
     parse_op(&ops[pi], words, wordc);
+
+    if (sctproto != NULL) {
+      if (ops[pi].op == OP_CALL)
+        ops[pi].datap = sctproto;
+      sctproto = NULL;
+    }
     pi++;
   }
 
