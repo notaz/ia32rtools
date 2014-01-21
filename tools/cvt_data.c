@@ -205,28 +205,6 @@ static char *escape_string(char *s)
   return strcpy(s, buf);
 }
 
-static void sprint_pp(const struct parsed_proto *pp, char *buf,
-  size_t buf_size)
-{
-  size_t l;
-  int i;
-
-  snprintf(buf, buf_size, "%s %s(", pp->ret_type.name, pp->name);
-  l = strlen(buf);
-
-  for (i = 0; i < pp->argc_reg; i++) {
-    snprintf(buf + l, buf_size - l, "%s%s",
-      i == 0 ? "" : ", ", pp->arg[i].reg);
-    l = strlen(buf);
-  }
-  if (pp->argc_stack > 0) {
-    snprintf(buf + l, buf_size - l, "%s{%d stack}",
-      i == 0 ? "" : ", ", pp->argc_stack);
-    l = strlen(buf);
-  }
-  snprintf(buf + l, buf_size - l, ")");
-}
-
 static void sprint_pp_short(const struct parsed_proto *pp, char *buf,
   size_t buf_size)
 {
@@ -272,7 +250,7 @@ static const struct parsed_proto *check_var(FILE *fhdr,
   if (!pp->is_func && !pp->is_fptr)
     return NULL;
 
-  sprint_pp(pp, fp_var, sizeof(fp_var));
+  pp_print(fp_var, sizeof(fp_var), pp);
 
   if (pp->argc_reg == 0)
     goto check_sym;
@@ -324,7 +302,7 @@ check_sym:
   }
 
   if (bad) {
-    sprint_pp(pp_sym, fp_sym, sizeof(fp_sym));
+    pp_print(fp_sym, sizeof(fp_sym), pp_sym);
     anote("var: %s\n", fp_var);
     anote("sym: %s\n", fp_sym);
     awarn("^ mismatch\n");

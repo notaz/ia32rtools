@@ -32,3 +32,7 @@
 
 #define noreturn __attribute__((noreturn))
 
+#ifdef __WINE__
+#define PCVOID LPCVOID
+#define __VALIST __ms_va_list
+#endif

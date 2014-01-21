@@ -698,6 +698,28 @@ struct parsed_proto *proto_clone(const struct parsed_proto *pp_c)
 	return pp;
 }
 
+static inline void pp_print(char *buf, size_t buf_size,
+  const struct parsed_proto *pp)
+{
+  size_t l;
+  int i;
+
+  snprintf(buf, buf_size, "%s %s(", pp->ret_type.name, pp->name);
+  l = strlen(buf);
+
+  for (i = 0; i < pp->argc_reg; i++) {
+    snprintf(buf + l, buf_size - l, "%s%s",
+      i == 0 ? "" : ", ", pp->arg[i].reg);
+    l = strlen(buf);
+  }
+  if (pp->argc_stack > 0) {
+    snprintf(buf + l, buf_size - l, "%s{%d stack}",
+      i == 0 ? "" : ", ", pp->argc_stack);
+    l = strlen(buf);
+  }
+  snprintf(buf + l, buf_size - l, ")");
+}
+
 static inline void proto_release(struct parsed_proto *pp)
 {
 	int i;

@@ -1450,9 +1450,13 @@ static void stack_frame_access(struct parsed_op *po,
 static void check_func_pp(struct parsed_op *po,
   const struct parsed_proto *pp, const char *pfx)
 {
+  char buf[256];
+
   if (pp->argc_reg != 0) {
-    if (!g_allow_regfunc && !pp->is_fastcall)
-      ferr(po, "%s: reg arg in arg-call unhandled yet\n", pfx);
+    if (/*!g_allow_regfunc &&*/ !pp->is_fastcall) {
+      pp_print(buf, sizeof(buf), pp);
+      ferr(po, "%s: unexpected reg arg in icall: %s\n", pfx, buf);
+    }
     if (pp->argc_stack > 0 && pp->argc_reg != 2)
       ferr(po, "%s: %d reg arg(s) with %d stack arg(s)\n",
         pfx, pp->argc_reg, pp->argc_stack);
@@ -3213,8 +3217,21 @@ tailcall:
 
       if (pp->is_unresolved) {
         int regmask_stack = 0;
-        collect_call_args(po, i, pp, &regmask_stack, &save_arg_vars,
+        collect_call_args(po, i, pp, &regmask, &save_arg_vars,
           i + opcnt * 2);
+
+        // this is pretty rough guess:
+        // see ecx and edx were pushed (and not their saved versions)
+        for (arg = 0; arg < pp->argc; arg++) {
+          if (pp->arg[arg].reg != NULL)
+            continue;
+
+          tmp_op = pp->arg[arg].datap;
+          if (tmp_op == NULL)
+            ferr(po, "parsed_op missing for arg%d\n", arg);
+          if (tmp_op->argnum == 0 && tmp_op->operand[0].type == OPT_REG)
+            regmask_stack |= 1 << tmp_op->operand[0].reg;
+        }
 
         if (!((regmask_stack & (1 << xCX))
           && (regmask_stack & (1 << xDX))))
@@ -3235,7 +3252,6 @@ tailcall:
             regmask |= 1 << xDX;
           }
         }
-        regmask |= regmask_stack;
 
         // note: __cdecl doesn't fall into is_unresolved category
         if (pp->argc_stack > 0)
