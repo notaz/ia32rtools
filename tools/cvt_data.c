@@ -311,6 +311,16 @@ check_sym:
   return pp;
 }
 
+static void output_decorated_pp(FILE *fout,
+  const struct parsed_proto *pp)
+{
+  if (pp->name[0] != '_')
+    fprintf(fout, pp->is_fastcall ? "@" : "_");
+  fprintf(fout, "%s", pp->name);
+  if (pp->is_stdcall && pp->argc > 0)
+    fprintf(fout, "@%d", pp->argc * 4);
+}
+
 static int cmpstringp(const void *p1, const void *p2)
 {
   return strcmp(*(char * const *)p1, *(char * const *)p2);
@@ -320,6 +330,7 @@ int main(int argc, char *argv[])
 {
   FILE *fout, *fasm, *fhdr, *frlist;
   const struct parsed_proto *pp;
+  int no_decorations = 0;
   char words[20][256];
   char word[256];
   char line[256];
@@ -345,9 +356,17 @@ int main(int argc, char *argv[])
   char *p2;
 
   if (argc < 4) {
-    printf("usage:\n%s <.s> <.asm> <hdrf> [rlist]*\n",
+    // -nd: no symbol decorations
+    printf("usage:\n%s [-nd] <.s> <.asm> <hdrf> [rlist]*\n",
       argv[0]);
     return 1;
+  }
+
+  for (arg = 1; arg < argc; arg++) {
+    if (IS(argv[arg], "-nd"))
+      no_decorations = 1;
+    else
+      break;
   }
 
   arg_out = arg++;
@@ -482,7 +501,7 @@ int main(int argc, char *argv[])
           g_func_sym_pp = NULL;
 
         len = strlen(sym);
-        fprintf(fout, "_%s:", sym);
+        fprintf(fout, "%s%s:", no_decorations ? "" : "_", sym);
 
         len += 2;
         if (len < 8)
@@ -607,11 +626,16 @@ int main(int argc, char *argv[])
           }
           else {
             pp = check_var(fhdr, sym, p);
-            if (p[0] != '_')
-              fprintf(fout, (pp && pp->is_fastcall) ? "@" : "_");
-            fprintf(fout, "%s", p);
-            if (pp && pp->is_stdcall && pp->argc > 0)
-              fprintf(fout, "@%d", pp->argc * 4);
+            if (pp == NULL) {
+              fprintf(fout, "%s%s",
+                (no_decorations || p[0] == '_') ? "" : "_", p);
+            }
+            else {
+              if (no_decorations)
+                fprintf(fout, "%s", pp->name);
+              else
+                output_decorated_pp(fout, pp);
+            }
           }
         }
         else {
@@ -638,7 +662,8 @@ fin:
 
   // dump public syms
   for (i = 0; i < pub_sym_cnt; i++)
-    fprintf(fout, ".global _%s\n", pub_syms[i]);
+    fprintf(fout, ".global %s%s\n",
+      no_decorations ? "" : "_", pub_syms[i]);
 
   fclose(fout);
   fclose(fasm);

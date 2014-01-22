@@ -19,13 +19,22 @@ int main(int argc, char *argv[])
   char line[256];
   char fmt[256];
   char word[256];
+  int noname = 0;
+  const char *p2;
   char *p;
-  int arg = 1;
+  int arg;
   int ret, ord;
   int l;
 
-  if (argc != 3) {
-    printf("usage:\n%s <.h> <.def>\n", argv[0]);
+  for (arg = 1; arg < argc; arg++) {
+    if (IS(argv[arg], "-n"))
+      noname = 1;
+    else
+      break;
+  }
+
+  if (argc != arg + 2) {
+    printf("usage:\n%s [-n] <.h> <.def>\n", argv[0]);
     return 1;
   }
 
@@ -38,9 +47,12 @@ int main(int argc, char *argv[])
 
   p = strrchr(hdrfn, '.');
   my_assert_not(p, NULL);
-  l = p - hdrfn;
-  my_assert(l < 256, 1);
-  memcpy(basename, hdrfn, l);
+  p2 = strrchr(hdrfn, '/');
+  if (p2++ == NULL)
+    p2 = hdrfn;
+  l = p - p2;
+  my_assert((unsigned int)l < 256, 1);
+  memcpy(basename, p2, l);
   basename[l] = 0;
 
   snprintf(fmt, sizeof(fmt), "%s_%%d", basename);
@@ -79,7 +91,10 @@ int main(int argc, char *argv[])
       fprintf(fout, "@%-2d", pp->argc_stack * 4);
     else
       fprintf(fout, "   ");
-    fprintf(fout, " @%d\n", ord);
+    fprintf(fout, " @%d", ord);
+    if (noname)
+      fprintf(fout, " NONAME");
+    fprintf(fout, "\n");
   }
 
   fclose(fhdr);
