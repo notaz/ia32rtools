@@ -9,9 +9,15 @@
 #include <frame.hpp>
 #include <struct.hpp>
 #include <auto.hpp>
+#include <intel.hpp>
 
 #define IS_START(w, y) !strncmp(w, y, strlen(y))
 #define ARRAY_SIZE(x) (sizeof(x) / sizeof(x[0]))
+
+// non-local branch targets
+static ea_t *nonlocal_bt;
+static int nonlocal_bt_alloc;
+static int nonlocal_bt_cnt;
 
 //--------------------------------------------------------------------------
 static int idaapi init(void)
@@ -22,6 +28,11 @@ static int idaapi init(void)
 //--------------------------------------------------------------------------
 static void idaapi term(void)
 {
+  if (nonlocal_bt != NULL) {
+    free(nonlocal_bt);
+    nonlocal_bt = NULL;
+  }
+  nonlocal_bt_alloc = 0;
 }
 
 //--------------------------------------------------------------------------
@@ -41,8 +52,30 @@ static int is_name_reserved(const char *name)
   return 0;
 }
 
+static int nonlocal_bt_cmp(const void *p1, const void *p2)
+{
+  const ea_t *e1 = (const ea_t *)p1, *e2 = (const ea_t *)p2;
+  return *e1 - *e2;
+}
+
+static void nonlocal_add(ea_t ea)
+{
+  if (nonlocal_bt_cnt >= nonlocal_bt_alloc) {
+    nonlocal_bt_alloc += nonlocal_bt_alloc * 2 + 64;
+    nonlocal_bt = (ea_t *)realloc(nonlocal_bt,
+      nonlocal_bt_alloc * sizeof(nonlocal_bt[0]));
+    if (nonlocal_bt == NULL) {
+      msg("OOM\n");
+      return;
+    }
+  }
+  nonlocal_bt[nonlocal_bt_cnt++] = ea;
+}
+
 static void do_def_line(char *buf, size_t buf_size, const char *line)
 {
+  char *endp = NULL;
+  ea_t ea, *ea_ret;
   int len;
 
   tag_remove(line, buf, buf_size); // remove color codes
@@ -52,30 +85,55 @@ static void do_def_line(char *buf, size_t buf_size, const char *line)
     return;
   }
   memmove(buf, buf + 9, len - 9 + 1); // rm address
+
+  if (IS_START(buf, "loc_")) {
+    ea = strtoul(buf + 4, &endp, 16);
+    if (ea != 0 && *endp == ':') {
+      ea_ret = (ea_t *)bsearch(&ea, nonlocal_bt, nonlocal_bt_cnt,
+        sizeof(nonlocal_bt[0]), nonlocal_bt_cmp);
+      if (ea_ret != 0) {
+        if (endp[1] != ' ')
+          msg("no trailing blank in '%s'\n", buf);
+        else
+          endp[1] = ':';
+      }
+    }
+  }
 }
 
 static void idaapi run(int /*arg*/)
 {
-  //  isEnabled(ea) // address belongs to disassembly
+  // isEnabled(ea) // address belongs to disassembly
   // ea_t ea = get_screen_ea();
-  // nextaddr(ea) - no worky?
+  // foo = DecodeInstruction(ScreenEA());
   FILE *fout = NULL;
   int fout_line = 0;
   char buf[MAXSTR];
+  int drop_large = 0;
   struc_t *frame;
   func_t *func;
-  ea_t ui_ea_block = 0;
-  ea_t tmp_ea;
+  ea_t ui_ea_block = 0, ea_size;
+  ea_t tmp_ea, target_ea;
   ea_t ea;
   int i, o, m, n;
   int ret;
   char *p;
 
-  // rename global syms which conflict with frame member names
-  ea = inf.minEA;
-  func = get_next_func(ea);
+  nonlocal_bt_cnt = 0;
+
+  // 1st pass: walk through all funcs
+  func = get_func(inf.minEA);
   while (func != NULL)
   {
+    func_tail_iterator_t fti(func);
+    if (!fti.main()) {
+      msg("%x: func_tail_iterator_t main failed\n", ea);
+      return;
+    }
+    const area_t &f_area = fti.chunk();
+    ea = f_area.startEA;
+
+    // rename global syms which conflict with frame member names
     frame = get_frame(func);
     if (frame != NULL)
     {
@@ -112,8 +170,54 @@ static void idaapi run(int /*arg*/)
     }
 
     func = get_next_func(ea);
-    if (func)
-      ea = get_next_func_addr(func, ea);
+  }
+
+  // 2nd pass over whole .text segment
+  for (ea = inf.minEA; ea != BADADDR; ea = next_head(ea, inf.maxEA))
+  {
+    segment_t *seg = getseg(ea);
+    if (!seg || seg->type != SEG_CODE)
+      break;
+
+    flags_t ea_flags = get_flags_novalue(ea);
+    func = get_func(ea);
+    if (isCode(ea_flags))
+    {
+      if (!decode_insn(ea)) {
+        msg("%x: decode_insn() failed\n", ea);
+        continue;
+      }
+
+      // find non-local branches
+      if ((cmd.itype == NN_jmp || insn_jcc())
+        && cmd.Operands[0].type == o_near)
+      {
+        target_ea = cmd.Operands[0].addr;
+        if (func == NULL)
+          nonlocal_add(target_ea);
+        else {
+          ret = get_func_chunknum(func, target_ea);
+          if (ret != 0) {
+            // a jump to another func or chunk
+            // check if it lands on func start
+            if (!isFunc(get_flags_novalue(target_ea)))
+              nonlocal_add(target_ea);
+          }
+        }
+      }
+    }
+    else { // not code
+      if (func == NULL && isOff0(ea_flags)) {
+        ea_size = get_item_size(ea);
+        for (tmp_ea = 0; tmp_ea < ea_size; tmp_ea += 4)
+          nonlocal_add(get_long(ea + tmp_ea));
+      }
+    }
+  }
+
+  if (nonlocal_bt_cnt > 1) {
+    qsort(nonlocal_bt, nonlocal_bt_cnt,
+      sizeof(nonlocal_bt[0]), nonlocal_bt_cmp);
   }
 
   char *fname = askfile_c(1, NULL, "Save asm file");
@@ -153,6 +257,8 @@ static void idaapi run(int /*arg*/)
 
   for (;;)
   {
+    drop_large = 0;
+
     if ((ea >> 14) != ui_ea_block) {
       ui_ea_block = ea >> 14;
       showAddr(ea);
@@ -173,15 +279,45 @@ static void idaapi run(int /*arg*/)
       if (cmd.Operands[o].type == o_void)
         break;
 
+      if (cmd.Operands[o].type == o_mem
+        && cmd.Operands[o].specval_shorts.high == 0x21) // correct?
+      {
+        drop_large = 1;
+      }
+#if 0
+      if (cmd.Operands[o].type == o_displ && cmd.Operands[o].reg == 5) {
+        member_t *m;
+
+        m = get_stkvar(cmd.Operands[o], cmd.Operands[o].addr, NULL);
+        if (m == NULL) {
+          msg("%x: no stkvar for offs %x\n",
+            ea, cmd.Operands[o].addr);
+          goto out;
+        }
+        if (get_struc_name(m->id, buf, sizeof(buf)) <= 0) {
+          msg("%x: stkvar with offs %x has no name?\n",
+            ea, cmd.Operands[o].addr);
+          goto out;
+        }
+        msg("%x: name '%s'\n", ea, buf);
+      }
+#endif
     }
 
 pass:
-    fout_line++;
     do_def_line(buf, sizeof(buf), ln.down());
+    if (drop_large) {
+      p = strstr(buf, "large ");
+      if (p != NULL)
+        memmove(p, p + 6, strlen(p + 6) + 1);
+    }
+
+    fout_line++;
     qfprintf(fout, "%s\n", buf);
 
+    // note: next_head skips some undefined stuff
     ea = next_not_tail(ea); // correct?
-    if (ea == 0 || ea == ~0)
+    if (ea == BADADDR)
       break;
 
     pl.ea = ea;
@@ -198,6 +334,8 @@ pass:
 
   if (fout != NULL)
     qfclose(fout);
+  if (fname != NULL)
+    qfree(fname);
 
   hide_wait_box();
   msg("%d lines saved.\n", fout_line);
