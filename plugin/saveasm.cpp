@@ -39,7 +39,9 @@ static void idaapi term(void)
 
 static const char *reserved_names[] = {
   "name",
+  "type",
   "offset",
+  "aam",
 };
 
 static int is_name_reserved(const char *name)
@@ -70,6 +72,12 @@ static void nonlocal_add(ea_t ea)
     }
   }
   nonlocal_bt[nonlocal_bt_cnt++] = ea;
+}
+
+// is instruction a (un)conditional jump (not call)?
+static int is_insn_jmp(uint16 itype)
+{
+  return itype == NN_jmp || (NN_ja <= itype && itype <= NN_jz);
 }
 
 static void do_def_line(char *buf, size_t buf_size, const char *line)
@@ -106,15 +114,17 @@ static void idaapi run(int /*arg*/)
   // isEnabled(ea) // address belongs to disassembly
   // ea_t ea = get_screen_ea();
   // foo = DecodeInstruction(ScreenEA());
+  int drop_large, drop_rva;
   FILE *fout = NULL;
   int fout_line = 0;
   char buf[MAXSTR];
-  int drop_large = 0;
+  const char *name;
   struc_t *frame;
   func_t *func;
   ea_t ui_ea_block = 0, ea_size;
   ea_t tmp_ea, target_ea;
   ea_t ea;
+  flags_t ea_flags;
   int i, o, m, n;
   int ret;
   char *p;
@@ -172,14 +182,18 @@ static void idaapi run(int /*arg*/)
     func = get_next_func(ea);
   }
 
-  // 2nd pass over whole .text segment
+  // 2nd pass over whole .text and .(ro)data segments
   for (ea = inf.minEA; ea != BADADDR; ea = next_head(ea, inf.maxEA))
   {
     segment_t *seg = getseg(ea);
-    if (!seg || seg->type != SEG_CODE)
+    if (!seg)
+      break;
+    if (seg->type == SEG_XTRN)
+      continue;
+    if (seg->type != SEG_CODE && seg->type != SEG_DATA)
       break;
 
-    flags_t ea_flags = get_flags_novalue(ea);
+    ea_flags = get_flags_novalue(ea);
     func = get_func(ea);
     if (isCode(ea_flags))
     {
@@ -188,9 +202,29 @@ static void idaapi run(int /*arg*/)
         continue;
       }
 
+      // masm doesn't understand IDA's float/xmm types
+      if (cmd.itype == NN_fld || cmd.itype == NN_fst
+        || cmd.itype == NN_movapd || cmd.itype == NN_movlpd)
+      {
+        for (o = 0; o < UA_MAXOP; o++) {
+          if (cmd.Operands[o].type == o_void)
+            break;
+
+          if (cmd.Operands[o].type == o_mem) {
+            tmp_ea = cmd.Operands[o].addr;
+            flags_t tmp_ea_flags = get_flags_novalue(tmp_ea);
+            if (!isUnknown(tmp_ea_flags)) {
+              buf[0] = 0;
+              get_name(ea, tmp_ea, buf, sizeof(buf));
+              msg("%x: undefining %x '%s'\n", ea, tmp_ea, buf);
+              do_unknown(tmp_ea, DOUNK_EXPAND);
+            }
+          }
+        }
+      }
+
       // find non-local branches
-      if ((cmd.itype == NN_jmp || insn_jcc())
-        && cmd.Operands[0].type == o_near)
+      if (is_insn_jmp(cmd.itype) && cmd.Operands[0].type == o_near)
       {
         target_ea = cmd.Operands[0].addr;
         if (func == NULL)
@@ -212,6 +246,41 @@ static void idaapi run(int /*arg*/)
         for (tmp_ea = 0; tmp_ea < ea_size; tmp_ea += 4)
           nonlocal_add(get_long(ea + tmp_ea));
       }
+
+      // IDA vs masm float/mmx/xmm type incompatibility
+      if (isDouble(ea_flags) || isTbyt(ea_flags)
+       || isPackReal(ea_flags))
+      {
+        buf[0] = 0;
+        get_name(BADADDR, ea, buf, sizeof(buf));
+        msg("%x: undefining '%s'\n", ea, buf);
+        do_unknown(ea, DOUNK_EXPAND);
+      }
+      if (isOwrd(ea_flags)) {
+        buf[0] = 0;
+        get_name(BADADDR, ea, buf, sizeof(buf));
+        if (IS_START(buf, "xmm")) {
+          msg("%x: undefining '%s'\n", ea, buf);
+          do_unknown(ea, DOUNK_EXPAND);
+        }
+      }
+    }
+  }
+
+  // check namelist for reserved names
+  n = get_nlist_size();
+  for (i = 0; i < n; i++) {
+    ea = get_nlist_ea(i);
+    name = get_nlist_name(i);
+    if (name == NULL) {
+      msg("%x: null name?\n", ea);
+      continue;
+    }
+
+    if (is_name_reserved(name)) {
+      msg("%x: renaming name '%s'\n", ea, name);
+      qsnprintf(buf, sizeof(buf), "%s_g", name);
+      set_name(ea, buf);
     }
   }
 
@@ -254,10 +323,11 @@ static void idaapi run(int /*arg*/)
       qfprintf(fout, "%s\n", buf);
     }
   }
+  pl.lnnum = i;
 
   for (;;)
   {
-    drop_large = 0;
+    drop_large = drop_rva = 0;
 
     if ((ea >> 14) != ui_ea_block) {
       ui_ea_block = ea >> 14;
@@ -267,53 +337,51 @@ static void idaapi run(int /*arg*/)
     }
 
     segment_t *seg = getseg(ea);
-    if (!seg || seg->type != SEG_CODE)
-      goto pass;
-    if (!decode_insn(ea))
+    if (!seg || (seg->type != SEG_CODE && seg->type != SEG_DATA))
       goto pass;
 
-    // note: decode_insn() picks up things like dd, size is then weird
-    //cmd_size = cmd.size;
+    ea_flags = get_flags_novalue(ea);
+    if (isCode(ea_flags))
+    {
+      if (!decode_insn(ea))
+        goto pass;
 
-    for (o = 0; o < UA_MAXOP; o++) {
-      if (cmd.Operands[o].type == o_void)
-        break;
+      for (o = 0; o < UA_MAXOP; o++) {
+        if (cmd.Operands[o].type == o_void)
+          break;
 
-      if (cmd.Operands[o].type == o_mem
-        && cmd.Operands[o].specval_shorts.high == 0x21) // correct?
-      {
-        drop_large = 1;
-      }
-#if 0
-      if (cmd.Operands[o].type == o_displ && cmd.Operands[o].reg == 5) {
-        member_t *m;
-
-        m = get_stkvar(cmd.Operands[o], cmd.Operands[o].addr, NULL);
-        if (m == NULL) {
-          msg("%x: no stkvar for offs %x\n",
-            ea, cmd.Operands[o].addr);
-          goto out;
+        if (cmd.Operands[o].type == o_mem
+          && cmd.Operands[o].specval_shorts.high == 0x21) // correct?
+        {
+          drop_large = 1;
         }
-        if (get_struc_name(m->id, buf, sizeof(buf)) <= 0) {
-          msg("%x: stkvar with offs %x has no name?\n",
-            ea, cmd.Operands[o].addr);
-          goto out;
-        }
-        msg("%x: name '%s'\n", ea, buf);
       }
-#endif
+    }
+    else { // not code
+      if (isOff0(ea_flags))
+        drop_rva = 1;
     }
 
 pass:
-    do_def_line(buf, sizeof(buf), ln.down());
-    if (drop_large) {
-      p = strstr(buf, "large ");
-      if (p != NULL)
-        memmove(p, p + 6, strlen(p + 6) + 1);
-    }
+    n = ln.get_linecnt();
+    for (i = pl.lnnum; i < n; i++) {
+      do_def_line(buf, sizeof(buf), ln.down());
 
-    fout_line++;
-    qfprintf(fout, "%s\n", buf);
+      if (drop_large) {
+        p = strstr(buf, "large ");
+        if (p != NULL)
+          memmove(p, p + 6, strlen(p + 6) + 1);
+      }
+      while (drop_rva) {
+        p = strstr(buf, " rva ");
+        if (p == NULL)
+          break;
+        memmove(p, p + 4, strlen(p + 4) + 1);
+      }
+
+      fout_line++;
+      qfprintf(fout, "%s\n", buf);
+    }
 
     // note: next_head skips some undefined stuff
     ea = next_not_tail(ea); // correct?
@@ -323,13 +391,6 @@ pass:
     pl.ea = ea;
     pl.lnnum = 0;
     ln.set_place(&pl);
-    n = ln.get_linecnt();
-    for (i = 0; i < n - 1; i++)
-    {
-      fout_line++;
-      do_def_line(buf, sizeof(buf), ln.down());
-      qfprintf(fout, "%s\n", buf);
-    }
   }
 
   if (fout != NULL)
