@@ -114,10 +114,10 @@ static void idaapi run(int /*arg*/)
   // isEnabled(ea) // address belongs to disassembly
   // ea_t ea = get_screen_ea();
   // foo = DecodeInstruction(ScreenEA());
-  int drop_large, drop_rva;
   FILE *fout = NULL;
   int fout_line = 0;
   char buf[MAXSTR];
+  char buf2[MAXSTR];
   const char *name;
   struc_t *frame;
   func_t *func;
@@ -125,11 +125,25 @@ static void idaapi run(int /*arg*/)
   ea_t tmp_ea, target_ea;
   ea_t ea;
   flags_t ea_flags;
+  uval_t idx;
   int i, o, m, n;
   int ret;
   char *p;
 
   nonlocal_bt_cnt = 0;
+
+  // get rid of structs, masm doesn't understand them
+  idx = get_first_struc_idx();
+  while (idx != BADNODE) {
+    tid_t tid = get_struc_by_idx(idx);
+    struc_t *struc = get_struc(tid);
+    get_struc_name(tid, buf, sizeof(buf));
+    msg("removing struct '%s'\n", buf);
+    //del_struc_members(struc, 0, get_max_offset(struc));
+    del_struc(struc);
+
+    idx = get_first_struc_idx();
+  }
 
   // 1st pass: walk through all funcs
   func = get_func(inf.minEA);
@@ -159,7 +173,15 @@ static void idaapi run(int /*arg*/)
         if (IS_START(buf, "arg_") || IS_START(buf, "var_"))
           continue;
 
-        if (is_name_reserved(buf)) {
+        // check for dupe names
+        int m1, dupe = 0;
+        for (m1 = 0; m1 < m; m1++) {
+          get_member_name(frame->members[m1].id, buf2, sizeof(buf2));
+          if (stricmp(buf, buf2) == 0)
+            dupe = 1;
+        }
+
+        if (is_name_reserved(buf) || dupe) {
           msg("%x: renaming '%s'\n", ea, buf);
           qstrncat(buf, "_", sizeof(buf));
           ret = set_member_name(frame, frame->members[m].soff, buf);
@@ -222,6 +244,23 @@ static void idaapi run(int /*arg*/)
           }
         }
       }
+      // detect code alignment
+      else if (cmd.itype == NN_lea) {
+        if (cmd.Operands[0].reg == cmd.Operands[1].reg
+          && cmd.Operands[1].type == o_displ
+          && cmd.Operands[1].addr == 0)
+        {
+          tmp_ea = next_head(ea, inf.maxEA);
+          if ((tmp_ea & 0x03) == 0) {
+            n = calc_max_align(tmp_ea);
+            if (n > 4) // masm doesn't like more..
+              n = 4;
+            msg("%x: align %d\n", ea, 1 << n);
+            do_unknown(ea, DOUNK_SIMPLE);
+            doAlign(ea, tmp_ea - ea, n);
+          }
+        }
+      }
 
       // find non-local branches
       if (is_insn_jmp(cmd.itype) && cmd.Operands[0].type == o_near)
@@ -241,8 +280,10 @@ static void idaapi run(int /*arg*/)
       }
     }
     else { // not code
+      int do_undef = 0;
+      ea_size = get_item_size(ea);
+
       if (func == NULL && isOff0(ea_flags)) {
-        ea_size = get_item_size(ea);
         for (tmp_ea = 0; tmp_ea < ea_size; tmp_ea += 4)
           nonlocal_add(get_long(ea + tmp_ea));
       }
@@ -251,18 +292,31 @@ static void idaapi run(int /*arg*/)
       if (isDouble(ea_flags) || isTbyt(ea_flags)
        || isPackReal(ea_flags))
       {
+        do_undef = 1;
+      }
+      else if (isOwrd(ea_flags)) {
+        buf[0] = 0;
+        get_name(BADADDR, ea, buf, sizeof(buf));
+        if (IS_START(buf, "xmm"))
+          do_undef = 1;
+      }
+      // masm doesn't understand IDA's unicode
+      else if (isASCII(ea_flags) && ea_size >= 4
+        && (get_long(ea) & 0xff00ff00) == 0) // lame..
+      {
+        do_undef = 1;
+      }
+      // masm doesn't understand large aligns
+      else if (isAlign(ea_flags) && ea_size > 0x10) {
+        msg("%x: undefining align %d\n", ea, ea_size);
+        do_unknown(ea, DOUNK_EXPAND);
+      }
+
+      if (do_undef) {
         buf[0] = 0;
         get_name(BADADDR, ea, buf, sizeof(buf));
         msg("%x: undefining '%s'\n", ea, buf);
         do_unknown(ea, DOUNK_EXPAND);
-      }
-      if (isOwrd(ea_flags)) {
-        buf[0] = 0;
-        get_name(BADADDR, ea, buf, sizeof(buf));
-        if (IS_START(buf, "xmm")) {
-          msg("%x: undefining '%s'\n", ea, buf);
-          do_unknown(ea, DOUNK_EXPAND);
-        }
       }
     }
   }
@@ -327,7 +381,8 @@ static void idaapi run(int /*arg*/)
 
   for (;;)
   {
-    drop_large = drop_rva = 0;
+    int drop_large = 0, drop_rva = 0, set_scale = 0, jmp_near = 0;
+    int word_imm = 0, dword_imm = 0, do_pushf = 0;
 
     if ((ea >> 14) != ui_ea_block) {
       ui_ea_block = ea >> 14;
@@ -346,14 +401,44 @@ static void idaapi run(int /*arg*/)
       if (!decode_insn(ea))
         goto pass;
 
+      if (is_insn_jmp(cmd.itype) && cmd.Operands[0].type == o_near
+        && cmd.Operands[0].dtyp == dt_dword)
+      {
+        jmp_near = 1;
+      }
+      else if ((cmd.itype == NN_pushf || cmd.itype == NN_popf)
+        && natop())
+      {
+        do_pushf = 1;
+      }
+
       for (o = 0; o < UA_MAXOP; o++) {
-        if (cmd.Operands[o].type == o_void)
+        const op_t &opr = cmd.Operands[o];
+        if (opr.type == o_void)
           break;
 
-        if (cmd.Operands[o].type == o_mem
-          && cmd.Operands[o].specval_shorts.high == 0x21) // correct?
-        {
+        // correct?
+        if (opr.type == o_mem && opr.specval_shorts.high == 0x21)
           drop_large = 1;
+        if (opr.hasSIB && x86_scale(opr) == 0
+          && x86_index(opr) != INDEX_NONE)
+        {
+          set_scale = 1;
+        }
+        // annoying alignment variant..
+        if (opr.type == o_imm && opr.dtyp == dt_dword
+          && (opr.value < 0x80 || opr.value > 0xffffff80)
+          && cmd.size >= opr.offb + 4)
+        {
+          if (get_long(ea + opr.offb) == opr.value)
+            dword_imm = 1;
+        }
+        else if (opr.type == o_imm && opr.dtyp == dt_word
+          && (opr.value < 0x80 || opr.value > 0xff80)
+          && cmd.size >= opr.offb + 2)
+        {
+          if (get_word(ea + opr.offb) == (ushort)opr.value)
+            word_imm = 1;
         }
       }
     }
@@ -367,6 +452,7 @@ pass:
     for (i = pl.lnnum; i < n; i++) {
       do_def_line(buf, sizeof(buf), ln.down());
 
+      // patches..
       if (drop_large) {
         p = strstr(buf, "large ");
         if (p != NULL)
@@ -377,6 +463,55 @@ pass:
         if (p == NULL)
           break;
         memmove(p, p + 4, strlen(p + 4) + 1);
+      }
+      if (set_scale) {
+        p = strchr(buf, '[');
+        if (p != NULL)
+          p = strchr(p, '+');
+        if (p != NULL && p[1] == 'e') {
+          p += 4;
+          // scale is 1, must specify it explicitly so that
+          // masm chooses the right scaled reg
+          memmove(p + 2, p, strlen(p) + 1);
+          memcpy(p, "*1", 2);
+        }
+      }
+      else if (jmp_near) {
+        p = strchr(buf, 'j');
+        while (p && *p != ' ')
+          p++;
+        while (p && *p == ' ')
+          p++;
+        if (p != NULL) {
+          memmove(p + 9, p, strlen(p) + 1);
+          memcpy(p, "near ptr ", 9);
+        }
+      }
+      if (word_imm) {
+        p = strstr(buf, ", ");
+        if (p != NULL && '0' <= p[2] && p[2] <= '9') {
+          p += 2;
+          memmove(p + 9, p, strlen(p) + 1);
+          memcpy(p, "word ptr ", 9);
+        }
+      }
+      else if (dword_imm) {
+        p = strstr(buf, ", ");
+        if (p != NULL && '0' <= p[2] && p[2] <= '9') {
+          p += 2;
+          memmove(p + 10, p, strlen(p) + 1);
+          memcpy(p, "dword ptr ", 10);
+        }
+      }
+      else if (do_pushf) {
+        p = strstr(buf, "pushf");
+        if (p == NULL)
+          p = strstr(buf, "popf");
+        if (p != NULL) {
+          p = strchr(p, 'f') + 1;
+          memmove(p + 1, p, strlen(p) + 1);
+          *p = 'd';
+        }
       }
 
       fout_line++;
