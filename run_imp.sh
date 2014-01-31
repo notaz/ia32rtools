@@ -7,7 +7,7 @@ echo ".data" > $2
 echo ".align 4" >> $2
 
 cat $2_implist | while read i; do
-  rm -f tmpsym
+  rm -f $2_tmpsym
   case $i in
   __imp_*)
     si=`echo $i | cut -c 7-`
@@ -21,11 +21,11 @@ cat $2_implist | while read i; do
     while read f; do
       sym=`i586-mingw32msvc-nm $f | grep "\<_$si\>" | grep ' T ' | awk '{print $3}'`
       if test -n "$sym"; then
-        echo $sym > tmpsym
+        echo $sym > $2_tmpsym
         break
       fi
     done
-  sym=`cat tmpsym`
+  sym=`cat $2_tmpsym`
   if test -z "$sym"; then
     echo "no file/sym for $i, lf $f"
     exit 1
