@@ -42,6 +42,7 @@ static const char *reserved_names[] = {
   "type",
   "offset",
   "aam",
+  "text",
 };
 
 static int is_name_reserved(const char *name)
@@ -375,6 +376,14 @@ static void idaapi run(int /*arg*/)
       memcpy(p, ".xmm", 4);
       fout_line++;
       qfprintf(fout, "%s\n", buf);
+      continue;
+    }
+    p = strstr(buf, ".model");
+    if (p != NULL) {
+      qstrncpy(p, "include imports.inc", sizeof(buf) - (p - buf));
+      fout_line++;
+      qfprintf(fout, "\n%s\n", buf);
+      continue;
     }
   }
   pl.lnnum = i;
@@ -452,20 +461,24 @@ pass:
     for (i = pl.lnnum; i < n; i++) {
       do_def_line(buf, sizeof(buf), ln.down());
 
+      char *fw;
+      for (fw = buf; *fw != 0 && *fw == ' '; )
+        fw++;
+
       // patches..
       if (drop_large) {
-        p = strstr(buf, "large ");
+        p = strstr(fw, "large ");
         if (p != NULL)
           memmove(p, p + 6, strlen(p + 6) + 1);
       }
       while (drop_rva) {
-        p = strstr(buf, " rva ");
+        p = strstr(fw, " rva ");
         if (p == NULL)
           break;
         memmove(p, p + 4, strlen(p + 4) + 1);
       }
       if (set_scale) {
-        p = strchr(buf, '[');
+        p = strchr(fw, '[');
         if (p != NULL)
           p = strchr(p, '+');
         if (p != NULL && p[1] == 'e') {
@@ -477,7 +490,7 @@ pass:
         }
       }
       else if (jmp_near) {
-        p = strchr(buf, 'j');
+        p = strchr(fw, 'j');
         while (p && *p != ' ')
           p++;
         while (p && *p == ' ')
@@ -488,7 +501,7 @@ pass:
         }
       }
       if (word_imm) {
-        p = strstr(buf, ", ");
+        p = strstr(fw, ", ");
         if (p != NULL && '0' <= p[2] && p[2] <= '9') {
           p += 2;
           memmove(p + 9, p, strlen(p) + 1);
@@ -496,7 +509,7 @@ pass:
         }
       }
       else if (dword_imm) {
-        p = strstr(buf, ", ");
+        p = strstr(fw, ", ");
         if (p != NULL && '0' <= p[2] && p[2] <= '9') {
           p += 2;
           memmove(p + 10, p, strlen(p) + 1);
@@ -504,14 +517,22 @@ pass:
         }
       }
       else if (do_pushf) {
-        p = strstr(buf, "pushf");
+        p = strstr(fw, "pushf");
         if (p == NULL)
-          p = strstr(buf, "popf");
+          p = strstr(fw, "popf");
         if (p != NULL) {
           p = strchr(p, 'f') + 1;
           memmove(p + 1, p, strlen(p) + 1);
           *p = 'd';
         }
+      }
+
+      if (fw[0] == 'e' && IS_START(fw, "end") && fw[3] == ' ') {
+        fout_line++;
+        qfprintf(fout, "include public.inc\n\n");
+
+        // kill entry point
+        fw[3] = 0;
       }
 
       fout_line++;
