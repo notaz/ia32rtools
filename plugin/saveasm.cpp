@@ -368,6 +368,11 @@ static void idaapi run(int /*arg*/)
     do_def_line(buf, sizeof(buf), ln.down());
     if (strstr(buf, "include"))
       continue;
+    p = strstr(buf, "assume cs");
+    if (p != NULL) {
+      memmove(p + 1, p, strlen(p) + 1);
+      *p = ';';
+    }
 
     fout_line++;
     qfprintf(fout, "%s\n", buf);
