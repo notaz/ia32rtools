@@ -41,6 +41,7 @@ enum op_flags {
   OPF_REPNZ  = (1 << 9), /* rep is repne/repnz */
   OPF_FARG   = (1 << 10), /* push collected as func arg (no reuse) */
   OPF_EBP_S  = (1 << 11), /* ebp used as scratch here, not BP */
+  OPF_DF     = (1 << 12), /* DF flag set */
 };
 
 enum op_op {
@@ -48,6 +49,7 @@ enum op_op {
 	OP_NOP,
 	OP_PUSH,
 	OP_POP,
+	OP_LEAVE,
 	OP_MOV,
 	OP_LEA,
 	OP_MOVZX,
@@ -57,6 +59,9 @@ enum op_op {
 	OP_STOS,
 	OP_MOVS,
 	OP_CMPS,
+	OP_SCAS,
+	OP_STD,
+	OP_CLD,
 	OP_RET,
 	OP_ADD,
 	OP_SUB,
@@ -398,7 +403,7 @@ static const char *parse_stack_el(const char *name, char *extra_reg)
     // must be a number after esp+, already converted to 0x..
     s = name + 4;
     if (!('0' <= *s && *s <= '9')) {
-		  aerr("%s nan?\n", __func__);
+      aerr("%s nan?\n", __func__);
       return NULL;
     }
     if (s[0] == '0' && s[1] == 'x')
@@ -711,6 +716,7 @@ static const struct {
   { "nop",  OP_NOP,    0, 0, 0 },
   { "push", OP_PUSH,   1, 1, 0 },
   { "pop",  OP_POP,    1, 1, OPF_DATA },
+  { "leave",OP_LEAVE,  0, 0, OPF_DATA },
   { "mov" , OP_MOV,    2, 2, OPF_DATA },
   { "lea",  OP_LEA,    2, 2, OPF_DATA },
   { "movzx",OP_MOVZX,  2, 2, OPF_DATA },
@@ -726,6 +732,11 @@ static const struct {
   { "cmpsb",OP_CMPS,   0, 0, OPF_DATA|OPF_FLAGS },
   { "cmpsw",OP_CMPS,   0, 0, OPF_DATA|OPF_FLAGS },
   { "cmpsd",OP_CMPS,   0, 0, OPF_DATA|OPF_FLAGS },
+  { "scasb",OP_SCAS,   0, 0, OPF_DATA|OPF_FLAGS },
+  { "scasw",OP_SCAS,   0, 0, OPF_DATA|OPF_FLAGS },
+  { "scasd",OP_SCAS,   0, 0, OPF_DATA|OPF_FLAGS },
+  { "std",  OP_STD,    0, 0, OPF_DATA }, // special flag
+  { "cld",  OP_CLD,    0, 0, OPF_DATA },
   { "add",  OP_ADD,    2, 2, OPF_DATA|OPF_FLAGS },
   { "sub",  OP_SUB,    2, 2, OPF_DATA|OPF_FLAGS },
   { "and",  OP_AND,    2, 2, OPF_DATA|OPF_FLAGS },
@@ -883,13 +894,14 @@ static void parse_op(struct parsed_op *op, char words[16][256], int wordc)
     break;
 
   case OP_STOS:
+  case OP_SCAS:
     if (op->operand_cnt != 0)
       break;
-    if      (IS(words[op_w], "stosb"))
+    if      (words[op_w][4] == 'b')
       lmod = OPLM_BYTE;
-    else if (IS(words[op_w], "stosw"))
+    else if (words[op_w][4] == 'w')
       lmod = OPLM_WORD;
-    else if (IS(words[op_w], "stosd"))
+    else if (words[op_w][4] == 'd')
       lmod = OPLM_DWORD;
     op->operand_cnt = 3;
     setup_reg_opr(&op->operand[0], xDI, lmod, &op->regmask_src);
@@ -1476,7 +1488,7 @@ static void check_label_read_ref(struct parsed_op *po, const char *name)
 }
 
 static char *out_src_opr(char *buf, size_t buf_size,
-	struct parsed_op *po, struct parsed_opr *popr, const char *cast,
+  struct parsed_op *po, struct parsed_opr *popr, const char *cast,
   int is_lea)
 {
   char tmp1[256], tmp2[256];
@@ -2036,6 +2048,52 @@ static int scan_for_pop_ret(int i, int opcnt, const char *reg,
   return found ? 0 : -1;
 }
 
+static void scan_propagate_df(int i, int opcnt)
+{
+  struct parsed_op *po = &ops[i];
+  int j;
+
+  for (; i < opcnt; i++) {
+    po = &ops[i];
+    if (po->flags & OPF_DF)
+      return; // already resolved
+    po->flags |= OPF_DF;
+
+    if (po->op == OP_CALL)
+      ferr(po, "call with DF set?\n");
+
+    if (po->flags & OPF_JMP) {
+      if (po->btj != NULL) {
+        // jumptable
+        for (j = 0; j < po->btj->count; j++)
+          scan_propagate_df(po->btj->d[j].bt_i, opcnt);
+        return;
+      }
+
+      if (po->bt_i < 0) {
+        ferr(po, "dead branch\n");
+        return;
+      }
+
+      if (po->flags & OPF_CC)
+        scan_propagate_df(po->bt_i, opcnt);
+      else
+        i = po->bt_i - 1;
+      continue;
+    }
+
+    if (po->flags & OPF_TAIL)
+      break;
+
+    if (po->op == OP_CLD) {
+      po->flags |= OPF_RMD;
+      return;
+    }
+  }
+
+  ferr(po, "missing DF clear?\n");
+}
+
 // is operand 'opr' modified by parsed_op 'po'?
 static int is_opr_modified(const struct parsed_opr *opr,
   const struct parsed_op *po)
@@ -2268,7 +2326,7 @@ static int scan_for_esp_adjust(int i, int opcnt, int *adj)
     }
   }
 
-  if (*adj == 4 && first_pop >= 0 && ops[first_pop].op == OP_POP
+  if (*adj <= 8 && first_pop >= 0 && ops[first_pop].op == OP_POP
     && ops[first_pop].operand[0].type == OPT_REG
     && ops[first_pop].operand[0].reg == xCX)
   {
@@ -2832,8 +2890,11 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
       if (i == opcnt && (ops[i - 1].flags & OPF_JMP) && found)
         break;
 
-      if (ops[i - 1].op == OP_POP && IS(opr_name(&ops[i - 1], 0), "ebp"))
+      if ((ops[i - 1].op == OP_POP && IS(opr_name(&ops[i - 1], 0), "ebp"))
+        || ops[i - 1].op == OP_LEAVE)
+      {
         ops[i - 1].flags |= OPF_RMD;
+      }
       else if (!(g_ida_func_attr & IDAFA_NORETURN))
         ferr(&ops[i - 1], "'pop ebp' expected\n");
 
@@ -2844,8 +2905,11 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
         {
           ops[i - 2].flags |= OPF_RMD;
         }
-        else if (!(g_ida_func_attr & IDAFA_NORETURN))
+        else if (ops[i - 1].op != OP_LEAVE
+          && !(g_ida_func_attr & IDAFA_NORETURN))
+        {
           ferr(&ops[i - 2], "esp restore expected\n");
+        }
 
         if (ecx_push && ops[i - 3].op == OP_POP
           && IS(opr_name(&ops[i - 3], 0), "ecx"))
@@ -3073,9 +3137,20 @@ tailcall:
             tmpname, pp->argc_stack * 4, j);
 
         ops[ret].flags |= OPF_RMD;
-        // a bit of a hack, but deals with use of
-        // single adj for multiple calls
-        ops[ret].operand[1].val -= j;
+        if (ops[ret].op == OP_POP && j > 4) {
+          // deal with multi-pop stack adjust
+          j = pp->argc_stack;
+          while (ops[ret].op == OP_POP && j > 0 && ret < opcnt) {
+            ops[ret].flags |= OPF_RMD;
+            j--;
+            ret++;
+          }
+        }
+        else {
+          // a bit of a hack, but deals with use of
+          // single adj for multiple calls
+          ops[ret].operand[1].val -= j;
+        }
       }
       else if (pp->is_vararg)
         ferr(po, "missing esp_adjust for vararg func '%s'\n",
@@ -3094,6 +3169,7 @@ tailcall:
 
   // pass4:
   // - find POPs for PUSHes, rm both
+  // - scan for STD/CLD, propagate DF
   // - scan for all used registers
   // - find flag set ops for their users
   // - do unreselved calls
@@ -3146,6 +3222,11 @@ tailcall:
       }
     }
 
+    if (po->op == OP_STD) {
+      po->flags |= OPF_DF | OPF_RMD;
+      scan_propagate_df(i + 1, opcnt);
+    }
+
     regmask_now = po->regmask_src | po->regmask_dst;
     if (regmask_now & (1 << xBP)) {
       if (g_bp_frame && !(po->flags & OPF_EBP_S)) {
@@ -3178,10 +3259,14 @@ tailcall:
 
         // to get nicer code, we try to delay test and cmp;
         // if we can't because of operand modification, or if we
-        // have math op, or branch, make it calculate flags explicitly
-        if (tmp_op->op == OP_TEST || tmp_op->op == OP_CMP) {
+        // have arith op, or branch, make it calculate flags explicitly
+        if (tmp_op->op == OP_TEST || tmp_op->op == OP_CMP)
+        {
           if (branched || scan_for_mod(tmp_op, setters[j] + 1, i, 0) >= 0)
             pfomask = 1 << pfo;
+        }
+        else if (tmp_op->op == OP_SCAS) {
+          pfomask = 1 << pfo;
         }
         else if (tmp_op->op == OP_CMPS) {
           pfomask = 1 << PFO_Z;
@@ -3204,6 +3289,9 @@ tailcall:
 
       if (po->op == OP_ADC || po->op == OP_SBB)
         cmp_result_vars |= 1 << PFO_C;
+    }
+    else if (po->op == OP_CMPS || po->op == OP_SCAS) {
+      cmp_result_vars |= 1 << PFO_Z;
     }
     else if (po->op == OP_MUL
       || (po->op == OP_IMUL && po->operand_cnt == 1))
@@ -3567,53 +3655,54 @@ tailcall:
         break;
 
       case OP_STOS:
-        // assumes DF=0
         assert_operand_cnt(3);
         if (po->flags & OPF_REP) {
-          fprintf(fout, "  for (; ecx != 0; ecx--, edi += %d)\n",
+          fprintf(fout, "  for (; ecx != 0; ecx--, edi %c= %d)\n",
+            (po->flags & OPF_DF) ? '-' : '+',
             lmod_bytes(po, po->operand[0].lmod));
           fprintf(fout, "    %sedi = eax;",
             lmod_cast_u_ptr(po, po->operand[0].lmod));
           strcpy(g_comment, "rep stos");
         }
         else {
-          fprintf(fout, "    %sedi = eax; edi += %d;",
+          fprintf(fout, "    %sedi = eax; edi %c= %d;",
             lmod_cast_u_ptr(po, po->operand[0].lmod),
+            (po->flags & OPF_DF) ? '-' : '+',
             lmod_bytes(po, po->operand[0].lmod));
           strcpy(g_comment, "stos");
         }
         break;
 
       case OP_MOVS:
-        // assumes DF=0
         assert_operand_cnt(3);
         j = lmod_bytes(po, po->operand[0].lmod);
         strcpy(buf1, lmod_cast_u_ptr(po, po->operand[0].lmod));
+        l = (po->flags & OPF_DF) ? '-' : '+';
         if (po->flags & OPF_REP) {
           fprintf(fout,
-            "  for (; ecx != 0; ecx--, edi += %d, esi += %d)\n",
-            j, j);
+            "  for (; ecx != 0; ecx--, edi %c= %d, esi %c= %d)\n",
+            l, j, l, j);
           fprintf(fout,
             "    %sedi = %sesi;", buf1, buf1);
           strcpy(g_comment, "rep movs");
         }
         else {
-          fprintf(fout, "    %sedi = %sesi; edi += %d; esi += %d;",
-            buf1, buf1, j, j);
+          fprintf(fout, "    %sedi = %sesi; edi %c= %d; esi %c= %d;",
+            buf1, buf1, l, j, l, j);
           strcpy(g_comment, "movs");
         }
         break;
 
       case OP_CMPS:
-        // assumes DF=0
         // repe ~ repeat while ZF=1
         assert_operand_cnt(3);
         j = lmod_bytes(po, po->operand[0].lmod);
         strcpy(buf1, lmod_cast_u_ptr(po, po->operand[0].lmod));
+        l = (po->flags & OPF_DF) ? '-' : '+';
         if (po->flags & OPF_REP) {
           fprintf(fout,
-            "  for (; ecx != 0; ecx--, edi += %d, esi += %d)\n",
-            j, j);
+            "  for (; ecx != 0; ecx--, edi %c= %d, esi %c= %d)\n",
+            l, j, l, j);
           fprintf(fout,
             "    if ((cond_z = (%sedi == %sesi)) %s 0)\n",
               buf1, buf1, (po->flags & OPF_REPZ) ? "==" : "!=");
@@ -3624,9 +3713,39 @@ tailcall:
         }
         else {
           fprintf(fout,
-            "    cond_z = (%sedi = %sesi); edi += %d; esi += %d;",
-            buf1, buf1, j, j);
+            "    cond_z = (%sedi = %sesi); edi %c= %d; esi %c= %d;",
+            buf1, buf1, l, j, l, j);
           strcpy(g_comment, "cmps");
+        }
+        pfomask &= ~(1 << PFO_Z);
+        last_arith_dst = NULL;
+        delayed_flag_op = NULL;
+        break;
+
+      case OP_SCAS:
+        // only does ZF (for now)
+        // repe ~ repeat while ZF=1
+        assert_operand_cnt(3);
+        j = lmod_bytes(po, po->operand[0].lmod);
+        l = (po->flags & OPF_DF) ? '-' : '+';
+        if (po->flags & OPF_REP) {
+          fprintf(fout,
+            "  for (; ecx != 0; ecx--, edi %c= %d)\n", l, j);
+          fprintf(fout,
+            "    if ((cond_z = (%seax == %sedi)) %s 0)\n",
+              lmod_cast_u(po, po->operand[0].lmod),
+              lmod_cast_u_ptr(po, po->operand[0].lmod),
+              (po->flags & OPF_REPZ) ? "==" : "!=");
+          fprintf(fout,
+            "      break;");
+          snprintf(g_comment, sizeof(g_comment), "rep%s scas",
+            (po->flags & OPF_REPZ) ? "e" : "ne");
+        }
+        else {
+          fprintf(fout, "    cond_z = (%seax = %sedi); edi %c= %d;",
+              lmod_cast_u(po, po->operand[0].lmod),
+              lmod_cast_u_ptr(po, po->operand[0].lmod), l, j);
+          strcpy(g_comment, "scas");
         }
         pfomask &= ~(1 << PFO_Z);
         last_arith_dst = NULL;
@@ -4001,6 +4120,19 @@ tailcall:
           fprintf(fout, "  s_%s = %s;", buf1, buf1);
           break;
         }
+        else if (ops[i + 1].op == OP_POP
+          && !(ops[i + 1].flags & OPF_RMD))
+        {
+          // push/pop pair
+          out_dst_opr(buf1, sizeof(buf1),
+            &ops[i + 1], &ops[i + 1].operand[0]);
+          fprintf(fout, "  %s = %s;", buf1,
+            out_src_opr(buf2, sizeof(buf2), po, &po->operand[0],
+              ops[i + 1].operand[0].is_ptr ? "(void *)" : "", 0));
+
+          ops[i + 1].flags |= OPF_RMD;
+          break;
+        }
         if (!(g_ida_func_attr & IDAFA_NORETURN))
           ferr(po, "stray push encountered\n");
         no_output = 1;
@@ -4038,10 +4170,16 @@ tailcall:
       fprintf(fout, "\n");
 
     // some sanity checking
-    if ((po->flags & OPF_REP) && po->op != OP_STOS
-        && po->op != OP_MOVS && po->op != OP_CMPS)
-      ferr(po, "unexpected rep\n");
-    if ((po->flags & (OPF_REPZ|OPF_REPNZ)) && po->op != OP_CMPS)
+    if (po->flags & OPF_REP) {
+      if (po->op != OP_STOS && po->op != OP_MOVS
+          && po->op != OP_CMPS && po->op != OP_SCAS)
+        ferr(po, "unexpected rep\n");
+      if (!(po->flags & (OPF_REPZ|OPF_REPNZ))
+          && (po->op == OP_CMPS || po->op == OP_SCAS))
+        ferr(po, "cmps/scas with plain rep\n");
+    }
+    if ((po->flags & (OPF_REPZ|OPF_REPNZ))
+        && po->op != OP_CMPS && po->op != OP_SCAS)
       ferr(po, "unexpected repz/repnz\n");
 
     if (pfomask != 0)
