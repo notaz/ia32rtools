@@ -81,10 +81,11 @@ static int is_insn_jmp(uint16 itype)
   return itype == NN_jmp || (NN_ja <= itype && itype <= NN_jz);
 }
 
-static void do_def_line(char *buf, size_t buf_size, const char *line)
+static void do_def_line(char *buf, size_t buf_size, const char *line,
+  ea_t ea)
 {
-  char *endp = NULL;
-  ea_t ea, *ea_ret;
+  ea_t *ea_ret;
+  char *p;
   int len;
 
   tag_remove(line, buf, buf_size); // remove color codes
@@ -95,17 +96,17 @@ static void do_def_line(char *buf, size_t buf_size, const char *line)
   }
   memmove(buf, buf + 9, len - 9 + 1); // rm address
 
-  if (IS_START(buf, "loc_")) {
-    ea = strtoul(buf + 4, &endp, 16);
-    if (ea != 0 && *endp == ':') {
-      ea_ret = (ea_t *)bsearch(&ea, nonlocal_bt, nonlocal_bt_cnt,
-        sizeof(nonlocal_bt[0]), nonlocal_bt_cmp);
-      if (ea_ret != 0) {
-        if (endp[1] != ' ')
-          msg("no trailing blank in '%s'\n", buf);
-        else
-          endp[1] = ':';
-      }
+  p = buf;
+  while (*p && *p != ' ' && *p != ':')
+    p++;
+  if (*p == ':') {
+    ea_ret = (ea_t *)bsearch(&ea, nonlocal_bt, nonlocal_bt_cnt,
+      sizeof(nonlocal_bt[0]), nonlocal_bt_cmp);
+    if (ea_ret != 0) {
+      if (p[1] != ' ')
+        msg("no trailing blank in '%s'\n", buf);
+      else
+        p[1] = ':';
     }
   }
 }
@@ -365,7 +366,7 @@ static void idaapi run(int /*arg*/)
   ln.set_place(&pl);
   n = ln.get_linecnt();
   for (i = 0; i < n - 1; i++) {
-    do_def_line(buf, sizeof(buf), ln.down());
+    do_def_line(buf, sizeof(buf), ln.down(), ea);
     if (strstr(buf, "include"))
       continue;
     p = strstr(buf, "assume cs");
@@ -464,7 +465,7 @@ static void idaapi run(int /*arg*/)
 pass:
     n = ln.get_linecnt();
     for (i = pl.lnnum; i < n; i++) {
-      do_def_line(buf, sizeof(buf), ln.down());
+      do_def_line(buf, sizeof(buf), ln.down(), ea);
 
       char *fw;
       for (fw = buf; *fw != 0 && *fw == ' '; )
