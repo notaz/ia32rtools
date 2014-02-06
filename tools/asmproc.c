@@ -9,6 +9,7 @@ struct sl_item {
 	char *name;
 	unsigned int callsites:1;
 	unsigned int found:1;
+	unsigned int ignore_missing:1;
 };
 
 static int cmp_sym(const void *p1_, const void *p2_)
@@ -50,7 +51,7 @@ static int cmp_sym_sort(const void *p1_, const void *p2_)
 }
 
 void read_list(struct sl_item **sl_in, int *cnt, int *alloc,
-	FILE *f, int callsites)
+	FILE *f, int callsites, int ignore_missing)
 {
 	struct sl_item *sl = *sl_in;
 	int c = *cnt;
@@ -64,6 +65,7 @@ void read_list(struct sl_item **sl_in, int *cnt, int *alloc,
 
 		sl[c].name = strdup(word);
 		sl[c].callsites = callsites;
+		sl[c].ignore_missing = ignore_missing;
 		sl[c].found = 0;
 		c++;
 
@@ -101,6 +103,7 @@ int main(int argc, char *argv[])
 {
 	struct sl_item *symlist, *sym, ssym = { NULL, };
 	int patch_callsites = 0;
+	int ignore_missing = 0;
 	FILE *fout, *fin, *f;
 	int symlist_alloc;
 	int symlist_cnt;
@@ -116,9 +119,10 @@ int main(int argc, char *argv[])
 	int i;
 
 	if (argc < 4) {
-		// -c - patch callsites
-		printf("usage:\n%s <asmf_out> <asmf_in> [[-c] <listf>]*>\n",
+		printf("usage:\n%s <asmf_out> <asmf_in> [[-c][-i] <listf>]*>\n",
 			argv[0]);
+		printf("  -c - patch callsites\n"
+					 "  -i - ignore missing syms\n");
 		return 1;
 	}
 
@@ -132,14 +136,19 @@ int main(int argc, char *argv[])
 			patch_callsites = 1;
 			continue;
 		}
+		if (strcmp(argv[i], "-i") == 0) {
+			ignore_missing = 1;
+			continue;
+		}
 
 		f = fopen(argv[i], "r");
 		my_assert_not(f, NULL);
 		read_list(&symlist, &symlist_cnt, &symlist_alloc,
-			f, patch_callsites);
+			f, patch_callsites, ignore_missing);
 		fclose(f);
 
 		patch_callsites = 0;
+		ignore_missing = 0;
 	}
 
 	qsort(symlist, symlist_cnt, sizeof(symlist[0]), cmp_sym_sort);
@@ -311,7 +320,7 @@ offset_loop:
 	}
 
 	for (i = 0; i < symlist_cnt; i++) {
-		if (!symlist[i].found)
+		if (!symlist[i].found && !symlist[i].ignore_missing)
 			printf("warning: sym '%s' not found\n", symlist[i].name);
 	}
 
