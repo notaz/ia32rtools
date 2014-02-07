@@ -55,6 +55,7 @@ enum op_op {
 	OP_LEA,
 	OP_MOVZX,
 	OP_MOVSX,
+	OP_XCHG,
 	OP_NOT,
 	OP_CDQ,
 	OP_STOS,
@@ -726,6 +727,7 @@ static const struct {
   { "lea",  OP_LEA,    2, 2, OPF_DATA },
   { "movzx",OP_MOVZX,  2, 2, OPF_DATA },
   { "movsx",OP_MOVSX,  2, 2, OPF_DATA },
+  { "xchg", OP_XCHG,   2, 2, OPF_DATA },
   { "not",  OP_NOT,    1, 1, OPF_DATA },
   { "cdq",  OP_CDQ,    0, 0, OPF_DATA },
   { "stosb",OP_STOS,   0, 0, OPF_DATA },
@@ -931,6 +933,11 @@ static void parse_op(struct parsed_op *op, char words[16][256], int wordc)
     setup_reg_opr(&op->operand[1], xSI, OPLM_DWORD, &op->regmask_src);
     setup_reg_opr(&op->operand[2], xCX, OPLM_DWORD, &op->regmask_src);
     op->regmask_dst = op->regmask_src;
+    break;
+
+  case OP_XCHG:
+    op->regmask_src |= op->regmask_dst;
+    op->regmask_dst |= op->regmask_src;
     break;
 
   case OP_JECXZ:
@@ -2319,12 +2326,15 @@ static int scan_for_esp_adjust(int i, int opcnt, int *adj)
         ferr(&ops[i], "unaligned esp adjust: %x\n", *adj);
       return i;
     }
-    else if (po->op == OP_PUSH) {
+    else if (po->op == OP_PUSH && !(po->flags & OPF_RMD)) {
       //if (first_pop == -1)
       //  first_pop = -2; // none
       *adj -= lmod_bytes(po, po->operand[0].lmod);
     }
     else if (po->op == OP_POP && !(po->flags & OPF_RMD)) {
+      // seems like msvc only uses 'pop ecx' for stack realignment..
+      if (po->operand[0].type != OPT_REG || po->operand[0].reg != xCX)
+        break;
       if (first_pop == -1 && *adj >= 0)
         first_pop = i;
       *adj += lmod_bytes(po, po->operand[0].lmod);
@@ -2340,10 +2350,7 @@ static int scan_for_esp_adjust(int i, int opcnt, int *adj)
     }
   }
 
-  if (*adj <= 8 && first_pop >= 0 && ops[first_pop].op == OP_POP
-    && ops[first_pop].operand[0].type == OPT_REG
-    && ops[first_pop].operand[0].reg == xCX)
-  {
+  if (first_pop >= 0) {
     // probably 'pop ecx' was used..
     return first_pop;
   }
@@ -2788,6 +2795,7 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
   enum parsed_flag_op pfo;
   int save_arg_vars = 0;
   int cmp_result_vars = 0;
+  int need_tmp_var = 0;
   int need_mul_var = 0;
   int had_decl = 0;
   int label_pending = 0;
@@ -3330,6 +3338,9 @@ tailcall:
     {
       need_mul_var = 1;
     }
+    else if (po->op == OP_XCHG) {
+      need_tmp_var = 1;
+    }
     else if (po->op == OP_CALL) {
       pp = po->datap;
       if (pp == NULL)
@@ -3534,6 +3545,11 @@ tailcall:
     }
   }
 
+  if (need_tmp_var) {
+    fprintf(fout, "  u32 tmp;\n");
+    had_decl = 1;
+  }
+
   if (need_mul_var) {
     fprintf(fout, "  u64 mul_tmp;\n");
     had_decl = 1;
@@ -3670,6 +3686,19 @@ tailcall:
             out_dst_opr(buf1, sizeof(buf1), po, &po->operand[0]),
             out_src_opr(buf2, sizeof(buf2), po, &po->operand[1],
               buf3, 0));
+        break;
+
+      case OP_XCHG:
+        assert_operand_cnt(2);
+        propagate_lmod(po, &po->operand[0], &po->operand[1]);
+        fprintf(fout, "  tmp = %s;",
+          out_src_opr(buf1, sizeof(buf1), po, &po->operand[0], "", 0));
+        fprintf(fout, " %s = %s;",
+          out_dst_opr(buf1, sizeof(buf1), po, &po->operand[0]),
+          out_src_opr(buf2, sizeof(buf2), po, &po->operand[1], "", 0));
+        fprintf(fout, " %s = tmp;",
+          out_dst_opr(buf1, sizeof(buf1), po, &po->operand[1]));
+        snprintf(g_comment, sizeof(g_comment), "xchg");
         break;
 
       case OP_NOT:
