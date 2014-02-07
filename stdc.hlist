@@ -185,6 +185,8 @@ int __cdecl _mbsnicmp (const unsigned char*, const unsigned char*, size_t);
 int __cdecl _mbsnbcmp (const unsigned char*, const unsigned char*, size_t);
 int __cdecl _mbsnbicmp (const unsigned char*, const unsigned char*, size_t);
 
+void * __cdecl _onexit (int (__cdecl *)(void));
+
 void * __cdecl signal (int, void *);
 int __cdecl raise (int);
 

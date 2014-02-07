@@ -193,7 +193,7 @@ int main(int argc, char *argv[])
 			}
 		}
 
-		if (IS_OR3(word, "call", "jmp", "public")) {
+		if (IS_OR2(word, "call", "jmp")) {
 			ssym.name = word2;
 			sym = bsearch(&ssym, symlist, symlist_cnt,
 				sizeof(symlist[0]), cmp_sym);
@@ -202,6 +202,16 @@ int main(int argc, char *argv[])
 			{
 				fprintf(fout, "\t\t%s\t%s%s", word,
 					sym_use(sym), p);
+				continue;
+			}
+		}
+
+		if (IS(word, "public")) {
+			ssym.name = word2;
+			sym = bsearch(&ssym, symlist, symlist_cnt,
+				sizeof(symlist[0]), cmp_sym);
+			if (sym != NULL) {
+				fprintf(fout, "\t\tpublic %s%s", sym_use(sym), p);
 				continue;
 			}
 		}

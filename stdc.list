@@ -65,6 +65,24 @@ __onexit
 _atexit
 __stricmp
 __strnicmp
+
+__strupr
+_sprintf
+_vsprintf
+__strlwr
+__fullpath
+_toupper
+_wcslen
+_wcstombs
+_setlocale
+__setmbcp
+__lseek
+__write
+__isatty
+_xtoa
+__itoa
+__close
+
 # not from mingw
 _memcpy_0
 # math
