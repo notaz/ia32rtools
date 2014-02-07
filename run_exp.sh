@@ -1,15 +1,20 @@
 #!/bin/sh
 
-grep '@' $1 | awk '{print $1}' > $2_explist
+outf=$3
 
-echo ".text" > $2
-echo ".align 4" >> $2
+grep '@' $1 | awk '{print $1}' > ${outf}_explist
 
-cat $2_explist | while read i; do
+echo ".text" > $outf
+echo ".align 4" >> $outf
+
+cat ${outf}_explist | while read i; do
   sym=`echo $i | awk -F@ '{print $1}'`
+  if grep -q "$sym" $2; then
+    continue
+  fi
 
-  echo ".globl _$i" >> $2
-  echo "_$i:" >> $2
-  echo "  jmp $sym" >> $2
-  echo >> $2
+  echo ".globl _$i" >> $outf
+  echo "_$i:" >> $outf
+  echo "  jmp $sym" >> $outf
+  echo >> $outf
 done
