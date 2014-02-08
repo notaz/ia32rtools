@@ -23,13 +23,38 @@ static int is_x86_reg_saved(const char *reg)
 	return !nosave;
 }
 
-static void out_toasm_x86(FILE *f, const char *sym_in,
-	const char *sym_out, const struct parsed_proto *pp)
+// output decorated name
+static const char *pp_to_name(const struct parsed_proto *pp)
+{
+	static char buf[256];
+	char atval[16];
+
+	if (!pp->is_fastcall && pp->argc_reg != 0) {
+		// can only be handled by __cdecl C func
+		snprintf(buf, sizeof(buf), "_%s", pp->name);
+		return buf;
+	}
+
+	atval[0] = 0;
+	if (pp->is_stdcall) {
+		snprintf(atval, sizeof(atval), "@%d",
+			pp->argc * 4);
+	}
+	snprintf(buf, sizeof(buf), "%s%s%s",
+		pp->is_fastcall ? "@" : "_",
+		pp->name, atval);
+
+	return buf;
+}
+
+static void out_toasm_x86(FILE *f, const char *sym_out,
+	const struct parsed_proto *pp)
 {
 	int must_save = 0;
 	int sarg_ofs = 1; // stack offset to args, in DWORDs
 	int args_repushed = 0;
 	int argc_repush;
+	const char *name;
 	int i;
 
 	argc_repush = pp->argc;
@@ -41,8 +66,9 @@ static void out_toasm_x86(FILE *f, const char *sym_in,
 			must_save |= is_x86_reg_saved(pp->arg[i].reg);
 	}
 
-	fprintf(f, ".global %s%s\n", pp->is_fastcall ? "@" : "_", sym_in);
-	fprintf(f, "%s%s:\n", pp->is_fastcall ? "@" : "_", sym_in);
+	name = pp_to_name(pp);
+	fprintf(f, ".global %s\n", name);
+	fprintf(f, "%s:\n", name);
 
 	if (pp->argc_reg == 0 || pp->is_fastcall) {
 		fprintf(f, "\t# %s\n",
@@ -138,11 +164,7 @@ static void out_fromasm_x86(FILE *f, const char *sym,
 	if ((pp->argc_reg == 0 || pp->is_fastcall)
 	    && !IS(pp->name, "storm_491")) // wants edx save :(
 	{
-		fprintf(f, "\tjmp %s%s",
-			pp->is_fastcall ? "@" : "_", sym);
-		if (pp->is_stdcall)
-			fprintf(f, "@%d", pp->argc * 4);
-		fprintf(f, "\n\n");
+		fprintf(f, "\tjmp %s\n\n", pp_to_name(pp));
 		return;
 	}
 
@@ -179,10 +201,7 @@ static void out_fromasm_x86(FILE *f, const char *sym,
 		sarg_ofs++;
 	}
 
-	fprintf(f, "\n\tcall _%s", sym);
-	if (c_is_stdcall)
-		fprintf(f, "@%d", pp->argc_stack * 4);
-	fprintf(f, "\n\n");
+	fprintf(f, "\n\tcall %s\n\n", pp_to_name(pp));
 
 	if (!c_is_stdcall && sarg_ofs > saved_regs + 1)
 		fprintf(f, "\tadd $%d,%%esp\n",
@@ -246,7 +265,7 @@ int main(int argc, char *argv[])
 		if (pp == NULL)
 			goto out;
 
-		out_toasm_x86(fout, sym, sym_noat, pp);
+		out_toasm_x86(fout, sym_noat, pp);
 	}
 
 	fprintf(fout, "# from asm\n\n");
