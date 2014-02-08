@@ -138,10 +138,12 @@ static const char *known_type_mod[] = {
 	"struct",
 	"enum",
 	"CONST",
+	"volatile",
 };
 
 static const char *known_ptr_types[] = {
 	"FARPROC",
+	"WNDPROC",
 	"HACCEL",
 	"HANDLE",
 	"HBITMAP",
@@ -162,6 +164,7 @@ static const char *known_ptr_types[] = {
 	"HWND",
 	"PCRITICAL_SECTION",
 	"PDWORD",
+	"PFILETIME",
 	"PHKEY",
 	"PLONG",
 	"PMEMORY_BASIC_INFORMATION",
