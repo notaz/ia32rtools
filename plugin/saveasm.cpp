@@ -413,7 +413,7 @@ static void idaapi run(int /*arg*/)
 
   for (;;)
   {
-    int drop_large = 0, drop_rva = 0, set_scale = 0, jmp_near = 0;
+    int drop_large = 0, do_rva = 0, set_scale = 0, jmp_near = 0;
     int word_imm = 0, dword_imm = 0, do_pushf = 0;
 
     if ((ea >> 14) != ui_ea_block) {
@@ -476,7 +476,7 @@ static void idaapi run(int /*arg*/)
     }
     else { // not code
       if (isOff0(ea_flags))
-        drop_rva = 1;
+        do_rva = 1;
     }
 
 pass:
@@ -494,11 +494,12 @@ pass:
         if (p != NULL)
           memmove(p, p + 6, strlen(p + 6) + 1);
       }
-      while (drop_rva) {
+      while (do_rva) {
         p = strstr(fw, " rva ");
         if (p == NULL)
           break;
-        memmove(p, p + 4, strlen(p + 4) + 1);
+        memmove(p + 4 + 3, p + 4, strlen(p + 4) + 1);
+        memcpy(p + 1, "offset", 6);
       }
       if (set_scale) {
         p = strchr(fw, '[');
