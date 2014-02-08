@@ -112,6 +112,7 @@ static void out_fromasm_x86(FILE *f, const char *sym,
 {
 	int sarg_ofs = 1; // stack offset to args, in DWORDs
 	int saved_regs = 0;
+	int c_is_stdcall;
 	int argc_repush;
 	int stack_args;
 	int ret64;
@@ -134,14 +135,18 @@ static void out_fromasm_x86(FILE *f, const char *sym,
 	fprintf(f, "\n.global %s\n", sym);
 	fprintf(f, "%s:\n", sym);
 
-	if (pp->argc_reg == 0 || pp->is_fastcall) {
+	if ((pp->argc_reg == 0 || pp->is_fastcall)
+	    && !IS(pp->name, "storm_491")) // wants edx save :(
+	{
 		fprintf(f, "\tjmp %s%s",
 			pp->is_fastcall ? "@" : "_", sym);
-		if (pp->is_stdcall && pp->argc > 0)
+		if (pp->is_stdcall)
 			fprintf(f, "@%d", pp->argc * 4);
 		fprintf(f, "\n\n");
 		return;
 	}
+
+	c_is_stdcall = (pp->argc_reg == 0 && pp->is_stdcall);
 
 	// at least sc sub_47B150 needs edx to be preserved
 	// int64 returns use edx:eax - no edx save
@@ -174,10 +179,12 @@ static void out_fromasm_x86(FILE *f, const char *sym,
 		sarg_ofs++;
 	}
 
-	// no worries about calling conventions - always __cdecl
-	fprintf(f, "\n\tcall _%s\n\n", sym);
+	fprintf(f, "\n\tcall _%s", sym);
+	if (c_is_stdcall)
+		fprintf(f, "@%d", pp->argc_stack * 4);
+	fprintf(f, "\n\n");
 
-	if (sarg_ofs > saved_regs + 1)
+	if (!c_is_stdcall && sarg_ofs > saved_regs + 1)
 		fprintf(f, "\tadd $%d,%%esp\n",
 			(sarg_ofs - (saved_regs + 1)) * 4);
 
