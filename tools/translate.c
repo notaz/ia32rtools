@@ -43,6 +43,7 @@ enum op_flags {
   OPF_FARG   = (1 << 11), /* push collected as func arg (no reuse) */
   OPF_EBP_S  = (1 << 12), /* ebp used as scratch here, not BP */
   OPF_DF     = (1 << 13), /* DF flag set */
+  OPF_ATAIL  = (1 << 14), /* tail call with reused arg frame */
 };
 
 enum op_op {
@@ -2804,7 +2805,7 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
   int save_arg_vars = 0;
   int cmp_result_vars = 0;
   int need_tmp_var = 0;
-  int need_mul_var = 0;
+  int need_tmp64 = 0;
   int had_decl = 0;
   int label_pending = 0;
   int regmask_save = 0;
@@ -2917,34 +2918,44 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
       for (; i < opcnt; i++)
         if (ops[i].op == OP_RET)
           break;
-      if (i == opcnt && (ops[i - 1].flags & OPF_JMP) && found)
-        break;
+      j = i - 1;
+      if (i == opcnt && (ops[j].flags & OPF_JMP)) {
+        if (found) {
+          if (ops[j].op == OP_JMP && !ops[j].operand[0].had_ds)
+            // probably local branch back..
+            break;
+          if (ops[j].op == OP_CALL)
+            // probably noreturn call..
+            break;
+        }
+        j--;
+      }
 
-      if ((ops[i - 1].op == OP_POP && IS(opr_name(&ops[i - 1], 0), "ebp"))
-        || ops[i - 1].op == OP_LEAVE)
+      if ((ops[j].op == OP_POP && IS(opr_name(&ops[j], 0), "ebp"))
+          || ops[j].op == OP_LEAVE)
       {
-        ops[i - 1].flags |= OPF_RMD;
+        ops[j].flags |= OPF_RMD;
       }
       else if (!(g_ida_func_attr & IDAFA_NORETURN))
-        ferr(&ops[i - 1], "'pop ebp' expected\n");
+        ferr(&ops[j], "'pop ebp' expected\n");
 
       if (g_stack_fsz != 0) {
-        if (ops[i - 2].op == OP_MOV
-            && IS(opr_name(&ops[i - 2], 0), "esp")
-            && IS(opr_name(&ops[i - 2], 1), "ebp"))
+        if (ops[j - 1].op == OP_MOV
+            && IS(opr_name(&ops[j - 1], 0), "esp")
+            && IS(opr_name(&ops[j - 1], 1), "ebp"))
         {
-          ops[i - 2].flags |= OPF_RMD;
+          ops[j - 1].flags |= OPF_RMD;
         }
-        else if (ops[i - 1].op != OP_LEAVE
+        else if (ops[j].op != OP_LEAVE
           && !(g_ida_func_attr & IDAFA_NORETURN))
         {
-          ferr(&ops[i - 2], "esp restore expected\n");
+          ferr(&ops[j - 1], "esp restore expected\n");
         }
 
-        if (ecx_push && ops[i - 3].op == OP_POP
-          && IS(opr_name(&ops[i - 3], 0), "ecx"))
+        if (ecx_push && ops[j - 2].op == OP_POP
+          && IS(opr_name(&ops[j - 2], 0), "ecx"))
         {
-          ferr(&ops[i - 3], "unexpected ecx pop\n");
+          ferr(&ops[j - 2], "unexpected ecx pop\n");
         }
       }
 
@@ -3091,6 +3102,8 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
 tailcall:
     po->op = OP_CALL;
     po->flags |= OPF_TAIL;
+    if (i > 0 && ops[i - 1].op == OP_POP)
+      po->flags |= OPF_ATAIL;
     i--; // reprocess
   }
 
@@ -3186,14 +3199,14 @@ tailcall:
         ferr(po, "missing esp_adjust for vararg func '%s'\n",
           pp->name);
 
-      if (!pp->is_unresolved) {
+      if (!pp->is_unresolved && !(po->flags & OPF_ATAIL)) {
         // since we know the args, collect them
         collect_call_args(po, i, pp, &regmask, &save_arg_vars,
           i + opcnt * 2);
       }
 
       if (strstr(pp->ret_type.name, "int64"))
-        need_mul_var = 1;
+        need_tmp64 = 1;
     }
   }
 
@@ -3323,6 +3336,9 @@ tailcall:
               || branched
               || scan_for_mod_opr0(tmp_op, setters[j] + 1, i) >= 0)
             pfomask = 1 << pfo;
+
+          if (tmp_op->op == OP_ADD && pfo == PFO_C)
+            need_tmp64 = 1;
         }
         if (pfomask) {
           tmp_op->pfomask |= pfomask;
@@ -3341,7 +3357,7 @@ tailcall:
     else if (po->op == OP_MUL
       || (po->op == OP_IMUL && po->operand_cnt == 1))
     {
-      need_mul_var = 1;
+      need_tmp64 = 1;
     }
     else if (po->op == OP_XCHG) {
       need_tmp_var = 1;
@@ -3555,8 +3571,8 @@ tailcall:
     had_decl = 1;
   }
 
-  if (need_mul_var) {
-    fprintf(fout, "  u64 mul_tmp;\n");
+  if (need_tmp64) {
+    fprintf(fout, "  u64 tmp64;\n");
     had_decl = 1;
   }
 
@@ -3847,8 +3863,6 @@ tailcall:
         break;
 
       // arithmetic w/flags
-      case OP_ADD:
-      case OP_SUB:
       case OP_AND:
       case OP_OR:
         propagate_lmod(po, &po->operand[0], &po->operand[1]);
@@ -3931,11 +3945,45 @@ tailcall:
         propagate_lmod(po, &po->operand[0], &po->operand[1]);
         if (IS(opr_name(po, 0), opr_name(po, 1))) {
           // special case for XOR
+          if (pfomask & (1 << PFO_BE)) { // weird, but it happens..
+            fprintf(fout, "  cond_be = 1;\n");
+            pfomask &= ~(1 << PFO_BE);
+          }
           fprintf(fout, "  %s = 0;",
             out_dst_opr(buf1, sizeof(buf1), po, &po->operand[0]));
           last_arith_dst = &po->operand[0];
           delayed_flag_op = NULL;
           break;
+        }
+        goto dualop_arith;
+
+      case OP_ADD:
+        assert_operand_cnt(2);
+        propagate_lmod(po, &po->operand[0], &po->operand[1]);
+        if (pfomask & (1 << PFO_C)) {
+          fprintf(fout, "  tmp64 = (u64)%s + %s;\n",
+            out_src_opr_u32(buf1, sizeof(buf1), po, &po->operand[0]),
+            out_src_opr_u32(buf2, sizeof(buf2), po, &po->operand[1]));
+          fprintf(fout, "  cond_c = tmp64 >> 32;\n");
+          fprintf(fout, "  %s = (u32)tmp64;",
+            out_dst_opr(buf1, sizeof(buf1), po, &po->operand[0]));
+          strcat(g_comment, "add64");
+          pfomask &= ~(1 << PFO_C);
+          output_std_flags(fout, po, &pfomask, buf1);
+          last_arith_dst = &po->operand[0];
+          delayed_flag_op = NULL;
+          break;
+        }
+        goto dualop_arith;
+
+      case OP_SUB:
+        assert_operand_cnt(2);
+        propagate_lmod(po, &po->operand[0], &po->operand[1]);
+        if (pfomask & (1 << PFO_C)) {
+          fprintf(fout, "  cond_c = %s < %s;\n",
+            out_src_opr_u32(buf1, sizeof(buf1), po, &po->operand[0]),
+            out_src_opr_u32(buf2, sizeof(buf2), po, &po->operand[1]));
+          pfomask &= ~(1 << PFO_C);
         }
         goto dualop_arith;
 
@@ -4001,10 +4049,10 @@ tailcall:
       case OP_MUL:
         assert_operand_cnt(1);
         strcpy(buf1, po->op == OP_IMUL ? "(s64)(s32)" : "(u64)");
-        fprintf(fout, "  mul_tmp = %seax * %s%s;\n", buf1, buf1,
+        fprintf(fout, "  tmp64 = %seax * %s%s;\n", buf1, buf1,
           out_src_opr_u32(buf2, sizeof(buf2), po, &po->operand[0]));
-        fprintf(fout, "  edx = mul_tmp >> 32;\n");
-        fprintf(fout, "  eax = mul_tmp;");
+        fprintf(fout, "  edx = tmp64 >> 32;\n");
+        fprintf(fout, "  eax = tmp64;");
         last_arith_dst = NULL;
         delayed_flag_op = NULL;
         break;
@@ -4099,7 +4147,7 @@ tailcall:
         if (strstr(pp->ret_type.name, "int64")) {
           if (po->flags & OPF_TAIL)
             ferr(po, "int64 and tail?\n");
-          fprintf(fout, "mul_tmp = ");
+          fprintf(fout, "tmp64 = ");
         }
         else if (!IS(pp->ret_type.name, "void")) {
           if (po->flags & OPF_TAIL) {
@@ -4121,38 +4169,68 @@ tailcall:
         fprintf(fout, "%s%s(", pp->name,
           pp->has_structarg ? "_sa" : "");
 
-        for (arg = 0; arg < pp->argc; arg++) {
-          if (arg > 0)
-            fprintf(fout, ", ");
+        if (po->flags & OPF_ATAIL) {
+          if (pp->argc_stack != g_func_pp->argc_stack
+            || (pp->argc_stack > 0
+                && pp->is_stdcall != g_func_pp->is_stdcall))
+            ferr(po, "incompatible tailcall\n");
 
-          cast[0] = 0;
-          if (pp->arg[arg].type.is_ptr)
-            snprintf(cast, sizeof(cast), "(%s)", pp->arg[arg].type.name);
+          for (arg = j = 0; arg < pp->argc; arg++) {
+            if (arg > 0)
+              fprintf(fout, ", ");
 
-          if (pp->arg[arg].reg != NULL) {
-            fprintf(fout, "%s%s", cast, pp->arg[arg].reg);
-            continue;
+            cast[0] = 0;
+            if (pp->arg[arg].type.is_ptr)
+              snprintf(cast, sizeof(cast), "(%s)",
+                pp->arg[arg].type.name);
+
+            if (pp->arg[arg].reg != NULL) {
+              fprintf(fout, "%s%s", cast, pp->arg[arg].reg);
+              continue;
+            }
+            // stack arg
+            for (; j < g_func_pp->argc; j++)
+              if (g_func_pp->arg[j].reg == NULL)
+                break;
+            fprintf(fout, "%sa%d", cast, j + 1);
+            j++;
           }
+        }
+        else {
+          for (arg = 0; arg < pp->argc; arg++) {
+            if (arg > 0)
+              fprintf(fout, ", ");
 
-          // stack arg
-          tmp_op = pp->arg[arg].datap;
-          if (tmp_op == NULL)
-            ferr(po, "parsed_op missing for arg%d\n", arg);
-          if (tmp_op->argnum != 0) {
-            fprintf(fout, "%ss_a%d", cast, tmp_op->argnum);
-          }
-          else {
-            fprintf(fout, "%s",
-              out_src_opr(buf1, sizeof(buf1),
-                tmp_op, &tmp_op->operand[0], cast, 0));
+            cast[0] = 0;
+            if (pp->arg[arg].type.is_ptr)
+              snprintf(cast, sizeof(cast), "(%s)",
+                pp->arg[arg].type.name);
+
+            if (pp->arg[arg].reg != NULL) {
+              fprintf(fout, "%s%s", cast, pp->arg[arg].reg);
+              continue;
+            }
+
+            // stack arg
+            tmp_op = pp->arg[arg].datap;
+            if (tmp_op == NULL)
+              ferr(po, "parsed_op missing for arg%d\n", arg);
+            if (tmp_op->argnum != 0) {
+              fprintf(fout, "%ss_a%d", cast, tmp_op->argnum);
+            }
+            else {
+              fprintf(fout, "%s",
+                out_src_opr(buf1, sizeof(buf1),
+                  tmp_op, &tmp_op->operand[0], cast, 0));
+            }
           }
         }
         fprintf(fout, ");");
 
         if (strstr(pp->ret_type.name, "int64")) {
           fprintf(fout, "\n");
-          fprintf(fout, "  edx = mul_tmp >> 32;\n");
-          fprintf(fout, "  eax = mul_tmp;");
+          fprintf(fout, "  edx = tmp64 >> 32;\n");
+          fprintf(fout, "  eax = tmp64;");
         }
 
         if (pp->is_unresolved) {
@@ -4185,6 +4263,8 @@ tailcall:
         }
         if (pp->is_noreturn)
           strcat(g_comment, " noreturn");
+        if ((po->flags & OPF_ATAIL) && pp->argc_stack > 0)
+          strcat(g_comment, " argframe");
         delayed_flag_op = NULL;
         last_arith_dst = NULL;
         break;
@@ -4201,6 +4281,8 @@ tailcall:
           fprintf(fout, "  return (%s)eax;",
             g_func_pp->ret_type.name);
         }
+        else if (IS(g_func_pp->ret_type.name, "__int64"))
+          fprintf(fout, "  return ((u64)edx << 32) | eax;");
         else
           fprintf(fout, "  return eax;");
 
