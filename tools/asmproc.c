@@ -239,9 +239,11 @@ int main(int argc, char *argv[])
 		}
 
 		// dd offset <sym>
-		if (IS(word, "dd") && IS(word2, "offset")) {
+		if (IS(word, "dd")
+			&& (IS(word2, "offset") || strstr(p, "offset")))
+		{
 			fprintf(fout, "\t\tdd");
-			strcpy(word, word3);
+			p = next_word(word, sizeof(word), line);
 			goto offset_loop;
 		}
 
@@ -252,9 +254,12 @@ int main(int argc, char *argv[])
 		p = next_word(word4, sizeof(word4), p);
 
 		// <name> dd offset <sym>
-		if (IS(word2, "dd") && IS(word3, "offset")) {
+		if (IS(word2, "dd")
+			&& (IS(word3, "offset") || strstr(p, "offset")))
+		{
 			fprintf(fout, "%s\tdd", word);
-			strcpy(word, word4);
+			p = next_word(word, sizeof(word), line);
+			p = next_word(word, sizeof(word), p);
 			goto offset_loop;
 		}
 
@@ -304,6 +309,19 @@ pass:
 
 offset_loop:
 		while (1) {
+			p2 = next_word(word, sizeof(word), p);
+			if (word[0] == 0 || word[0] == ';') {
+				break;
+			}
+			if (!IS(word, "offset")) {
+				// pass through
+				p2 = strstr(p, "offset");
+				if (p2 == NULL)
+					break;
+				fwrite(p, 1, p2 - p, fout);
+				p2 = next_word(word, sizeof(word), p2);
+			}
+			p = next_word(word, sizeof(word), p2);
 			p2 = strchr(word, ',');
 			if (p2)
 				*p2 = 0;
@@ -314,16 +332,6 @@ offset_loop:
 			fprintf(fout, " offset %s%s",
 				(sym != NULL && sym->callsites) ? sym_use(sym) : word,
 				p2 ? "," : "");
-
-			p2 = next_word(word, sizeof(word), p);
-			if (word[0] == 0 || word[0] == ';') {
-				break;
-			}
-			if (!IS(word, "offset")) {
-				printf("could not handle offset array\n");
-				break;
-			}
-			p = next_word(word, sizeof(word), p2);
 		}
 		fprintf(fout, "%s", p);
 		continue;
