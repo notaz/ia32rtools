@@ -333,9 +333,26 @@ static void idaapi run(int /*arg*/)
       continue;
     }
 
-    if (is_name_reserved(name)) {
+    // rename vars with '?@' (funcs are ok)
+    int change_qat = 0;
+    ea_flags = get_flags_novalue(ea);
+    if (!isCode(ea_flags) && strpbrk(name, "?@"))
+      change_qat = 1;
+
+    if (change_qat || is_name_reserved(name)) {
       msg("%x: renaming name '%s'\n", ea, name);
       qsnprintf(buf, sizeof(buf), "%s_g", name);
+
+      if (change_qat) {
+        for (p = buf; *p != 0; p++) {
+          if (*p == '?' || *p == '@') {
+            qsnprintf(buf2, sizeof(buf2), "%02x", (unsigned char)*p);
+            memmove(p + 1, p, strlen(p) + 1);
+            memcpy(p, buf2, 2);
+          }
+        }
+      }
+
       set_name(ea, buf);
     }
   }
