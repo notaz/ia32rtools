@@ -455,8 +455,8 @@ static int guess_lmod_from_c_type(enum opr_lenmod *lmod,
 {
   static const char *dword_types[] = {
     "int", "_DWORD", "UINT_PTR", "DWORD",
-    "WPARAM", "LPARAM", "UINT",
-    "HIMC",
+    "WPARAM", "LPARAM", "UINT", "__int32",
+    "LONG", "HIMC",
   };
   static const char *word_types[] = {
     "uint16_t", "int16_t", "_WORD",
@@ -465,7 +465,7 @@ static int guess_lmod_from_c_type(enum opr_lenmod *lmod,
   static const char *byte_types[] = {
     "uint8_t", "int8_t", "char",
     "unsigned __int8", "__int8", "BYTE", "_BYTE",
-    "_UNKNOWN",
+    "CHAR", "_UNKNOWN",
   };
   const char *n;
   int i;
@@ -1422,8 +1422,10 @@ static void stack_frame_access(struct parsed_op *po,
       ferr(po, "bp_arg arg%d/w offset %d and type '%s' is too small\n",
         i + 1, offset, g_func_pp->arg[i].type.name);
     }
-    if (popr->is_ptr && popr->lmod != OPLM_DWORD)
-      ferr(po, "bp_arg arg%d: non-dword ptr access\n", i + 1);
+    // can't check this because msvc likes to reuse
+    // arg space for scratch..
+    //if (popr->is_ptr && popr->lmod != OPLM_DWORD)
+    //  ferr(po, "bp_arg arg%d: non-dword ptr access\n", i + 1);
   }
   else
   {
@@ -2305,18 +2307,20 @@ static int scan_for_reg_clear(int i, int reg)
 }
 
 // scan for positive, constant esp adjust
-static int scan_for_esp_adjust(int i, int opcnt, int *adj)
+static int scan_for_esp_adjust(int i, int opcnt, int *adj,
+  int *multipath)
 {
   const struct parsed_proto *pp;
   struct parsed_op *po;
   int first_pop = -1;
-  *adj = 0;
+
+  *adj = *multipath = 0;
 
   for (; i < opcnt; i++) {
     po = &ops[i];
 
     if (g_labels[i][0] != 0)
-      break;
+      *multipath = 1;
 
     if (po->op == OP_ADD && po->operand[0].reg == xSP) {
       if (po->operand[1].type != OPT_CONST)
@@ -2340,6 +2344,10 @@ static int scan_for_esp_adjust(int i, int opcnt, int *adj)
       *adj += lmod_bytes(po, po->operand[0].lmod);
     }
     else if (po->flags & (OPF_JMP|OPF_TAIL)) {
+      if (po->op == OP_JMP && po->btj == NULL) {
+        i = po->bt_i - 1;
+        continue;
+      }
       if (po->op != OP_CALL)
         break;
       if (po->operand[0].type != OPT_LABEL)
@@ -3117,7 +3125,7 @@ tailcall:
           pp = calloc(1, sizeof(*pp));
           my_assert_not(pp, NULL);
           pp->is_fptr = 1;
-          ret = scan_for_esp_adjust(i + 1, opcnt, &j);
+          ret = scan_for_esp_adjust(i + 1, opcnt, &j, &l);
           if (ret < 0) {
             if (!g_allow_regfunc)
               ferr(po, "non-__cdecl indirect call unhandled yet\n");
@@ -3138,7 +3146,7 @@ tailcall:
       // look for and make use of esp adjust
       ret = -1;
       if (!pp->is_stdcall && pp->argc_stack > 0)
-        ret = scan_for_esp_adjust(i + 1, opcnt, &j);
+        ret = scan_for_esp_adjust(i + 1, opcnt, &j, &l);
       if (ret >= 0) {
         if (pp->is_vararg) {
           if (j / 4 < pp->argc_stack)
@@ -3168,7 +3176,7 @@ tailcall:
             ret++;
           }
         }
-        else {
+        else if (!l) {
           // a bit of a hack, but deals with use of
           // single adj for multiple calls
           ops[ret].operand[1].val -= j;
@@ -3305,11 +3313,8 @@ tailcall:
           if (branched || scan_for_mod(tmp_op, setters[j] + 1, i, 0) >= 0)
             pfomask = 1 << pfo;
         }
-        else if (tmp_op->op == OP_SCAS) {
+        else if (tmp_op->op == OP_CMPS || tmp_op->op == OP_SCAS) {
           pfomask = 1 << pfo;
-        }
-        else if (tmp_op->op == OP_CMPS) {
-          pfomask = 1 << PFO_Z;
         }
         else {
           // see if we'll be able to handle based on op result
@@ -3643,6 +3648,27 @@ tailcall:
 
     pfomask = po->pfomask;
 
+    if (po->flags & (OPF_REPZ|OPF_REPNZ)) {
+      // we need initial flags for ecx=0 case..
+      if (i > 0 && ops[i - 1].op == OP_XOR
+        && IS(ops[i - 1].operand[0].name,
+              ops[i - 1].operand[1].name))
+      {
+        fprintf(fout, "  cond_z = ");
+        if (pfomask & (1 << PFO_C))
+          fprintf(fout, "cond_c = ");
+        fprintf(fout, "0;\n");
+      }
+      else if (last_arith_dst != NULL) {
+        out_src_opr_u32(buf3, sizeof(buf3), po, last_arith_dst);
+        out_test_for_cc(buf1, sizeof(buf1), po, PFO_Z, 0,
+          last_arith_dst->lmod, buf3);
+        fprintf(fout, "  cond_z = %s;\n", buf1);
+      }
+      else
+        ferr(po, "missing initial ZF\n");
+    }
+
     switch (po->op)
     {
       case OP_MOV:
@@ -3762,13 +3788,20 @@ tailcall:
         l = (po->flags & OPF_DF) ? '-' : '+';
         if (po->flags & OPF_REP) {
           fprintf(fout,
-            "  for (; ecx != 0; ecx--, edi %c= %d, esi %c= %d)\n",
+            "  for (; ecx != 0; ecx--, edi %c= %d, esi %c= %d) {\n",
             l, j, l, j);
+          if (pfomask & (1 << PFO_C)) {
+            // ugh..
+            fprintf(fout,
+            "    cond_c = %sedi < %sesi;\n", buf1, buf1);
+            pfomask &= ~(1 << PFO_C);
+          }
           fprintf(fout,
             "    if ((cond_z = (%sedi == %sesi)) %s 0)\n",
               buf1, buf1, (po->flags & OPF_REPZ) ? "==" : "!=");
           fprintf(fout,
-            "      break;");
+            "      break;\n"
+            "  }");
           snprintf(g_comment, sizeof(g_comment), "rep%s cmps",
             (po->flags & OPF_REPZ) ? "e" : "ne");
         }
