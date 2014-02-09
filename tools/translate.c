@@ -44,6 +44,7 @@ enum op_flags {
   OPF_EBP_S  = (1 << 12), /* ebp used as scratch here, not BP */
   OPF_DF     = (1 << 13), /* DF flag set */
   OPF_ATAIL  = (1 << 14), /* tail call with reused arg frame */
+  OPF_32BIT  = (1 << 15), /* 32bit division */
 };
 
 enum op_op {
@@ -76,6 +77,8 @@ enum op_op {
 	OP_SAR,
 	OP_ROL,
 	OP_ROR,
+	OP_RCL,
+	OP_RCR,
 	OP_ADC,
 	OP_SBB,
 	OP_INC,
@@ -756,6 +759,8 @@ static const struct {
   { "sar",  OP_SAR,    2, 2, OPF_DATA|OPF_FLAGS },
   { "rol",  OP_ROL,    2, 2, OPF_DATA|OPF_FLAGS },
   { "ror",  OP_ROR,    2, 2, OPF_DATA|OPF_FLAGS },
+  { "rcl",  OP_RCL,    2, 2, OPF_DATA|OPF_FLAGS|OPF_CC },
+  { "rcr",  OP_RCR,    2, 2, OPF_DATA|OPF_FLAGS|OPF_CC },
   { "adc",  OP_ADC,    2, 2, OPF_DATA|OPF_FLAGS|OPF_CC },
   { "sbb",  OP_SBB,    2, 2, OPF_DATA|OPF_FLAGS|OPF_CC },
   { "inc",  OP_INC,    1, 1, OPF_DATA|OPF_FLAGS },
@@ -1734,6 +1739,8 @@ static enum parsed_flag_op split_cond(struct parsed_op *po,
     *is_inv = 1;
     return PFO_LE;
 
+  case OP_RCL:
+  case OP_RCR:
   case OP_ADC:
   case OP_SBB:
     return PFO_C;
@@ -2803,7 +2810,7 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
   const char *tmpname;
   enum parsed_flag_op pfo;
   int save_arg_vars = 0;
-  int cmp_result_vars = 0;
+  int cond_vars = 0;
   int need_tmp_var = 0;
   int need_tmp64 = 0;
   int had_decl = 0;
@@ -2832,7 +2839,7 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
 
   fprintf(fout, "%s ", g_func_pp->ret_type.name);
   output_pp_attrs(fout, g_func_pp, g_ida_func_attr & IDAFA_NORETURN);
-  fprintf(fout, "%s(", funcn);
+  fprintf(fout, "%s(", g_func_pp->name);
 
   for (i = 0; i < g_func_pp->argc; i++) {
     if (i > 0)
@@ -3342,25 +3349,23 @@ tailcall:
         }
         if (pfomask) {
           tmp_op->pfomask |= pfomask;
-          cmp_result_vars |= pfomask;
+          cond_vars |= pfomask;
         }
         // note: may overwrite, currently not a problem
         po->datap = tmp_op;
       }
 
-      if (po->op == OP_ADC || po->op == OP_SBB)
-        cmp_result_vars |= 1 << PFO_C;
+      if (po->op == OP_RCL || po->op == OP_RCR
+       || po->op == OP_ADC || po->op == OP_SBB)
+        cond_vars |= 1 << PFO_C;
     }
     else if (po->op == OP_CMPS || po->op == OP_SCAS) {
-      cmp_result_vars |= 1 << PFO_Z;
+      cond_vars |= 1 << PFO_Z;
     }
     else if (po->op == OP_MUL
       || (po->op == OP_IMUL && po->operand_cnt == 1))
     {
       need_tmp64 = 1;
-    }
-    else if (po->op == OP_XCHG) {
-      need_tmp_var = 1;
     }
     else if (po->op == OP_CALL) {
       pp = po->datap;
@@ -3457,6 +3462,21 @@ tailcall:
     }
     else if (po->op == OP_RET && !IS(g_func_pp->ret_type.name, "void"))
       regmask |= 1 << xAX;
+    else if (po->op == OP_DIV || po->op == OP_IDIV) {
+      // 32bit division is common, look for it
+      if (po->op == OP_DIV)
+        ret = scan_for_reg_clear(i, xDX);
+      else
+        ret = scan_for_cdq_edx(i);
+      if (ret >= 0)
+        po->flags |= OPF_32BIT;
+      else
+        need_tmp64 = 1;
+    }
+
+    if (po->op == OP_RCL || po->op == OP_RCR || po->op == OP_XCHG) {
+      need_tmp_var = 1;
+    }
   }
 
   // pass4:
@@ -3557,9 +3577,9 @@ tailcall:
     }
   }
 
-  if (cmp_result_vars) {
+  if (cond_vars) {
     for (i = 0; i < 8; i++) {
-      if (cmp_result_vars & (1 << i)) {
+      if (cond_vars & (1 << i)) {
         fprintf(fout, "  u32 cond_%s;\n", parsed_flag_op_names[i]);
         had_decl = 1;
       }
@@ -3648,7 +3668,9 @@ tailcall:
       if (po->flags & OPF_JMP) {
         fprintf(fout, "  if %s\n", buf1);
       }
-      else if (po->op == OP_ADC || po->op == OP_SBB) {
+      else if (po->op == OP_RCL || po->op == OP_RCR
+               || po->op == OP_ADC || po->op == OP_SBB)
+      {
         if (is_delayed)
           fprintf(fout, "  cond_%s = %s;\n",
             parsed_flag_op_names[pfo], buf1);
@@ -3892,8 +3914,8 @@ tailcall:
                 j = l - j;
               else
                 j -= 1;
-              fprintf(fout, "  cond_c = (%s & 0x%02x) ? 1 : 0;\n",
-                buf1, 1 << j);
+              fprintf(fout, "  cond_c = (%s >> %d) & 1;\n",
+                buf1, j);
             }
             else
               ferr(po, "zero shift?\n");
@@ -3935,6 +3957,42 @@ tailcall:
         }
         else
           ferr(po, "TODO\n");
+        output_std_flags(fout, po, &pfomask, buf1);
+        last_arith_dst = &po->operand[0];
+        delayed_flag_op = NULL;
+        break;
+
+      case OP_RCL:
+      case OP_RCR:
+        assert_operand_cnt(2);
+        out_dst_opr(buf1, sizeof(buf1), po, &po->operand[0]);
+        l = lmod_bytes(po, po->operand[0].lmod) * 8;
+        if (po->operand[1].type == OPT_CONST) {
+          j = po->operand[1].val % l;
+          if (j == 0)
+            ferr(po, "zero rotate\n");
+          fprintf(fout, "  tmp = (%s >> %d) & 1;\n",
+            buf1, (po->op == OP_RCL) ? (l - j) : (j - 1));
+          if (po->op == OP_RCL) {
+            fprintf(fout,
+              "  %s = (%s << %d) | (cond_c << %d)",
+              buf1, buf1, j, j - 1);
+            if (j != 1)
+              fprintf(fout, " | (%s >> %d)", buf1, l + 1 - j);
+          }
+          else {
+            fprintf(fout,
+              "  %s = (%s >> %d) | (cond_c << %d)",
+              buf1, buf1, j, l - j);
+            if (j != 1)
+              fprintf(fout, " | (%s << %d)", buf1, l + 1 - j);
+          }
+          fprintf(fout, ";\n");
+          fprintf(fout, "  cond_c = tmp;");
+        }
+        else
+          ferr(po, "TODO\n");
+        strcpy(g_comment, (po->op == OP_RCL) ? "rcl" : "rcr");
         output_std_flags(fout, po, &pfomask, buf1);
         last_arith_dst = &po->operand[0];
         delayed_flag_op = NULL;
@@ -4063,20 +4121,32 @@ tailcall:
         if (po->operand[0].lmod != OPLM_DWORD)
           ferr(po, "unhandled lmod %d\n", po->operand[0].lmod);
 
-        // 32bit division is common, look for it
-        if (po->op == OP_DIV)
-          ret = scan_for_reg_clear(i, xDX);
-        else
-          ret = scan_for_cdq_edx(i);
-        if (ret >= 0) {
-          out_src_opr_u32(buf1, sizeof(buf1), po, &po->operand[0]);
-          strcpy(buf2, lmod_cast(po, po->operand[0].lmod,
-            po->op == OP_IDIV));
-          fprintf(fout, "  edx = %seax %% %s%s;\n", buf2, buf2, buf1);
-          fprintf(fout, "  eax = %seax / %s%s;", buf2, buf2, buf1);
+        out_src_opr_u32(buf1, sizeof(buf1), po, &po->operand[0]);
+        strcpy(buf2, lmod_cast(po, po->operand[0].lmod,
+          po->op == OP_IDIV));
+        switch (po->operand[0].lmod) {
+        case OPLM_DWORD:
+          if (po->flags & OPF_32BIT)
+            snprintf(buf3, sizeof(buf3), "%seax", buf2);
+          else {
+            fprintf(fout, "  tmp64 = ((u64)edx << 32) | eax;\n");
+            snprintf(buf3, sizeof(buf3), "%stmp64",
+              (po->op == OP_IDIV) ? "(s64)" : "");
+          }
+          if (po->operand[0].type == OPT_REG
+            && po->operand[0].reg == xDX)
+          {
+            fprintf(fout, "  eax = %s / %s%s;", buf3, buf2, buf1);
+            fprintf(fout, "  edx = %s %% %s%s;\n", buf3, buf2, buf1);
+          }
+          else {
+            fprintf(fout, "  edx = %s %% %s%s;\n", buf3, buf2, buf1);
+            fprintf(fout, "  eax = %s / %s%s;", buf3, buf2, buf1);
+          }
+          break;
+        default:
+          ferr(po, "unhandled division type\n");
         }
-        else
-          ferr(po, "TODO 64bit divident\n");
         last_arith_dst = NULL;
         delayed_flag_op = NULL;
         break;
