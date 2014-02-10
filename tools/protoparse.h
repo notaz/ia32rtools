@@ -536,6 +536,16 @@ static int parse_protostr(char *protostr, struct parsed_proto *pp)
 			arg->reg = strdup(map_reg(regparm));
 		}
 
+		if (strstr(arg->type.name, "int64")
+		    || IS(arg->type.name, "double"))
+		{
+			// hack..
+			free(arg->type.name);
+			arg->type.name = strdup("int");
+			pp_copy_arg(&pp->arg[xarg], arg);
+			xarg++;
+		}
+
 		ret = check_struct_arg(arg);
 		if (ret > 0) {
 			pp->has_structarg = 1;
