@@ -2857,6 +2857,11 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
           ferr(ops, "nested fptr\n");
         fprintf(fout, "%s", pp->arg[j].type.name);
       }
+      if (pp->is_vararg) {
+        if (j > 0)
+          fprintf(fout, ", ");
+        fprintf(fout, "...");
+      }
       fprintf(fout, ")");
     }
     else {
@@ -3428,7 +3433,8 @@ tailcall:
         }
       }
 
-      if (pp->is_fptr) {
+      // declare indirect funcs
+      if (pp->is_fptr && !(pp->name[0] != 0 && pp->is_arg)) {
         if (pp->name[0] != 0) {
           memmove(pp->name + 2, pp->name, strlen(pp->name) + 1);
           memcpy(pp->name, "i_", 2);
@@ -4208,7 +4214,7 @@ tailcall:
         pp = po->datap;
         my_assert_not(pp, NULL);
 
-        if (pp->is_fptr)
+        if (pp->is_fptr && !pp->is_arg)
           fprintf(fout, "  %s = %s;\n", pp->name,
             out_src_opr(buf1, sizeof(buf1), po, &po->operand[0],
               "(void *)", 0));

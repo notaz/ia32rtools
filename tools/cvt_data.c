@@ -517,7 +517,10 @@ int main(int argc, char *argv[])
         fprintf(fout, "\t\t  ");
       }
 
-      if (type == DXT_BYTE && words[w][0] == '\'') {
+      if (type == DXT_BYTE
+        && (words[w][0] == '\''
+            || (w + 1 < wordc && words[w + 1][0] == '\'')))
+      {
         // string; use asciz for most common case
         if (w == wordc - 2 && IS(words[w + 1], "0")) {
           fprintf(fout, ".asciz \"");

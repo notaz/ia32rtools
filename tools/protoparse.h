@@ -28,10 +28,11 @@ struct parsed_proto {
 	unsigned int is_func:1;
 	unsigned int is_stdcall:1;
 	unsigned int is_fastcall:1;
-	unsigned int is_vararg:1;
+	unsigned int is_vararg:1;     // vararg func
 	unsigned int is_fptr:1;
 	unsigned int is_noreturn:1;
 	unsigned int is_unresolved:1;
+	unsigned int is_arg:1;        // decl in func arg
 	unsigned int has_structarg:1;
 };
 
@@ -512,6 +513,10 @@ static int parse_protostr(char *protostr, struct parsed_proto *pp)
 					hdrfn, hdrfline, p1 - protostr);
 				return -1;
 			}
+			arg->fptr->is_arg = 1;
+			// we don't use actual names right now..
+			snprintf(arg->fptr->name,
+				sizeof(arg->fptr->name), "a%d", xarg);
 			// we'll treat it as void * for non-calls
 			arg->type.name = strdup("void *");
 			arg->type.is_ptr = 1;
