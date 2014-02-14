@@ -43,6 +43,8 @@ static const char *reserved_names[] = {
   "offset",
   "aam",
   "text",
+  "size",
+  "c",
 };
 
 static int is_name_reserved(const char *name)
@@ -386,11 +388,6 @@ static void idaapi run(int /*arg*/)
     do_def_line(buf, sizeof(buf), ln.down(), ea);
     if (strstr(buf, "include"))
       continue;
-    p = strstr(buf, "assume cs");
-    if (p != NULL) {
-      memmove(p + 1, p, strlen(p) + 1);
-      *p = ';';
-    }
 
     fout_line++;
     qfprintf(fout, "%s\n", buf);
@@ -406,7 +403,8 @@ static void idaapi run(int /*arg*/)
       qstrncpy(p, "include imports.inc", sizeof(buf) - (p - buf));
       fout_line++;
       qfprintf(fout, "\n%s\n", buf);
-      continue;
+      i++;
+      break;
     }
   }
   pl.lnnum = i;
@@ -551,7 +549,12 @@ pass:
         }
       }
 
-      if (fw[0] == 'e' && IS_START(fw, "end") && fw[3] == ' ') {
+      if (fw[0] == 'a' && IS_START(fw, "assume cs")) {
+        // "assume cs" causes problems with ext syms
+        memmove(fw + 1, fw, strlen(fw) + 1);
+        *fw = ';';
+      }
+      else if (fw[0] == 'e' && IS_START(fw, "end") && fw[3] == ' ') {
         fout_line++;
         qfprintf(fout, "include public.inc\n\n");
 
