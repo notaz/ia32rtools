@@ -482,24 +482,33 @@ int main(int argc, char *argv[])
 	FILE *f_obj, *f_exe;
 	SCNHDR tmphdr;
 	long sztext_cmn;
+	int do_cmp = 1;
 	int retval = 1;
 	int left;
+	int arg;
 	int ret;
 	int i;
 
-	if (argc != 3) {
-		printf("usage:\n%s <a_obj> <exe>\n", argv[0]);
+	for (arg = 1; arg < argc; arg++) {
+		if (!strcmp(argv[arg], "-n"))
+			do_cmp = 0;
+		else
+			break;
+	}
+
+	if (argc != arg + 2) {
+		printf("usage:\n%s [-n] <a_obj> <exe>\n", argv[0]);
 		return 1;
 	}
 
-	f_obj = fopen(argv[1], "r+b");
+	f_obj = fopen(argv[arg++], "r+b");
 	if (f_obj == NULL) {
 		fprintf(stderr, "%s: ", argv[1]);
 		perror("");
 		return 1;
 	}
 
-	f_exe = fopen(argv[2], "r");
+	f_exe = fopen(argv[arg++], "r");
 	if (f_exe == NULL) {
 		fprintf(stderr, "%s: ", argv[2]);
 		perror("");
@@ -539,6 +548,7 @@ int main(int argc, char *argv[])
 		}
 	}
 
+	if (do_cmp)
 	for (i = 0; i < sztext_cmn; i++)
 	{
 		if (s_text_obj.data[i] == s_text_exe.data[i])
