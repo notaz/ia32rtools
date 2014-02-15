@@ -1504,7 +1504,8 @@ static void check_func_pp(struct parsed_op *po,
   }
 }
 
-static void check_label_read_ref(struct parsed_op *po, const char *name)
+static const char *check_label_read_ref(struct parsed_op *po,
+  const char *name)
 {
   const struct parsed_proto *pp;
 
@@ -1514,6 +1515,8 @@ static void check_label_read_ref(struct parsed_op *po, const char *name)
 
   if (pp->is_func)
     check_func_pp(po, pp, "ref");
+
+  return pp->name;
 }
 
 static char *out_src_opr(char *buf, size_t buf_size,
@@ -1522,6 +1525,7 @@ static char *out_src_opr(char *buf, size_t buf_size,
 {
   char tmp1[256], tmp2[256];
   char expr[256];
+  const char *name;
   char *p;
   int ret;
 
@@ -1589,29 +1593,28 @@ static char *out_src_opr(char *buf, size_t buf_size,
     break;
 
   case OPT_LABEL:
-    check_label_read_ref(po, popr->name);
+    name = check_label_read_ref(po, popr->name);
     if (cast[0] == 0 && popr->is_ptr)
       cast = "(u32)";
 
     if (is_lea)
-      snprintf(buf, buf_size, "(u32)&%s", popr->name);
+      snprintf(buf, buf_size, "(u32)&%s", name);
     else if (popr->size_lt)
       snprintf(buf, buf_size, "%s%s%s%s", cast,
         lmod_cast_u_ptr(po, popr->lmod),
-        popr->is_array ? "" : "&",
-        popr->name);
+        popr->is_array ? "" : "&", name);
     else
-      snprintf(buf, buf_size, "%s%s%s", cast, popr->name,
+      snprintf(buf, buf_size, "%s%s%s", cast, name,
         popr->is_array ? "[0]" : "");
     break;
 
   case OPT_OFFSET:
-    check_label_read_ref(po, popr->name);
+    name = check_label_read_ref(po, popr->name);
     if (cast[0] == 0)
       cast = "(u32)";
     if (is_lea)
       ferr(po, "lea an offset?\n");
-    snprintf(buf, buf_size, "%s&%s", cast, popr->name);
+    snprintf(buf, buf_size, "%s&%s", cast, name);
     break;
 
   case OPT_CONST:

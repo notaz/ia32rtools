@@ -18,6 +18,11 @@ static int cmp_sym(const void *p1_, const void *p2_)
 	const char *s1 = p1->name, *s2 = p2->name;
 	int i;
 
+	if (*s1 == '_')
+		s1++;
+	if (*s2 == '_')
+		s2++;
+
 	for (i = 0; ; i++) {
 		if ((s1[i] | s2[i]) == 0)
 			break;
@@ -81,12 +86,13 @@ void read_list(struct sl_item **sl_in, int *cnt, int *alloc,
 	*cnt = c;
 }
 
-const char *sym_use(const struct sl_item *sym)
+const char *sym_use(const struct sl_item *sym, int is_rm)
 {
 	static char buf[256+3];
 	int ret;
 
-	ret = snprintf(buf, sizeof(buf), "rm_%s", sym->name);
+	ret = snprintf(buf, sizeof(buf), "%s%s",
+	  is_rm ? "rm_" : "", sym->name);
 	if (ret >= sizeof(buf)) {
 		printf("truncation detected: '%s'\n", buf);
 		exit(1);
@@ -188,7 +194,7 @@ int main(int argc, char *argv[])
 				sizeof(symlist[0]), cmp_sym);
 			if (sym != NULL) {
 				sym->found = 1;
-				fprintf(fout, "rm_%s\t%s%s", word, word2, p);
+				fprintf(fout, "%s\t%s%s", sym_use(sym, 1), word2, p);
 				continue;
 			}
 		}
@@ -197,11 +203,9 @@ int main(int argc, char *argv[])
 			ssym.name = word2;
 			sym = bsearch(&ssym, symlist, symlist_cnt,
 				sizeof(symlist[0]), cmp_sym);
-			if (sym != NULL
-			    && (sym->callsites || IS(word2, func)))
-			{
+			if (sym != NULL) {
 				fprintf(fout, "\t\t%s\t%s%s", word,
-					sym_use(sym), p);
+					sym_use(sym, sym->callsites || IS(word2, func)), p);
 				continue;
 			}
 		}
@@ -211,7 +215,7 @@ int main(int argc, char *argv[])
 			sym = bsearch(&ssym, symlist, symlist_cnt,
 				sizeof(symlist[0]), cmp_sym);
 			if (sym != NULL) {
-				fprintf(fout, "\t\tpublic %s%s", sym_use(sym), p);
+				fprintf(fout, "\t\tpublic %s%s", sym_use(sym, 1), p);
 				continue;
 			}
 		}
@@ -225,15 +229,13 @@ int main(int argc, char *argv[])
 		// push offset <sym>
 		// jcc short <sym>
 		if ( (IS(word, "push") && IS(word2, "offset"))
-		  || (word[0] == 'j' && IS(word2, "short")) ) {
+		  || (word[0] == 'j' && IS(word2, "short") && !IS(word3, "exit")) ) {
 			ssym.name = word3;
 			sym = bsearch(&ssym, symlist, symlist_cnt,
 				sizeof(symlist[0]), cmp_sym);
-			if (sym != NULL
-			    && (sym->callsites || IS(word3, func)))
-			{
-				fprintf(fout, "\t\t%s %s %s%s",
-					word, word2, sym_use(sym), p);
+			if (sym != NULL) {
+				fprintf(fout, "\t\t%s %s %s%s", word, word2,
+				  sym_use(sym, sym->callsites || IS(word3, func)), p);
 				continue;
 			}
 		}
@@ -270,10 +272,10 @@ int main(int argc, char *argv[])
 			ssym.name = word4;
 			sym = bsearch(&ssym, symlist, symlist_cnt,
 				sizeof(symlist[0]), cmp_sym);
-			if (sym != NULL && sym->callsites) {
+			if (sym != NULL) {
 				fprintf(fout, "\t\t%s\t%s %s %s%s",
 					word, word2, word3,
-					sym_use(sym), p);
+					sym_use(sym, sym->callsites), p);
 				continue;
 			}
 		}
@@ -296,9 +298,9 @@ int main(int argc, char *argv[])
 			ssym.name = word6;
 			sym = bsearch(&ssym, symlist, symlist_cnt,
 				sizeof(symlist[0]), cmp_sym);
-			if (sym != NULL && sym->callsites) {
+			if (sym != NULL) {
 				fprintf(fout, "\t\t%s\tdword ptr %s offset %s%s",
-					word, word4, sym_use(sym), p);
+					word, word4, sym_use(sym, sym->callsites), p);
 				continue;
 			}
 		}
@@ -330,7 +332,7 @@ offset_loop:
 			sym = bsearch(&ssym, symlist, symlist_cnt,
 				sizeof(symlist[0]), cmp_sym);
 			fprintf(fout, " offset %s%s",
-				(sym != NULL && sym->callsites) ? sym_use(sym) : word,
+				(sym != NULL) ? sym_use(sym, sym->callsites) : word,
 				p2 ? "," : "");
 		}
 		fprintf(fout, "%s", p);

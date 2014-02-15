@@ -162,6 +162,7 @@ static const char *known_ptr_types[] = {
 	"HRSRC",
 	"HKEY",
 	"HMENU",
+	"HWAVEOUT",
 	"HWND",
 	"PBYTE",
 	"PCRITICAL_SECTION",
@@ -664,6 +665,7 @@ static const struct parsed_proto *proto_parse(FILE *fhdr, const char *sym,
 {
 	const struct parsed_proto *pp_ret;
 	struct parsed_proto pp_search;
+	char *p;
 
 	if (pp_cache == NULL)
 		build_pp_cache(fhdr);
@@ -672,6 +674,10 @@ static const struct parsed_proto *proto_parse(FILE *fhdr, const char *sym,
 		sym++;
 
 	strcpy(pp_search.name, sym);
+	p = strchr(pp_search.name, '@');
+	if (p != NULL)
+		*p = 0;
+
 	pp_ret = bsearch(&pp_search, pp_cache, pp_cache_size,
 			sizeof(pp_cache[0]), pp_name_cmp);
 	if (pp_ret == NULL && !quiet)
