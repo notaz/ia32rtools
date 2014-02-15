@@ -45,6 +45,7 @@ enum op_flags {
   OPF_DF     = (1 << 13), /* DF flag set */
   OPF_ATAIL  = (1 << 14), /* tail call with reused arg frame */
   OPF_32BIT  = (1 << 15), /* 32bit division */
+  OPF_LOCK   = (1 << 16), /* op has lock prefix */
 };
 
 enum op_op {
@@ -204,7 +205,7 @@ enum ida_func_attr {
 static struct parsed_op ops[MAX_OPS];
 static struct parsed_equ *g_eqs;
 static int g_eqcnt;
-static char g_labels[MAX_OPS][32];
+static char g_labels[MAX_OPS][48];
 static struct label_ref g_label_refs[MAX_OPS];
 static const struct parsed_proto *g_func_pp;
 static struct parsed_data *g_func_pd;
@@ -406,12 +407,21 @@ static const char *parse_stack_el(const char *name, char *extra_reg)
   if (!IS_START(name, "esp+"))
     return NULL;
 
-  p = strchr(name + 4, '+');
+  s = name + 4;
+  p = strchr(s, '+');
   if (p) {
-    // must be a number after esp+, already converted to 0x..
-    s = name + 4;
+    if (is_reg_in_str(s)) {
+      if (extra_reg != NULL) {
+        strncpy(extra_reg, s, p - s);
+        extra_reg[p - s] = 0;
+      }
+      s = p + 1;
+      p = strchr(s, '+');
+      if (p == NULL)
+        aerr("%s IDA stackvar not set?\n", __func__);
+    }
     if (!('0' <= *s && *s <= '9')) {
-      aerr("%s nan?\n", __func__);
+      aerr("%s IDA stackvar offset not set?\n", __func__);
       return NULL;
     }
     if (s[0] == '0' && s[1] == 'x')
@@ -712,6 +722,7 @@ static const struct {
   { "repz",   OPF_REP|OPF_REPZ },
   { "repne",  OPF_REP|OPF_REPNZ },
   { "repnz",  OPF_REP|OPF_REPNZ },
+  { "lock",   OPF_LOCK }, // ignored for now..
 };
 
 #define OPF_CJMP_CC (OPF_JMP|OPF_CJMP|OPF_CC)
@@ -1257,7 +1268,7 @@ static int is_stack_access(struct parsed_op *po,
 
 static void parse_stack_access(struct parsed_op *po,
   const char *name, char *ofs_reg, int *offset_out,
-  int *stack_ra_out, const char **bp_arg_out)
+  int *stack_ra_out, const char **bp_arg_out, int is_lea)
 {
   const char *bp_arg = "";
   const char *p = NULL;
@@ -1292,8 +1303,12 @@ static void parse_stack_access(struct parsed_op *po,
   if (!strncmp(name, "ebp", 3))
     stack_ra = 4;
 
-  if (ofs_reg[0] == 0 && stack_ra <= offset && offset < stack_ra + 4)
+  // yes it sometimes LEAs ra for compares..
+  if (!is_lea && ofs_reg[0] == 0
+    && stack_ra <= offset && offset < stack_ra + 4)
+  {
     ferr(po, "reference to ra? %d %d\n", offset, stack_ra);
+  }
 
   *offset_out = offset;
   *stack_ra_out = stack_ra;
@@ -1319,7 +1334,8 @@ static void stack_frame_access(struct parsed_op *po,
   if (po->flags & OPF_EBP_S)
     ferr(po, "stack_frame_access while ebp is scratch\n");
 
-  parse_stack_access(po, name, ofs_reg, &offset, &stack_ra, &bp_arg);
+  parse_stack_access(po, name, ofs_reg, &offset,
+    &stack_ra, &bp_arg, is_lea);
 
   if (offset > stack_ra)
   {
@@ -1959,7 +1975,8 @@ static void op_set_clear_flag(struct parsed_op *po,
 
 // last op in stream - unconditional branch or ret
 #define LAST_OP(_i) ((ops[_i].flags & OPF_TAIL) \
-  || (ops[_i].flags & (OPF_JMP|OPF_CJMP)) == OPF_JMP)
+  || ((ops[_i].flags & (OPF_JMP|OPF_CJMP)) == OPF_JMP \
+      && ops[_i].op != OP_CALL))
 
 static int scan_for_pop(int i, int opcnt, const char *reg,
   int magic, int depth, int *maxdepth, int do_flags)
@@ -2425,7 +2442,7 @@ static const struct parsed_proto *try_recover_pp(
     int offset = 0;
 
     parse_stack_access(po, opr->name, ofs_reg,
-      &offset, &stack_ra, NULL);
+      &offset, &stack_ra, NULL, 0);
     if (ofs_reg[0] != 0)
       ferr(po, "offset reg on arg access?\n");
     if (offset <= stack_ra) {
@@ -2475,11 +2492,9 @@ static void scan_for_call_type(int i, const struct parsed_opr *opr,
   struct parsed_op *po;
   struct label_ref *lr;
 
-  while (i >= 0) {
-    if (ops[i].cc_scratch == magic)
-      return;
-    ops[i].cc_scratch = magic;
+  ops[i].cc_scratch = magic;
 
+  while (1) {
     if (g_labels[i][0] != 0) {
       lr = &g_label_refs[i];
       for (; lr != NULL; lr = lr->next)
@@ -2487,7 +2502,14 @@ static void scan_for_call_type(int i, const struct parsed_opr *opr,
       if (i > 0 && LAST_OP(i - 1))
         return;
     }
+
     i--;
+    if (i < 0)
+      break;
+
+    if (ops[i].cc_scratch == magic)
+      return;
+    ops[i].cc_scratch = magic;
 
     if (!(ops[i].flags & OPF_DATA))
       continue;
@@ -2743,6 +2765,22 @@ static int collect_call_args(struct parsed_op *po, int i,
   return ret;
 }
 
+// early check for tail call or branch back
+static int is_like_tailjmp(int j)
+{
+  if (!(ops[j].flags & OPF_JMP))
+    return 0;
+
+  if (ops[j].op == OP_JMP && !ops[j].operand[0].had_ds)
+    // probably local branch back..
+    return 1;
+  if (ops[j].op == OP_CALL)
+    // probably noreturn call..
+    return 1;
+
+  return 0;
+}
+
 static void pp_insert_reg_arg(struct parsed_proto *pp, const char *reg)
 {
   int i;
@@ -2935,14 +2973,8 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
           break;
       j = i - 1;
       if (i == opcnt && (ops[j].flags & OPF_JMP)) {
-        if (found) {
-          if (ops[j].op == OP_JMP && !ops[j].operand[0].had_ds)
-            // probably local branch back..
+        if (found && is_like_tailjmp(j))
             break;
-          if (ops[j].op == OP_CALL)
-            // probably noreturn call..
-            break;
-        }
         j--;
       }
 
@@ -2990,6 +3022,7 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
       }
     }
 
+    found = 0;
     if (g_sp_frame)
     {
       g_stack_fsz = ops[i].operand[1].val;
@@ -3000,13 +3033,21 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
         for (; i < opcnt; i++)
           if (ops[i].op == OP_RET)
             break;
-        if (ops[i - 1].op != OP_ADD
-            || !IS(opr_name(&ops[i - 1], 0), "esp")
-            || ops[i - 1].operand[1].type != OPT_CONST
-            || ops[i - 1].operand[1].val != g_stack_fsz)
-          ferr(&ops[i - 1], "'add esp' expected\n");
-        ops[i - 1].flags |= OPF_RMD;
+        j = i - 1;
+        if (i == opcnt && (ops[j].flags & OPF_JMP)) {
+          if (found && is_like_tailjmp(j))
+              break;
+          j--;
+        }
 
+        if (ops[j].op != OP_ADD
+            || !IS(opr_name(&ops[j], 0), "esp")
+            || ops[j].operand[1].type != OPT_CONST
+            || ops[j].operand[1].val != g_stack_fsz)
+          ferr(&ops[j], "'add esp' expected\n");
+        ops[j].flags |= OPF_RMD;
+
+        found = 1;
         i++;
       } while (i < opcnt);
     }
@@ -3148,6 +3189,9 @@ tailcall:
           if (l)
             // not resolved just to single func
             pp->is_fptr = 1;
+          if (po->operand[0].type == OPT_REG)
+            // we resolved this call and no longer need the register
+            po->regmask_src &= ~(1 << po->operand[0].reg);
         }
         if (pp == NULL) {
           pp = calloc(1, sizeof(*pp));
@@ -3308,7 +3352,7 @@ tailcall:
       if (g_bp_frame && !(po->flags & OPF_EBP_S)) {
         if (po->regmask_dst & (1 << xBP))
           // compiler decided to drop bp frame and use ebp as scratch
-          scan_fwd_set_flags(i, opcnt, i + opcnt * 5, OPF_EBP_S);
+          scan_fwd_set_flags(i + 1, opcnt, i + opcnt * 5, OPF_EBP_S);
         else
           regmask_now &= ~(1 << xBP);
       }
@@ -3482,6 +3526,8 @@ tailcall:
       else
         need_tmp64 = 1;
     }
+    else if (po->op == OP_CLD)
+      po->flags |= OPF_RMD;
 
     if (po->op == OP_RCL || po->op == OP_RCR || po->op == OP_XCHG) {
       need_tmp_var = 1;
