@@ -6,6 +6,7 @@ struct parsed_type {
 	unsigned int is_array:1;
 	unsigned int is_ptr:1;
 	unsigned int is_struct:1; // split for args
+	unsigned int is_retreg:1; // register to return
 };
 
 struct parsed_proto_arg {
@@ -32,8 +33,10 @@ struct parsed_proto {
 	unsigned int is_fptr:1;
 	unsigned int is_noreturn:1;
 	unsigned int is_unresolved:1;
+	unsigned int is_userstack:1;
 	unsigned int is_arg:1;        // decl in func arg
 	unsigned int has_structarg:1;
+	unsigned int has_retreg:1;
 };
 
 static const char *hdrfn;
@@ -113,14 +116,22 @@ static int do_protostrs(FILE *fhdr, const char *fname)
 	return -1;
 }
 
-static int get_regparm(char *dst, size_t dlen, char *p)
+static int get_regparm(char *dst, size_t dlen, char *p, int *retreg)
 {
-	int i, o;
+	int i = 0, o;
+
+	*retreg = 0;
 
 	if (*p != '<')
 		return 0;
 
-	for (o = 0, i = 1; o < dlen; i++) {
+	i++;
+	if (p[i] == '*') {
+		*retreg = 1;
+		i++;
+	}
+
+	for (o = 0; o < dlen; i++) {
 		if (p[i] == 0)
 			return 0;
 		if (p[i] == '>')
@@ -302,6 +313,7 @@ static int parse_protostr(char *protostr, struct parsed_proto *pp)
 	char regparm[16];
 	char buf[256];
 	char cconv[32];
+	int is_retreg;
 	int xarg = 0;
 	char *p, *p1;
 	int i, l;
@@ -390,6 +402,10 @@ static int parse_protostr(char *protostr, struct parsed_proto *pp)
 		pp->is_stdcall = 1; // IDA
 	else if (IS(cconv, "__usercall"))
 		pp->is_stdcall = 0; // IDA
+	else if (IS(cconv, "__userstack")) {
+		pp->is_stdcall = 0; // custom
+		pp->is_userstack = 1;
+	}
 	else if (IS(cconv, "WINAPI"))
 		pp->is_stdcall = 1;
 	else {
@@ -420,7 +436,7 @@ static int parse_protostr(char *protostr, struct parsed_proto *pp)
 	}
 	strcpy(pp->name, buf);
 
-	ret = get_regparm(regparm, sizeof(regparm), p);
+	ret = get_regparm(regparm, sizeof(regparm), p, &is_retreg);
 	if (ret > 0) {
 		if (!IS(regparm, "eax") && !IS(regparm, "ax")
 		 && !IS(regparm, "al") && !IS(regparm, "edx:eax"))
@@ -536,12 +552,14 @@ static int parse_protostr(char *protostr, struct parsed_proto *pp)
 #endif
 		arg->reg = NULL;
 
-		ret = get_regparm(regparm, sizeof(regparm), p);
+		ret = get_regparm(regparm, sizeof(regparm), p, &is_retreg);
 		if (ret > 0) {
 			p += ret;
 			p = sskip(p);
 
 			arg->reg = strdup(map_reg(regparm));
+			arg->type.is_retreg = is_retreg;
+			pp->has_retreg |= is_retreg;
 		}
 
 		if (strstr(arg->type.name, "int64")

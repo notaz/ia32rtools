@@ -10,6 +10,8 @@
 
 #include "protoparse.h"
 
+static const char *c_save_regs[] = { "ebx", "esi", "edi", "ebp" };
+
 static int is_x86_reg_saved(const char *reg)
 {
 	static const char *nosave_regs[] = { "eax", "edx", "ecx" };
@@ -79,7 +81,7 @@ static void out_toasm_x86(FILE *f, const char *sym_out,
 	}
 
 	if (pp->argc_stack == 0 && !must_save && !pp->is_stdcall
-	     && !pp->is_vararg)
+	     && !pp->is_vararg && !pp->has_retreg)
 	{
 		// load arg regs
 		for (i = 0; i < pp->argc; i++) {
@@ -90,15 +92,17 @@ static void out_toasm_x86(FILE *f, const char *sym_out,
 		return;
 	}
 
+	// asm_stack_args | saved_regs | ra | args_from_c
+
 	// save the regs
-	for (i = 0; i < pp->argc; i++) {
-		if (pp->arg[i].reg != NULL && is_x86_reg_saved(pp->arg[i].reg)) {
-			fprintf(f, "\tpushl %%%s\n", pp->arg[i].reg);
-			sarg_ofs++;
-		}
+	// because we don't always know what we are calling,
+	// be safe and save everything that has to be saved in __cdecl
+	for (i = 0; i < ARRAY_SIZE(c_save_regs); i++) {
+		fprintf(f, "\tpushl %%%s\n", c_save_regs[i]);
+		sarg_ofs++;
 	}
 
-	// reconstruct arg stack
+	// reconstruct arg stack for asm
 	for (i = argc_repush - 1; i >= 0; i--) {
 		if (pp->arg[i].reg == NULL) {
 			fprintf(f, "\tmovl %d(%%esp), %%eax\n",
@@ -108,27 +112,40 @@ static void out_toasm_x86(FILE *f, const char *sym_out,
 			args_repushed++;
 		}
 	}
-	// my_assert(args_repushed, pp->argc_stack);
 
 	// load arg regs
 	for (i = 0; i < pp->argc; i++) {
 		if (pp->arg[i].reg != NULL) {
 			fprintf(f, "\tmovl %d(%%esp), %%%s\n",
 				(i + sarg_ofs) * 4, pp->arg[i].reg);
+			if (pp->arg[i].type.is_retreg)
+				fprintf(f, "\tmovl (%%%s), %%%s\n",
+					pp->arg[i].reg, pp->arg[i].reg);
 		}
 	}
 
 	fprintf(f, "\n\t# %s\n", pp->is_stdcall ? "__stdcall" : "__cdecl");
 	fprintf(f, "\tcall %s\n\n", sym_out);
 
-	if (args_repushed && !pp->is_stdcall)
+	if (args_repushed && !pp->is_stdcall) {
 		fprintf(f, "\tadd $%d,%%esp\n", args_repushed * 4);
+		sarg_ofs -= args_repushed;
+	}
+
+	// update the retreg regs
+	if (pp->has_retreg) {
+		for (i = 0; i < pp->argc; i++) {
+			if (pp->arg[i].type.is_retreg) {
+				fprintf(f, "\tmovl %d(%%esp), %%ecx\n"
+					   "\tmovl %%%s, (%%ecx)\n",
+					(i + sarg_ofs) * 4, pp->arg[i].reg);
+			}
+		}
+	}
 
 	// restore regs
-	for (i = pp->argc - 1; i >= 0; i--) {
-		if (pp->arg[i].reg != NULL && is_x86_reg_saved(pp->arg[i].reg))
-			fprintf(f, "\tpopl %%%s\n", pp->arg[i].reg);
-	}
+	for (i = ARRAY_SIZE(c_save_regs) - 1; i >= 0; i--)
+		fprintf(f, "\tpopl %%%s\n", c_save_regs[i]);
 
 	fprintf(f, "\tret\n\n");
 }
@@ -136,8 +153,11 @@ static void out_toasm_x86(FILE *f, const char *sym_out,
 static void out_fromasm_x86(FILE *f, const char *sym,
 	const struct parsed_proto *pp)
 {
+	int reg_ofs[ARRAY_SIZE(pp->arg)];
 	int sarg_ofs = 1; // stack offset to args, in DWORDs
 	int saved_regs = 0;
+	int ecx_ofs = -1;
+	int edx_ofs = -1;
 	int c_is_stdcall;
 	int argc_repush;
 	int stack_args;
@@ -176,10 +196,32 @@ static void out_fromasm_x86(FILE *f, const char *sym,
 	fprintf(f, "\tpushl %%ecx\n");
 	saved_regs++;
 	sarg_ofs++;
+	ecx_ofs = sarg_ofs;
 	if (!ret64) {
 		fprintf(f, "\tpushl %%edx\n");
 		saved_regs++;
 		sarg_ofs++;
+		edx_ofs = sarg_ofs;
+	}
+
+	// need space for retreg args
+	if (pp->has_retreg) {
+		for (i = 0; i < pp->argc; i++) {
+			if (!pp->arg[i].type.is_retreg)
+				continue;
+			if (IS(pp->arg[i].reg, "ecx") && ecx_ofs >= 0) {
+				reg_ofs[i] = ecx_ofs;
+				continue;
+			}
+			if (IS(pp->arg[i].reg, "edx") && edx_ofs >= 0) {
+				reg_ofs[i] = edx_ofs;
+				continue;
+			}
+			fprintf(f, "\tpushl %%%s\n", pp->arg[i].reg);
+			saved_regs++;
+			sarg_ofs++;
+			reg_ofs[i] = sarg_ofs;
+		}
 	}
 
 	// construct arg stack
@@ -191,12 +233,18 @@ static void out_fromasm_x86(FILE *f, const char *sym,
 			stack_args--;
 		}
 		else {
-			if (IS(pp->arg[i].reg, "ecx"))
+			const char *reg = pp->arg[i].reg;
+			if (pp->arg[i].type.is_retreg) {
+				reg = "ecx";
+				fprintf(f, "\tlea %d(%%esp), %%ecx\n",
+				  (sarg_ofs - reg_ofs[i]) * 4);
+			}
+			else if (IS(reg, "ecx"))
 				// must reload original ecx
 				fprintf(f, "\tmovl %d(%%esp), %%ecx\n",
 					(sarg_ofs - 2) * 4);
 
-			fprintf(f, "\tpushl %%%s\n", pp->arg[i].reg);
+			fprintf(f, "\tpushl %%%s\n", reg);
 		}
 		sarg_ofs++;
 	}
@@ -206,6 +254,21 @@ static void out_fromasm_x86(FILE *f, const char *sym,
 	if (!c_is_stdcall && sarg_ofs > saved_regs + 1)
 		fprintf(f, "\tadd $%d,%%esp\n",
 			(sarg_ofs - (saved_regs + 1)) * 4);
+
+	// pop retregs
+	if (pp->has_retreg) {
+		for (i = pp->argc - 1; i >= 0; i--) {
+			if (!pp->arg[i].type.is_retreg)
+				continue;
+			if (IS(pp->arg[i].reg, "ecx") && ecx_ofs >= 0) {
+				continue;
+			}
+			if (IS(pp->arg[i].reg, "edx") && edx_ofs >= 0) {
+				continue;
+			}
+			fprintf(f, "\tpopl %%%s\n", pp->arg[i].reg);
+		}
+	}
 
 	if (!ret64)
 		fprintf(f, "\tpopl %%edx\n");

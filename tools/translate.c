@@ -82,6 +82,7 @@ enum op_op {
 	OP_RCR,
 	OP_ADC,
 	OP_SBB,
+	OP_BSF,
 	OP_INC,
 	OP_DEC,
 	OP_NEG,
@@ -774,6 +775,7 @@ static const struct {
   { "rcr",  OP_RCR,    2, 2, OPF_DATA|OPF_FLAGS|OPF_CC },
   { "adc",  OP_ADC,    2, 2, OPF_DATA|OPF_FLAGS|OPF_CC },
   { "sbb",  OP_SBB,    2, 2, OPF_DATA|OPF_FLAGS|OPF_CC },
+  { "bsf",  OP_BSF,    2, 2, OPF_DATA|OPF_FLAGS },
   { "inc",  OP_INC,    1, 1, OPF_DATA|OPF_FLAGS },
   { "dec",  OP_DEC,    1, 1, OPF_DATA|OPF_FLAGS },
   { "neg",  OP_NEG,    1, 1, OPF_DATA|OPF_FLAGS },
@@ -2591,6 +2593,43 @@ static const struct parsed_proto *resolve_icall(int i, int opcnt,
   return pp;
 }
 
+static int try_resolve_const(int i, const struct parsed_opr *opr,
+  int magic, unsigned int *val)
+{
+  struct label_ref *lr;
+  int ret = 0;
+
+  ops[i].cc_scratch = magic;
+
+  while (1) {
+    if (g_labels[i][0] != 0) {
+      lr = &g_label_refs[i];
+      for (; lr != NULL; lr = lr->next)
+        ret |= try_resolve_const(lr->i, opr, magic, val);
+      if (i > 0 && LAST_OP(i - 1))
+        return ret;
+    }
+
+    i--;
+    if (i < 0)
+      return -1;
+
+    if (ops[i].cc_scratch == magic)
+      return 0;
+    ops[i].cc_scratch = magic;
+
+    if (!(ops[i].flags & OPF_DATA))
+      continue;
+    if (!is_opr_modified(opr, &ops[i]))
+      continue;
+    if (ops[i].op != OP_MOV && ops[i].operand[1].type != OPT_CONST)
+      return -1;
+
+    *val = ops[i].operand[1].val;
+    return 1;
+  }
+}
+
 static int collect_call_args_r(struct parsed_op *po, int i,
   struct parsed_proto *pp, int *regmask, int *save_arg_vars, int arg,
   int magic, int need_op_saving, int may_reuse)
@@ -2850,6 +2889,7 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
   struct parsed_data *pd;
   const char *tmpname;
   enum parsed_flag_op pfo;
+  unsigned int uval;
   int save_arg_vars = 0;
   int cond_vars = 0;
   int need_tmp_var = 0;
@@ -2904,6 +2944,9 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
         fprintf(fout, "...");
       }
       fprintf(fout, ")");
+    }
+    else if (g_func_pp->arg[i].type.is_retreg) {
+      fprintf(fout, "u32 *r_%s", g_func_pp->arg[i].reg);
     }
     else {
       fprintf(fout, "%s a%d", g_func_pp->arg[i].type.name, i + 1);
@@ -3189,9 +3232,18 @@ tailcall:
           if (l)
             // not resolved just to single func
             pp->is_fptr = 1;
-          if (po->operand[0].type == OPT_REG)
+
+          switch (po->operand[0].type) {
+          case OPT_REG:
             // we resolved this call and no longer need the register
             po->regmask_src &= ~(1 << po->operand[0].reg);
+            break;
+          case OPT_REGMEM:
+            pp->is_fptr = 1;
+            break;
+          default:
+            break;
+          }
         }
         if (pp == NULL) {
           pp = calloc(1, sizeof(*pp));
@@ -3291,7 +3343,7 @@ tailcall:
     }
 
     if (po->op == OP_PUSH && po->argnum == 0
-      && !(po->flags & OPF_RSAVE))
+      && !(po->flags & OPF_RSAVE) && !g_func_pp->is_userstack)
     {
       if (po->operand[0].type == OPT_REG)
       {
@@ -3574,15 +3626,26 @@ tailcall:
       }
     }
     fprintf(fout, " };\n");
+    had_decl = 1;
   }
 
   // declare stack frame, va_arg
-  if (g_stack_fsz)
+  if (g_stack_fsz) {
     fprintf(fout, "  union { u32 d[%d]; u16 w[%d]; u8 b[%d]; } sf;\n",
       (g_stack_fsz + 3) / 4, (g_stack_fsz + 1) / 2, g_stack_fsz);
+    had_decl = 1;
+  }
 
-  if (g_func_pp->is_vararg)
+  if (g_func_pp->is_userstack) {
+    fprintf(fout, "  u32 fake_sf[1024];\n");
+    fprintf(fout, "  u32 *esp = &fake_sf[1024];\n");
+    had_decl = 1;
+  }
+
+  if (g_func_pp->is_vararg) {
     fprintf(fout, "  va_list ap;\n");
+    had_decl = 1;
+  }
 
   // declare arg-registers
   for (i = 0; i < g_func_pp->argc; i++) {
@@ -3590,12 +3653,20 @@ tailcall:
       reg = char_array_i(regs_r32,
               ARRAY_SIZE(regs_r32), g_func_pp->arg[i].reg);
       if (regmask & (1 << reg)) {
-        fprintf(fout, "  u32 %s = (u32)a%d;\n",
-          g_func_pp->arg[i].reg, i + 1);
+        if (g_func_pp->arg[i].type.is_retreg)
+          fprintf(fout, "  u32 %s = *r_%s;\n",
+            g_func_pp->arg[i].reg, g_func_pp->arg[i].reg);
+        else
+          fprintf(fout, "  u32 %s = (u32)a%d;\n",
+            g_func_pp->arg[i].reg, i + 1);
       }
-      else
+      else {
+        if (g_func_pp->arg[i].type.is_retreg)
+          ferr(ops, "retreg '%s' is unused?\n",
+            g_func_pp->arg[i].reg);
         fprintf(fout, "  // %s = a%d; // unused\n",
           g_func_pp->arg[i].reg, i + 1);
+      }
       had_decl = 1;
     }
   }
@@ -3742,24 +3813,32 @@ tailcall:
     pfomask = po->pfomask;
 
     if (po->flags & (OPF_REPZ|OPF_REPNZ)) {
-      // we need initial flags for ecx=0 case..
-      if (i > 0 && ops[i - 1].op == OP_XOR
-        && IS(ops[i - 1].operand[0].name,
-              ops[i - 1].operand[1].name))
-      {
-        fprintf(fout, "  cond_z = ");
-        if (pfomask & (1 << PFO_C))
-          fprintf(fout, "cond_c = ");
-        fprintf(fout, "0;\n");
+      struct parsed_opr opr = {0,};
+      opr.type = OPT_REG;
+      opr.reg = xCX;
+      opr.lmod = OPLM_DWORD;
+      ret = try_resolve_const(i, &opr, opcnt * 7 + i, &uval);
+
+      if (ret != 1 || uval == 0) {
+        // we need initial flags for ecx=0 case..
+        if (i > 0 && ops[i - 1].op == OP_XOR
+          && IS(ops[i - 1].operand[0].name,
+                ops[i - 1].operand[1].name))
+        {
+          fprintf(fout, "  cond_z = ");
+          if (pfomask & (1 << PFO_C))
+            fprintf(fout, "cond_c = ");
+          fprintf(fout, "0;\n");
+        }
+        else if (last_arith_dst != NULL) {
+          out_src_opr_u32(buf3, sizeof(buf3), po, last_arith_dst);
+          out_test_for_cc(buf1, sizeof(buf1), po, PFO_Z, 0,
+            last_arith_dst->lmod, buf3);
+          fprintf(fout, "  cond_z = %s;\n", buf1);
+        }
+        else
+          ferr(po, "missing initial ZF\n");
       }
-      else if (last_arith_dst != NULL) {
-        out_src_opr_u32(buf3, sizeof(buf3), po, last_arith_dst);
-        out_test_for_cc(buf1, sizeof(buf1), po, PFO_Z, 0,
-          last_arith_dst->lmod, buf3);
-        fprintf(fout, "  cond_z = %s;\n", buf1);
-      }
-      else
-        ferr(po, "missing initial ZF\n");
     }
 
     switch (po->op)
@@ -3881,8 +3960,7 @@ tailcall:
         l = (po->flags & OPF_DF) ? '-' : '+';
         if (po->flags & OPF_REP) {
           fprintf(fout,
-            "  for (; ecx != 0; ecx--, edi %c= %d, esi %c= %d) {\n",
-            l, j, l, j);
+            "  for (; ecx != 0; ecx--) {\n");
           if (pfomask & (1 << PFO_C)) {
             // ugh..
             fprintf(fout,
@@ -3890,10 +3968,12 @@ tailcall:
             pfomask &= ~(1 << PFO_C);
           }
           fprintf(fout,
-            "    if ((cond_z = (%sedi == %sesi)) %s 0)\n",
-              buf1, buf1, (po->flags & OPF_REPZ) ? "==" : "!=");
+            "    cond_z = (%sedi == %sesi); edi %c= %d, esi %c= %d;\n",
+              buf1, buf1, l, j, l, j);
           fprintf(fout,
-            "      break;\n"
+            "    if (cond_z %s 0) break;\n",
+              (po->flags & OPF_REPZ) ? "==" : "!=");
+          fprintf(fout,
             "  }");
           snprintf(g_comment, sizeof(g_comment), "rep%s cmps",
             (po->flags & OPF_REPZ) ? "e" : "ne");
@@ -3917,19 +3997,21 @@ tailcall:
         l = (po->flags & OPF_DF) ? '-' : '+';
         if (po->flags & OPF_REP) {
           fprintf(fout,
-            "  for (; ecx != 0; ecx--, edi %c= %d)\n", l, j);
+            "  for (; ecx != 0; ecx--) {\n");
           fprintf(fout,
-            "    if ((cond_z = (%seax == %sedi)) %s 0)\n",
+            "    cond_z = (%seax == %sedi); edi %c= %d;\n",
               lmod_cast_u(po, po->operand[0].lmod),
-              lmod_cast_u_ptr(po, po->operand[0].lmod),
+              lmod_cast_u_ptr(po, po->operand[0].lmod), l, j);
+          fprintf(fout,
+            "    if (cond_z %s 0) break;\n",
               (po->flags & OPF_REPZ) ? "==" : "!=");
           fprintf(fout,
-            "      break;");
+            "  }");
           snprintf(g_comment, sizeof(g_comment), "rep%s scas",
             (po->flags & OPF_REPZ) ? "e" : "ne");
         }
         else {
-          fprintf(fout, "    cond_z = (%seax = %sedi); edi %c= %d;",
+          fprintf(fout, "  cond_z = (%seax = %sedi); edi %c= %d;",
               lmod_cast_u(po, po->operand[0].lmod),
               lmod_cast_u_ptr(po, po->operand[0].lmod), l, j);
           strcpy(g_comment, "scas");
@@ -4122,6 +4204,18 @@ tailcall:
         delayed_flag_op = NULL;
         break;
 
+      case OP_BSF:
+        assert_operand_cnt(2);
+        out_src_opr_u32(buf2, sizeof(buf2), po, &po->operand[1]);
+        fprintf(fout, "  %s = %s ? __builtin_ffs(%s) - 1 : 0;",
+          out_dst_opr(buf1, sizeof(buf1), po, &po->operand[0]),
+          buf2, buf2);
+        output_std_flags(fout, po, &pfomask, buf1);
+        last_arith_dst = &po->operand[0];
+        delayed_flag_op = NULL;
+        strcat(g_comment, "bsf");
+        break;
+
       case OP_INC:
       case OP_DEC:
         out_dst_opr(buf1, sizeof(buf1), po, &po->operand[0]);
@@ -4299,6 +4393,8 @@ tailcall:
             || (pp->argc_stack > 0
                 && pp->is_stdcall != g_func_pp->is_stdcall))
             ferr(po, "incompatible tailcall\n");
+          if (g_func_pp->has_retreg)
+            ferr(po, "TODO: retreg+tailcall\n");
 
           for (arg = j = 0; arg < pp->argc; arg++) {
             if (arg > 0)
@@ -4332,7 +4428,10 @@ tailcall:
                 pp->arg[arg].type.name);
 
             if (pp->arg[arg].reg != NULL) {
-              fprintf(fout, "%s%s", cast, pp->arg[arg].reg);
+              if (pp->arg[arg].type.is_retreg)
+                fprintf(fout, "&%s", pp->arg[arg].reg);
+              else
+                fprintf(fout, "%s%s", cast, pp->arg[arg].reg);
               continue;
             }
 
@@ -4397,6 +4496,12 @@ tailcall:
       case OP_RET:
         if (g_func_pp->is_vararg)
           fprintf(fout, "  va_end(ap);\n");
+        if (g_func_pp->has_retreg) {
+          for (arg = 0; arg < g_func_pp->argc; arg++)
+            if (g_func_pp->arg[arg].type.is_retreg)
+              fprintf(fout, "  *r_%s = %s;\n",
+                g_func_pp->arg[arg].reg, g_func_pp->arg[arg].reg);
+        }
  
         if (IS(g_func_pp->ret_type.name, "void")) {
           if (i != opcnt - 1 || label_pending)
@@ -4416,15 +4521,18 @@ tailcall:
         break;
 
       case OP_PUSH:
+        out_src_opr_u32(buf1, sizeof(buf1), po, &po->operand[0]);
         if (po->argnum != 0) {
           // special case - saved func arg
-          out_src_opr_u32(buf1, sizeof(buf1), po, &po->operand[0]);
           fprintf(fout, "  s_a%d = %s;", po->argnum, buf1);
           break;
         }
         else if (po->flags & OPF_RSAVE) {
-          out_src_opr_u32(buf1, sizeof(buf1), po, &po->operand[0]);
           fprintf(fout, "  s_%s = %s;", buf1, buf1);
+          break;
+        }
+        else if (g_func_pp->is_userstack) {
+          fprintf(fout, "  *(--esp) = %s;", buf1);
           break;
         }
         if (!(g_ida_func_attr & IDAFA_NORETURN))
@@ -4448,7 +4556,13 @@ tailcall:
               po->operand[0].is_ptr ? "(void *)" : "", 0));
           break;
         }
-        ferr(po, "stray pop encountered\n");
+        else if (g_func_pp->is_userstack) {
+          fprintf(fout, "  %s = *esp++;",
+            out_dst_opr(buf1, sizeof(buf1), po, &po->operand[0]));
+          break;
+        }
+        else
+          ferr(po, "stray pop encountered\n");
         break;
 
       case OP_NOP:
@@ -4685,6 +4799,7 @@ int main(int argc, char *argv[])
   int skip_warned = 0;
   int eq_alloc;
   int verbose = 0;
+  int multi_seg = 0;
   int arg_out;
   int arg;
   int pi = 0;
@@ -4698,12 +4813,14 @@ int main(int argc, char *argv[])
       verbose = 1;
     else if (IS(argv[arg], "-rf"))
       g_allow_regfunc = 1;
+    else if (IS(argv[arg], "-m"))
+      multi_seg = 1;
     else
       break;
   }
 
   if (argc < arg + 3) {
-    printf("usage:\n%s [-v] [-rf] <.c> <.asm> <hdrf> [rlist]*\n",
+    printf("usage:\n%s [-v] [-rf] [-m] <.c> <.asm> <hdrf> [rlist]*\n",
       argv[0]);
     return 1;
   }
@@ -5079,8 +5196,23 @@ do_pending_endp:
       continue;
     }
 
-    if (wordc == 2 && IS(words[1], "ends"))
-      break;
+    if (wordc == 2 && IS(words[1], "ends")) {
+      if (!multi_seg)
+        break;
+
+      // scan for next text segment
+      while (fgets(line, sizeof(line), fasm)) {
+        asmln++;
+        p = sskip(line);
+        if (*p == 0 || *p == ';')
+          continue;
+
+        if (strstr(p, "segment para public 'CODE' use32"))
+          break;
+      }
+
+      continue;
+    }
 
     p = strchr(words[0], ':');
     if (p != NULL) {
