@@ -227,14 +227,28 @@ int main(int argc, char *argv[])
 		p = next_word(word3, sizeof(word3), p);
 
 		// push offset <sym>
-		// jcc short <sym>
-		if ( (IS(word, "push") && IS(word2, "offset"))
-		  || (word[0] == 'j' && IS(word2, "short") && !IS(word3, "exit")) ) {
+		if (IS(word, "push") && IS(word2, "offset")) {
 			ssym.name = word3;
 			sym = bsearch(&ssym, symlist, symlist_cnt,
 				sizeof(symlist[0]), cmp_sym);
 			if (sym != NULL) {
 				fprintf(fout, "\t\t%s %s %s%s", word, word2,
+				  sym_use(sym, sym->callsites || IS(word3, func)), p);
+				continue;
+			}
+		}
+
+		// jcc short <sym>
+		if (word[0] == 'j' && IS(word2, "short") && !IS(word3, "exit")) {
+			ssym.name = word3;
+			sym = bsearch(&ssym, symlist, symlist_cnt,
+				sizeof(symlist[0]), cmp_sym);
+			if (sym != NULL) {
+				fprintf(fout, "\t\t%s ", word);
+				// for conditional "call", don't print 'short'
+				if (IS(word3, func))
+					fprintf(fout, "short ");
+				fprintf(fout, "%s%s",
 				  sym_use(sym, sym->callsites || IS(word3, func)), p);
 				continue;
 			}

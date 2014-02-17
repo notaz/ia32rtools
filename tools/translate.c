@@ -61,6 +61,7 @@ enum op_op {
 	OP_XCHG,
 	OP_NOT,
 	OP_CDQ,
+	OP_LODS,
 	OP_STOS,
 	OP_MOVS,
 	OP_CMPS,
@@ -95,22 +96,8 @@ enum op_op {
 	OP_CALL,
 	OP_JMP,
 	OP_JECXZ,
-	OP_JO,
-	OP_JNO,
-	OP_JC,
-	OP_JNC,
-	OP_JZ,
-	OP_JNZ,
-	OP_JBE,
-	OP_JA,
-	OP_JS,
-	OP_JNS,
-	OP_JP,
-	OP_JNP,
-	OP_JL,
-	OP_JGE,
-	OP_JLE,
-	OP_JG,
+	OP_JCC,
+	OP_SCC,
 };
 
 enum opr_type {
@@ -150,7 +137,10 @@ struct parsed_op {
   enum op_op op;
   struct parsed_opr operand[MAX_OPERANDS];
   unsigned int flags;
-  int operand_cnt;
+  unsigned char pfo;
+  unsigned char pfo_inv;
+  unsigned char operand_cnt;
+  unsigned char pad;
   int regmask_src;        // all referensed regs
   int regmask_dst;
   int pfomask;            // flagop: parsed_flag_op that can't be delayed
@@ -158,11 +148,12 @@ struct parsed_op {
   int cc_scratch;         // scratch storage during analysis
   int bt_i;               // branch target for branches
   struct parsed_data *btj;// branch targets for jumptables
+  struct parsed_proto *pp;
   void *datap;
 };
 
 // datap:
-// OP_CALL - parser proto hint (str), ptr to struct parsed_proto
+// OP_CALL - parser proto hint (str)
 // (OPF_CC) - point to one of (OPF_FLAGS) that affects cc op
 // OP_POP - point to OP_PUSH in push/pop pair
 
@@ -731,9 +722,11 @@ static const struct {
 static const struct {
   const char *name;
   enum op_op op;
-  unsigned int minopr;
-  unsigned int maxopr;
+  unsigned short minopr;
+  unsigned short maxopr;
   unsigned int flags;
+  unsigned char pfo;
+  unsigned char pfo_inv;
 } op_table[] = {
   { "nop",  OP_NOP,    0, 0, 0 },
   { "push", OP_PUSH,   1, 1, 0 },
@@ -746,6 +739,9 @@ static const struct {
   { "xchg", OP_XCHG,   2, 2, OPF_DATA },
   { "not",  OP_NOT,    1, 1, OPF_DATA },
   { "cdq",  OP_CDQ,    0, 0, OPF_DATA },
+  { "lodsb",OP_LODS,   0, 0, OPF_DATA },
+  { "lodsw",OP_LODS,   0, 0, OPF_DATA },
+  { "lodsd",OP_LODS,   0, 0, OPF_DATA },
   { "stosb",OP_STOS,   0, 0, OPF_DATA },
   { "stosw",OP_STOS,   0, 0, OPF_DATA },
   { "stosd",OP_STOS,   0, 0, OPF_DATA },
@@ -771,10 +767,10 @@ static const struct {
   { "sar",  OP_SAR,    2, 2, OPF_DATA|OPF_FLAGS },
   { "rol",  OP_ROL,    2, 2, OPF_DATA|OPF_FLAGS },
   { "ror",  OP_ROR,    2, 2, OPF_DATA|OPF_FLAGS },
-  { "rcl",  OP_RCL,    2, 2, OPF_DATA|OPF_FLAGS|OPF_CC },
-  { "rcr",  OP_RCR,    2, 2, OPF_DATA|OPF_FLAGS|OPF_CC },
-  { "adc",  OP_ADC,    2, 2, OPF_DATA|OPF_FLAGS|OPF_CC },
-  { "sbb",  OP_SBB,    2, 2, OPF_DATA|OPF_FLAGS|OPF_CC },
+  { "rcl",  OP_RCL,    2, 2, OPF_DATA|OPF_FLAGS|OPF_CC, PFO_C },
+  { "rcr",  OP_RCR,    2, 2, OPF_DATA|OPF_FLAGS|OPF_CC, PFO_C },
+  { "adc",  OP_ADC,    2, 2, OPF_DATA|OPF_FLAGS|OPF_CC, PFO_C },
+  { "sbb",  OP_SBB,    2, 2, OPF_DATA|OPF_FLAGS|OPF_CC, PFO_C },
   { "bsf",  OP_BSF,    2, 2, OPF_DATA|OPF_FLAGS },
   { "inc",  OP_INC,    1, 1, OPF_DATA|OPF_FLAGS },
   { "dec",  OP_DEC,    1, 1, OPF_DATA|OPF_FLAGS },
@@ -789,63 +785,64 @@ static const struct {
   { "call", OP_CALL,   1, 1, OPF_JMP|OPF_DATA|OPF_FLAGS },
   { "jmp",  OP_JMP,    1, 1, OPF_JMP },
   { "jecxz",OP_JECXZ,  1, 1, OPF_JMP|OPF_CJMP },
-  { "jo",   OP_JO,     1, 1, OPF_CJMP_CC }, // 70 OF=1
-  { "jno",  OP_JNO,    1, 1, OPF_CJMP_CC }, // 71 OF=0
-  { "jc",   OP_JC,     1, 1, OPF_CJMP_CC }, // 72 CF=1
-  { "jb",   OP_JC,     1, 1, OPF_CJMP_CC }, // 72
-  { "jnc",  OP_JNC,    1, 1, OPF_CJMP_CC }, // 73 CF=0
-  { "jnb",  OP_JNC,    1, 1, OPF_CJMP_CC }, // 73
-  { "jae",  OP_JNC,    1, 1, OPF_CJMP_CC }, // 73
-  { "jz",   OP_JZ,     1, 1, OPF_CJMP_CC }, // 74 ZF=1
-  { "je",   OP_JZ,     1, 1, OPF_CJMP_CC }, // 74
-  { "jnz",  OP_JNZ,    1, 1, OPF_CJMP_CC }, // 75 ZF=0
-  { "jne",  OP_JNZ,    1, 1, OPF_CJMP_CC }, // 75
-  { "jbe",  OP_JBE,    1, 1, OPF_CJMP_CC }, // 76 CF=1 || ZF=1
-  { "jna",  OP_JBE,    1, 1, OPF_CJMP_CC }, // 76
-  { "ja",   OP_JA,     1, 1, OPF_CJMP_CC }, // 77 CF=0 && ZF=0
-  { "jnbe", OP_JA,     1, 1, OPF_CJMP_CC }, // 77
-  { "js",   OP_JS,     1, 1, OPF_CJMP_CC }, // 78 SF=1
-  { "jns",  OP_JNS,    1, 1, OPF_CJMP_CC }, // 79 SF=0
-  { "jp",   OP_JP,     1, 1, OPF_CJMP_CC }, // 7a PF=1
-  { "jpe",  OP_JP,     1, 1, OPF_CJMP_CC }, // 7a
-  { "jnp",  OP_JNP,    1, 1, OPF_CJMP_CC }, // 7b PF=0
-  { "jpo",  OP_JNP,    1, 1, OPF_CJMP_CC }, // 7b
-  { "jl",   OP_JL,     1, 1, OPF_CJMP_CC }, // 7c SF!=OF
-  { "jnge", OP_JL,     1, 1, OPF_CJMP_CC }, // 7c
-  { "jge",  OP_JGE,    1, 1, OPF_CJMP_CC }, // 7d SF=OF
-  { "jnl",  OP_JGE,    1, 1, OPF_CJMP_CC }, // 7d
-  { "jle",  OP_JLE,    1, 1, OPF_CJMP_CC }, // 7e ZF=1 || SF!=OF
-  { "jng",  OP_JLE,    1, 1, OPF_CJMP_CC }, // 7e
-  { "jg",   OP_JG,     1, 1, OPF_CJMP_CC }, // 7f ZF=0 && SF=OF
-  { "jnle", OP_JG,     1, 1, OPF_CJMP_CC }, // 7f
-  { "seto",   OP_JO,   1, 1, OPF_DATA|OPF_CC },
-  { "setno",  OP_JNO,  1, 1, OPF_DATA|OPF_CC },
-  { "setc",   OP_JC,   1, 1, OPF_DATA|OPF_CC },
-  { "setb",   OP_JC,   1, 1, OPF_DATA|OPF_CC },
-  { "setnc",  OP_JNC,  1, 1, OPF_DATA|OPF_CC },
-  { "setae",  OP_JNC,  1, 1, OPF_DATA|OPF_CC },
-  { "setz",   OP_JZ,   1, 1, OPF_DATA|OPF_CC },
-  { "sete",   OP_JZ,   1, 1, OPF_DATA|OPF_CC },
-  { "setnz",  OP_JNZ,  1, 1, OPF_DATA|OPF_CC },
-  { "setne",  OP_JNZ,  1, 1, OPF_DATA|OPF_CC },
-  { "setbe",  OP_JBE,  1, 1, OPF_DATA|OPF_CC },
-  { "setna",  OP_JBE,  1, 1, OPF_DATA|OPF_CC },
-  { "seta",   OP_JA,   1, 1, OPF_DATA|OPF_CC },
-  { "setnbe", OP_JA,   1, 1, OPF_DATA|OPF_CC },
-  { "sets",   OP_JS,   1, 1, OPF_DATA|OPF_CC },
-  { "setns",  OP_JNS,  1, 1, OPF_DATA|OPF_CC },
-  { "setp",   OP_JP,   1, 1, OPF_DATA|OPF_CC },
-  { "setpe",  OP_JP,   1, 1, OPF_DATA|OPF_CC },
-  { "setnp",  OP_JNP,  1, 1, OPF_DATA|OPF_CC },
-  { "setpo",  OP_JNP,  1, 1, OPF_DATA|OPF_CC },
-  { "setl",   OP_JL,   1, 1, OPF_DATA|OPF_CC },
-  { "setnge", OP_JL,   1, 1, OPF_DATA|OPF_CC },
-  { "setge",  OP_JGE,  1, 1, OPF_DATA|OPF_CC },
-  { "setnl",  OP_JGE,  1, 1, OPF_DATA|OPF_CC },
-  { "setle",  OP_JLE,  1, 1, OPF_DATA|OPF_CC },
-  { "setng",  OP_JLE,  1, 1, OPF_DATA|OPF_CC },
-  { "setg",   OP_JG,   1, 1, OPF_DATA|OPF_CC },
-  { "setnle", OP_JG,   1, 1, OPF_DATA|OPF_CC },
+  { "jo",   OP_JCC,    1, 1, OPF_CJMP_CC, PFO_O,  0 }, // 70 OF=1
+  { "jno",  OP_JCC,    1, 1, OPF_CJMP_CC, PFO_O,  1 }, // 71 OF=0
+  { "jc",   OP_JCC,    1, 1, OPF_CJMP_CC, PFO_C,  0 }, // 72 CF=1
+  { "jb",   OP_JCC,    1, 1, OPF_CJMP_CC, PFO_C,  0 }, // 72
+  { "jnc",  OP_JCC,    1, 1, OPF_CJMP_CC, PFO_C,  1 }, // 73 CF=0
+  { "jnb",  OP_JCC,    1, 1, OPF_CJMP_CC, PFO_C,  1 }, // 73
+  { "jae",  OP_JCC,    1, 1, OPF_CJMP_CC, PFO_C,  1 }, // 73
+  { "jz",   OP_JCC,    1, 1, OPF_CJMP_CC, PFO_Z,  0 }, // 74 ZF=1
+  { "je",   OP_JCC,    1, 1, OPF_CJMP_CC, PFO_Z,  0 }, // 74
+  { "jnz",  OP_JCC,    1, 1, OPF_CJMP_CC, PFO_Z,  1 }, // 75 ZF=0
+  { "jne",  OP_JCC,    1, 1, OPF_CJMP_CC, PFO_Z,  1 }, // 75
+  { "jbe",  OP_JCC,    1, 1, OPF_CJMP_CC, PFO_BE, 0 }, // 76 CF=1||ZF=1
+  { "jna",  OP_JCC,    1, 1, OPF_CJMP_CC, PFO_BE, 0 }, // 76
+  { "ja",   OP_JCC,    1, 1, OPF_CJMP_CC, PFO_BE, 1 }, // 77 CF=0&&ZF=0
+  { "jnbe", OP_JCC,    1, 1, OPF_CJMP_CC, PFO_BE, 1 }, // 77
+  { "js",   OP_JCC,    1, 1, OPF_CJMP_CC, PFO_S,  0 }, // 78 SF=1
+  { "jns",  OP_JCC,    1, 1, OPF_CJMP_CC, PFO_S,  1 }, // 79 SF=0
+  { "jp",   OP_JCC,    1, 1, OPF_CJMP_CC, PFO_P,  0 }, // 7a PF=1
+  { "jpe",  OP_JCC,    1, 1, OPF_CJMP_CC, PFO_P,  0 }, // 7a
+  { "jnp",  OP_JCC,    1, 1, OPF_CJMP_CC, PFO_P,  1 }, // 7b PF=0
+  { "jpo",  OP_JCC,    1, 1, OPF_CJMP_CC, PFO_P,  1 }, // 7b
+  { "jl",   OP_JCC,    1, 1, OPF_CJMP_CC, PFO_L,  0 }, // 7c SF!=OF
+  { "jnge", OP_JCC,    1, 1, OPF_CJMP_CC, PFO_L,  0 }, // 7c
+  { "jge",  OP_JCC,    1, 1, OPF_CJMP_CC, PFO_L,  1 }, // 7d SF=OF
+  { "jnl",  OP_JCC,    1, 1, OPF_CJMP_CC, PFO_L,  1 }, // 7d
+  { "jle",  OP_JCC,    1, 1, OPF_CJMP_CC, PFO_LE, 0 }, // 7e ZF=1||SF!=OF
+  { "jng",  OP_JCC,    1, 1, OPF_CJMP_CC, PFO_LE, 0 }, // 7e
+  { "jg",   OP_JCC,    1, 1, OPF_CJMP_CC, PFO_LE, 1 }, // 7f ZF=0&&SF=OF
+  { "jnle", OP_JCC,    1, 1, OPF_CJMP_CC, PFO_LE, 1 }, // 7f
+  { "seto",   OP_SCC,  1, 1, OPF_DATA|OPF_CC, PFO_O,  0 },
+  { "setno",  OP_SCC,  1, 1, OPF_DATA|OPF_CC, PFO_O,  1 },
+  { "setc",   OP_SCC,  1, 1, OPF_DATA|OPF_CC, PFO_C,  0 },
+  { "setb",   OP_SCC,  1, 1, OPF_DATA|OPF_CC, PFO_C,  0 },
+  { "setnc",  OP_SCC,  1, 1, OPF_DATA|OPF_CC, PFO_C,  1 },
+  { "setae",  OP_SCC,  1, 1, OPF_DATA|OPF_CC, PFO_C,  1 },
+  { "setnb",  OP_SCC,  1, 1, OPF_DATA|OPF_CC, PFO_C,  1 },
+  { "setz",   OP_SCC,  1, 1, OPF_DATA|OPF_CC, PFO_Z,  0 },
+  { "sete",   OP_SCC,  1, 1, OPF_DATA|OPF_CC, PFO_Z,  0 },
+  { "setnz",  OP_SCC,  1, 1, OPF_DATA|OPF_CC, PFO_Z,  1 },
+  { "setne",  OP_SCC,  1, 1, OPF_DATA|OPF_CC, PFO_Z,  1 },
+  { "setbe",  OP_SCC,  1, 1, OPF_DATA|OPF_CC, PFO_BE, 0 },
+  { "setna",  OP_SCC,  1, 1, OPF_DATA|OPF_CC, PFO_BE, 0 },
+  { "seta",   OP_SCC,  1, 1, OPF_DATA|OPF_CC, PFO_BE, 1 },
+  { "setnbe", OP_SCC,  1, 1, OPF_DATA|OPF_CC, PFO_BE, 1 },
+  { "sets",   OP_SCC,  1, 1, OPF_DATA|OPF_CC, PFO_S,  0 },
+  { "setns",  OP_SCC,  1, 1, OPF_DATA|OPF_CC, PFO_S,  1 },
+  { "setp",   OP_SCC,  1, 1, OPF_DATA|OPF_CC, PFO_P,  0 },
+  { "setpe",  OP_SCC,  1, 1, OPF_DATA|OPF_CC, PFO_P,  0 },
+  { "setnp",  OP_SCC,  1, 1, OPF_DATA|OPF_CC, PFO_P,  1 },
+  { "setpo",  OP_SCC,  1, 1, OPF_DATA|OPF_CC, PFO_P,  1 },
+  { "setl",   OP_SCC,  1, 1, OPF_DATA|OPF_CC, PFO_L,  0 },
+  { "setnge", OP_SCC,  1, 1, OPF_DATA|OPF_CC, PFO_L,  0 },
+  { "setge",  OP_SCC,  1, 1, OPF_DATA|OPF_CC, PFO_L,  1 },
+  { "setnl",  OP_SCC,  1, 1, OPF_DATA|OPF_CC, PFO_L,  1 },
+  { "setle",  OP_SCC,  1, 1, OPF_DATA|OPF_CC, PFO_LE, 0 },
+  { "setng",  OP_SCC,  1, 1, OPF_DATA|OPF_CC, PFO_LE, 0 },
+  { "setg",   OP_SCC,  1, 1, OPF_DATA|OPF_CC, PFO_LE, 1 },
+  { "setnle", OP_SCC,  1, 1, OPF_DATA|OPF_CC, PFO_LE, 1 },
 };
 
 static void parse_op(struct parsed_op *op, char words[16][256], int wordc)
@@ -884,6 +881,8 @@ static void parse_op(struct parsed_op *op, char words[16][256], int wordc)
 
   op->op = op_table[i].op;
   op->flags = op_table[i].flags | prefix_flags;
+  op->pfo = op_table[i].pfo;
+  op->pfo_inv = op_table[i].pfo_inv;
   op->regmask_src = op->regmask_dst = 0;
 
   for (opr = 0; opr < op_table[i].minopr; opr++) {
@@ -920,6 +919,7 @@ static void parse_op(struct parsed_op *op, char words[16][256], int wordc)
     setup_reg_opr(&op->operand[1], xAX, OPLM_DWORD, &op->regmask_src);
     break;
 
+  case OP_LODS:
   case OP_STOS:
   case OP_SCAS:
     if (op->operand_cnt != 0)
@@ -931,10 +931,12 @@ static void parse_op(struct parsed_op *op, char words[16][256], int wordc)
     else if (words[op_w][4] == 'd')
       lmod = OPLM_DWORD;
     op->operand_cnt = 3;
-    setup_reg_opr(&op->operand[0], xDI, lmod, &op->regmask_src);
+    setup_reg_opr(&op->operand[0], op->op == OP_LODS ? xSI : xDI,
+      lmod, &op->regmask_src);
     setup_reg_opr(&op->operand[1], xCX, OPLM_DWORD, &op->regmask_src);
     op->regmask_dst = op->regmask_src;
-    setup_reg_opr(&op->operand[2], xAX, OPLM_DWORD, &op->regmask_src);
+    setup_reg_opr(&op->operand[2], xAX, OPLM_DWORD,
+      op->op == OP_LODS ? &op->regmask_dst : &op->regmask_src);
     break;
 
   case OP_MOVS:
@@ -957,7 +959,7 @@ static void parse_op(struct parsed_op *op, char words[16][256], int wordc)
   case OP_XCHG:
     op->regmask_src |= op->regmask_dst;
     op->regmask_dst |= op->regmask_src;
-    break;
+    goto check_align;
 
   case OP_JECXZ:
     op->operand_cnt = 1;
@@ -1009,10 +1011,14 @@ static void parse_op(struct parsed_op *op, char words[16][256], int wordc)
 
   // alignment
   case OP_MOV:
+  check_align:
     if (op->operand[0].type == OPT_REG && op->operand[1].type == OPT_REG
-     && op->operand[0].reg == xDI && op->operand[1].reg == xDI)
+     && op->operand[0].lmod == op->operand[1].lmod
+     && op->operand[0].reg == op->operand[1].reg
+     && IS(op->operand[0].name, op->operand[1].name)) // ah, al..
     {
       op->flags |= OPF_RMD;
+      op->regmask_src = op->regmask_dst = 0;
     }
     break;
 
@@ -1037,12 +1043,23 @@ static void parse_op(struct parsed_op *op, char words[16][256], int wordc)
   }
 }
 
-static const char *op_name(enum op_op op)
+static const char *op_name(struct parsed_op *po)
 {
+  static char buf[16];
+  char *p;
   int i;
 
+  if (po->op == OP_JCC || po->op == OP_SCC) {
+    p = buf;
+    *p++ = (po->op == OP_JCC) ? 'j' : 's';
+    if (po->pfo_inv)
+      *p++ = 'n';
+    strcpy(p, parsed_flag_op_names[po->pfo]);
+    return buf;
+  }
+
   for (i = 0; i < ARRAY_SIZE(op_table); i++)
-    if (op_table[i].op == op)
+    if (op_table[i].op == po->op)
       return op_table[i].name;
 
   return "???";
@@ -1058,7 +1075,7 @@ static const char *dump_op(struct parsed_op *po)
   if (po == NULL)
     return "???";
 
-  snprintf(out, sizeof(out), "%s", op_name(po->op));
+  snprintf(out, sizeof(out), "%s", op_name(po));
   for (i = 0; i < po->operand_cnt; i++) {
     p += strlen(p);
     if (i > 0)
@@ -1712,66 +1729,6 @@ static char *out_src_opr_u32(char *buf, size_t buf_size,
   return out_src_opr(buf, buf_size, po, popr, NULL, 0);
 }
 
-static enum parsed_flag_op split_cond(struct parsed_op *po,
-  enum op_op op, int *is_inv)
-{
-  *is_inv = 0;
-
-  switch (op) {
-  case OP_JO:
-    return PFO_O;
-  case OP_JC:
-    return PFO_C;
-  case OP_JZ:
-    return PFO_Z;
-  case OP_JBE:
-    return PFO_BE;
-  case OP_JS:
-    return PFO_S;
-  case OP_JP:
-    return PFO_P;
-  case OP_JL:
-    return PFO_L;
-  case OP_JLE:
-    return PFO_LE;
-
-  case OP_JNO:
-    *is_inv = 1;
-    return PFO_O;
-  case OP_JNC:
-    *is_inv = 1;
-    return PFO_C;
-  case OP_JNZ:
-    *is_inv = 1;
-    return PFO_Z;
-  case OP_JA:
-    *is_inv = 1;
-    return PFO_BE;
-  case OP_JNS:
-    *is_inv = 1;
-    return PFO_S;
-  case OP_JNP:
-    *is_inv = 1;
-    return PFO_P;
-  case OP_JGE:
-    *is_inv = 1;
-    return PFO_L;
-  case OP_JG:
-    *is_inv = 1;
-    return PFO_LE;
-
-  case OP_RCL:
-  case OP_RCR:
-  case OP_ADC:
-  case OP_SBB:
-    return PFO_C;
-
-  default:
-    ferr(po, "split_cond: bad op %d\n", op);
-    return -1;
-  }
-}
-
 static void out_test_for_cc(char *buf, size_t buf_size,
   struct parsed_op *po, enum parsed_flag_op pfo, int is_inv,
   enum opr_lenmod lmod, const char *expr)
@@ -1977,7 +1934,7 @@ static void op_set_clear_flag(struct parsed_op *po,
 
 // last op in stream - unconditional branch or ret
 #define LAST_OP(_i) ((ops[_i].flags & OPF_TAIL) \
-  || ((ops[_i].flags & (OPF_JMP|OPF_CJMP)) == OPF_JMP \
+  || ((ops[_i].flags & (OPF_JMP|OPF_CJMP|OPF_RMD)) == OPF_JMP \
       && ops[_i].op != OP_CALL))
 
 static int scan_for_pop(int i, int opcnt, const char *reg,
@@ -2340,7 +2297,6 @@ static int scan_for_reg_clear(int i, int reg)
 static int scan_for_esp_adjust(int i, int opcnt, int *adj,
   int *multipath)
 {
-  const struct parsed_proto *pp;
   struct parsed_op *po;
   int first_pop = -1;
 
@@ -2382,8 +2338,7 @@ static int scan_for_esp_adjust(int i, int opcnt, int *adj,
         break;
       if (po->operand[0].type != OPT_LABEL)
         break;
-      pp = po->datap;
-      if (pp != NULL && pp->is_stdcall)
+      if (po->pp != NULL && po->pp->is_stdcall)
         break;
     }
   }
@@ -2696,7 +2651,7 @@ static int collect_call_args_r(struct parsed_op *po, int i,
       if (pp->is_unresolved)
         break;
 
-      pp_tmp = ops[j].datap;
+      pp_tmp = ops[j].pp;
       if (pp_tmp == NULL)
         ferr(po, "arg collect hit unparsed call '%s'\n",
           ops[j].operand[0].name);
@@ -2888,7 +2843,6 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
   struct parsed_proto *pp, *pp_tmp;
   struct parsed_data *pd;
   const char *tmpname;
-  enum parsed_flag_op pfo;
   unsigned int uval;
   int save_arg_vars = 0;
   int cond_vars = 0;
@@ -2906,7 +2860,6 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
   int depth = 0;
   int no_output;
   int i, j, l;
-  int dummy;
   int arg;
   int reg;
   int ret;
@@ -3138,8 +3091,8 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
           check_func_pp(po, pp, "fptr var call");
         if (pp->is_noreturn)
           po->flags |= OPF_TAIL;
-        po->datap = pp;
       }
+      po->pp = pp;
       continue;
     }
 
@@ -3183,13 +3136,18 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
 
     for (l = 0; l < opcnt; l++) {
       if (g_labels[l][0] && IS(po->operand[0].name, g_labels[l])) {
+        if (l == i + 1 && po->op == OP_JMP) {
+          // yet another alignment type..
+          po->flags |= OPF_RMD;
+          break;
+        }
         add_label_ref(&g_label_refs[l], i);
         po->bt_i = l;
         break;
       }
     }
 
-    if (po->bt_i != -1)
+    if (po->bt_i != -1 || (po->flags & OPF_RMD))
       continue;
 
     if (po->operand[0].type == OPT_LABEL)
@@ -3221,7 +3179,7 @@ tailcall:
     if (po->op == OP_CALL)
     {
       tmpname = opr_name(po, 0);
-      pp = po->datap;
+      pp = po->pp;
       if (pp == NULL)
       {
         // indirect call
@@ -3264,7 +3222,7 @@ tailcall:
           for (arg = 0; arg < pp->argc; arg++)
             pp->arg[arg].type.name = strdup("int");
         }
-        po->datap = pp;
+        po->pp = pp;
       }
 
       // look for and make use of esp adjust
@@ -3423,7 +3381,6 @@ tailcall:
       if (cnt > ARRAY_SIZE(setters))
         ferr(po, "too many flag setters\n");
 
-      pfo = split_cond(po, po->op, &dummy);
       for (j = 0; j < cnt; j++)
       {
         tmp_op = &ops[setters[j]]; // flag setter
@@ -3435,20 +3392,23 @@ tailcall:
         if (tmp_op->op == OP_TEST || tmp_op->op == OP_CMP)
         {
           if (branched || scan_for_mod(tmp_op, setters[j] + 1, i, 0) >= 0)
-            pfomask = 1 << pfo;
+            pfomask = 1 << po->pfo;
         }
         else if (tmp_op->op == OP_CMPS || tmp_op->op == OP_SCAS) {
-          pfomask = 1 << pfo;
+          pfomask = 1 << po->pfo;
         }
         else {
           // see if we'll be able to handle based on op result
           if ((tmp_op->op != OP_AND && tmp_op->op != OP_OR
-               && pfo != PFO_Z && pfo != PFO_S && pfo != PFO_P)
+               && po->pfo != PFO_Z && po->pfo != PFO_S
+               && po->pfo != PFO_P)
               || branched
               || scan_for_mod_opr0(tmp_op, setters[j] + 1, i) >= 0)
-            pfomask = 1 << pfo;
+          {
+            pfomask = 1 << po->pfo;
+          }
 
-          if (tmp_op->op == OP_ADD && pfo == PFO_C)
+          if (tmp_op->op == OP_ADD && po->pfo == PFO_C)
             need_tmp64 = 1;
         }
         if (pfomask) {
@@ -3463,7 +3423,8 @@ tailcall:
        || po->op == OP_ADC || po->op == OP_SBB)
         cond_vars |= 1 << PFO_C;
     }
-    else if (po->op == OP_CMPS || po->op == OP_SCAS) {
+
+    if (po->op == OP_CMPS || po->op == OP_SCAS) {
       cond_vars |= 1 << PFO_Z;
     }
     else if (po->op == OP_MUL
@@ -3472,7 +3433,7 @@ tailcall:
       need_tmp64 = 1;
     }
     else if (po->op == OP_CALL) {
-      pp = po->datap;
+      pp = po->pp;
       if (pp == NULL)
         ferr(po, "NULL pp\n");
 
@@ -3541,7 +3502,7 @@ tailcall:
           // might be declared already
           found = 0;
           for (j = 0; j < i; j++) {
-            if (ops[j].op == OP_CALL && (pp_tmp = ops[j].datap)) {
+            if (ops[j].op == OP_CALL && (pp_tmp = ops[j].pp)) {
               if (pp_tmp->is_fptr && IS(pp->name, pp_tmp->name)) {
                 found = 1;
                 break;
@@ -3756,50 +3717,49 @@ tailcall:
     if (po->flags & OPF_CC)
     {
       int is_delayed = 0;
-      int is_inv = 0;
 
-      pfo = split_cond(po, po->op, &is_inv);
       tmp_op = po->datap;
 
       // we go through all this trouble to avoid using parsed_flag_op,
       // which makes generated code much nicer
       if (delayed_flag_op != NULL)
       {
-        out_cmp_test(buf1, sizeof(buf1), delayed_flag_op, pfo, is_inv);
+        out_cmp_test(buf1, sizeof(buf1), delayed_flag_op,
+          po->pfo, po->pfo_inv);
         is_delayed = 1;
       }
       else if (last_arith_dst != NULL
-        && (pfo == PFO_Z || pfo == PFO_S || pfo == PFO_P
+        && (po->pfo == PFO_Z || po->pfo == PFO_S || po->pfo == PFO_P
            || (tmp_op && (tmp_op->op == OP_AND || tmp_op->op == OP_OR))
            ))
       {
         out_src_opr_u32(buf3, sizeof(buf3), po, last_arith_dst);
-        out_test_for_cc(buf1, sizeof(buf1), po, pfo, is_inv,
+        out_test_for_cc(buf1, sizeof(buf1), po, po->pfo, po->pfo_inv,
           last_arith_dst->lmod, buf3);
         is_delayed = 1;
       }
       else if (tmp_op != NULL) {
         // use preprocessed flag calc results
-        if (!(tmp_op->pfomask & (1 << pfo)))
-          ferr(po, "not prepared for pfo %d\n", pfo);
+        if (!(tmp_op->pfomask & (1 << po->pfo)))
+          ferr(po, "not prepared for pfo %d\n", po->pfo);
 
-        // note: is_inv was not yet applied
+        // note: pfo_inv was not yet applied
         snprintf(buf1, sizeof(buf1), "(%scond_%s)",
-          is_inv ? "!" : "", parsed_flag_op_names[pfo]);
+          po->pfo_inv ? "!" : "", parsed_flag_op_names[po->pfo]);
       }
       else {
         ferr(po, "all methods of finding comparison failed\n");
       }
  
       if (po->flags & OPF_JMP) {
-        fprintf(fout, "  if %s\n", buf1);
+        fprintf(fout, "  if %s", buf1);
       }
       else if (po->op == OP_RCL || po->op == OP_RCR
                || po->op == OP_ADC || po->op == OP_SBB)
       {
         if (is_delayed)
           fprintf(fout, "  cond_%s = %s;\n",
-            parsed_flag_op_names[pfo], buf1);
+            parsed_flag_op_names[po->pfo], buf1);
       }
       else if (po->flags & OPF_DATA) { // SETcc
         out_dst_opr(buf2, sizeof(buf2), po, &po->operand[0]);
@@ -3913,6 +3873,21 @@ tailcall:
         strcpy(g_comment, "cdq");
         break;
 
+      case OP_LODS:
+        assert_operand_cnt(3);
+        if (po->flags & OPF_REP) {
+          // hmh..
+          ferr(po, "TODO\n");
+        }
+        else {
+          fprintf(fout, "  eax = %sedi; esi %c= %d;",
+            lmod_cast_u_ptr(po, po->operand[0].lmod),
+            (po->flags & OPF_DF) ? '-' : '+',
+            lmod_bytes(po, po->operand[0].lmod));
+          strcpy(g_comment, "lods");
+        }
+        break;
+
       case OP_STOS:
         assert_operand_cnt(3);
         if (po->flags & OPF_REP) {
@@ -3924,7 +3899,7 @@ tailcall:
           strcpy(g_comment, "rep stos");
         }
         else {
-          fprintf(fout, "    %sedi = eax; edi %c= %d;",
+          fprintf(fout, "  %sedi = eax; edi %c= %d;",
             lmod_cast_u_ptr(po, po->operand[0].lmod),
             (po->flags & OPF_DF) ? '-' : '+',
             lmod_bytes(po, po->operand[0].lmod));
@@ -3946,7 +3921,7 @@ tailcall:
           strcpy(g_comment, "rep movs");
         }
         else {
-          fprintf(fout, "    %sedi = %sesi; edi %c= %d; esi %c= %d;",
+          fprintf(fout, "  %sedi = %sesi; edi %c= %d; esi %c= %d;",
             buf1, buf1, l, j, l, j);
           strcpy(g_comment, "movs");
         }
@@ -3980,7 +3955,7 @@ tailcall:
         }
         else {
           fprintf(fout,
-            "    cond_z = (%sedi = %sesi); edi %c= %d; esi %c= %d;",
+            "  cond_z = (%sedi = %sesi); edi %c= %d; esi %c= %d;",
             buf1, buf1, l, j, l, j);
           strcpy(g_comment, "cmps");
         }
@@ -4319,11 +4294,13 @@ tailcall:
         delayed_flag_op = po;
         break;
 
+      case OP_SCC:
+        // SETcc - should already be handled
+        break;
+
       // note: we reuse OP_Jcc for SETcc, only flags differ
-      case OP_JO ... OP_JG:
-        if (po->flags & OPF_JMP)
-          fprintf(fout, "    goto %s;", po->operand[0].name);
-        // else SETcc - should already be handled
+      case OP_JCC:
+        fprintf(fout, "\n    goto %s;", po->operand[0].name);
         break;
 
       case OP_JECXZ:
@@ -4354,15 +4331,23 @@ tailcall:
 
       case OP_CALL:
         assert_operand_cnt(1);
-        pp = po->datap;
+        pp = po->pp;
         my_assert_not(pp, NULL);
 
+        strcpy(buf3, "  ");
+        if (po->flags & OPF_CC) {
+          // we treat conditional branch to another func
+          // (yes such code exists..) as conditional tailcall
+          strcat(buf3, "  ");
+          fprintf(fout, " {\n");
+        }
+
         if (pp->is_fptr && !pp->is_arg)
-          fprintf(fout, "  %s = %s;\n", pp->name,
+          fprintf(fout, "%s%s = %s;\n", buf3, pp->name,
             out_src_opr(buf1, sizeof(buf1), po, &po->operand[0],
               "(void *)", 0));
 
-        fprintf(fout, "  ");
+        fprintf(fout, "%s", buf3);
         if (strstr(pp->ret_type.name, "int64")) {
           if (po->flags & OPF_TAIL)
             ferr(po, "int64 and tail?\n");
@@ -4453,14 +4438,14 @@ tailcall:
 
         if (strstr(pp->ret_type.name, "int64")) {
           fprintf(fout, "\n");
-          fprintf(fout, "  edx = tmp64 >> 32;\n");
-          fprintf(fout, "  eax = tmp64;");
+          fprintf(fout, "%sedx = tmp64 >> 32;\n", buf3);
+          fprintf(fout, "%seax = tmp64;", buf3);
         }
 
         if (pp->is_unresolved) {
-          snprintf(buf3, sizeof(buf3), " unresoved %dreg",
+          snprintf(buf2, sizeof(buf2), " unresoved %dreg",
             pp->argc_reg);
-          strcat(g_comment, buf3);
+          strcat(g_comment, buf2);
         }
 
         if (po->flags & OPF_TAIL) {
@@ -4478,7 +4463,7 @@ tailcall:
               ferr(po, "int func -> void func tailcall?\n");
             }
             else {
-              fprintf(fout, "\n  return;");
+              fprintf(fout, "\n%sreturn;", buf3);
               strcat(g_comment, " ^ tailcall");
             }
           }
@@ -4489,6 +4474,12 @@ tailcall:
           strcat(g_comment, " noreturn");
         if ((po->flags & OPF_ATAIL) && pp->argc_stack > 0)
           strcat(g_comment, " argframe");
+        if (po->flags & OPF_CC)
+          strcat(g_comment, " cond");
+
+        if (po->flags & OPF_CC)
+          fprintf(fout, "\n  }");
+
         delayed_flag_op = NULL;
         last_arith_dst = NULL;
         break;
@@ -4636,9 +4627,8 @@ tailcall:
     g_label_refs[i].next = NULL;
 
     if (ops[i].op == OP_CALL) {
-      pp = ops[i].datap;
-      if (pp)
-        proto_release(pp);
+      if (ops[i].pp)
+        proto_release(ops[i].pp);
     }
   }
   g_func_pp = NULL;
