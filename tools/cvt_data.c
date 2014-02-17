@@ -18,6 +18,7 @@ static int asmln;
 static const struct parsed_proto *g_func_sym_pp;
 static char g_comment[256];
 static int g_warn_cnt;
+static int g_cconv_novalidate;
 
 // note: must be in ascending order
 enum dx_type {
@@ -259,9 +260,10 @@ static const struct parsed_proto *check_var(FILE *fhdr,
   {
     goto check_sym;
   }
-  if (pp->argc_reg != 2
-    || !IS(pp->arg[0].reg, "ecx")
-    || !IS(pp->arg[1].reg, "edx"))
+  if (!g_cconv_novalidate
+    && (pp->argc_reg != 2
+       || !IS(pp->arg[0].reg, "ecx")
+       || !IS(pp->arg[1].reg, "edx")))
   {
     awarn("unhandled reg call: %s\n", fp_var);
   }
@@ -357,7 +359,7 @@ int main(int argc, char *argv[])
 
   if (argc < 4) {
     // -nd: no symbol decorations
-    printf("usage:\n%s [-nd] <.s> <.asm> <hdrf> [rlist]*\n",
+    printf("usage:\n%s [-nd] [-i] <.s> <.asm> <hdrf> [rlist]*\n",
       argv[0]);
     return 1;
   }
@@ -365,6 +367,8 @@ int main(int argc, char *argv[])
   for (arg = 1; arg < argc; arg++) {
     if (IS(argv[arg], "-nd"))
       no_decorations = 1;
+    else if (IS(argv[arg], "-i"))
+      g_cconv_novalidate = 1;
     else
       break;
   }
