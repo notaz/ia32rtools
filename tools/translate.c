@@ -4745,6 +4745,9 @@ static void scan_ahead(FILE *fasm)
 
         add_func_chunk(fasm, words[0], asmln);
       }
+      else if (IS_START(p, "; sctend"))
+        break;
+
       continue;
     } // *p == ';'
 
@@ -4790,6 +4793,7 @@ int main(int argc, char *argv[])
   int eq_alloc;
   int verbose = 0;
   int multi_seg = 0;
+  int end = 0;
   int arg_out;
   int arg;
   int pi = 0;
@@ -5020,6 +5024,11 @@ parse_words:
       if (IS_START(p, "; sctproto:")) {
         sctproto = strdup(p + 11);
       }
+      else if (IS_START(p, "; sctend")) {
+        end = 1;
+        if (!pending_endp)
+          break;
+      }
     }
 
     if (wordc == 0) {
@@ -5040,7 +5049,7 @@ parse_words:
 do_pending_endp:
     // do delayed endp processing to collect switch jumptables
     if (pending_endp) {
-      if (in_func && !skip_func && wordc >= 2
+      if (in_func && !skip_func && !end && wordc >= 2
           && ((words[0][0] == 'd' && words[0][2] == 0)
               || (words[1][0] == 'd' && words[1][2] == 0)))
       {
@@ -5123,6 +5132,9 @@ do_pending_endp:
       }
       g_func_pd_cnt = 0;
       pd = NULL;
+
+      if (end)
+        break;
       if (wordc == 0)
         continue;
     }
@@ -5187,8 +5199,12 @@ do_pending_endp:
     }
 
     if (wordc == 2 && IS(words[1], "ends")) {
-      if (!multi_seg)
+      if (!multi_seg) {
+        end = 1;
+        if (pending_endp)
+          goto do_pending_endp;
         break;
+      }
 
       // scan for next text segment
       while (fgets(line, sizeof(line), fasm)) {
