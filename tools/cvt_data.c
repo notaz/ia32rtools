@@ -328,6 +328,39 @@ static int cmpstringp(const void *p1, const void *p2)
   return strcmp(*(char * const *)p1, *(char * const *)p2);
 }
 
+/* XXX: maybe move to external file? */
+static const char *unwanted_syms[] = {
+  "aRuntimeError",
+  "aTlossError",
+  "aSingError",
+  "aDomainError",
+  "aR6029ThisAppli",
+  "aR6028UnableToI",
+  "aR6027NotEnough",
+  "aR6026NotEnough",
+  "aR6025PureVirtu",
+  "aR6024NotEnough",
+  "aR6019UnableToO",
+  "aR6018Unexpecte",
+  "aR6017Unexpecte",
+  "aR6016NotEnough",
+  "aAbnormalProgra",
+  "aR6009NotEnough",
+  "aR6008NotEnough",
+  "aR6002FloatingP",
+  "aMicrosoftVisua",
+  "aRuntimeErrorPr",
+  "aThisApplicatio",
+  "aMicrosoftFindF",
+  "aMicrosoftOffic",
+};
+
+static int is_unwanted_sym(const char *sym)
+{
+  return bsearch(&sym, unwanted_syms, ARRAY_SIZE(unwanted_syms),
+    sizeof(unwanted_syms[0]), cmpstringp) != NULL;
+}
+
 int main(int argc, char *argv[])
 {
   FILE *fout, *fasm, *fhdr, *frlist;
@@ -336,6 +369,7 @@ int main(int argc, char *argv[])
   char words[20][256];
   char word[256];
   char line[256];
+  char last_sym[32];
   unsigned long val;
   unsigned long cnt;
   const char *sym;
@@ -422,6 +456,11 @@ int main(int argc, char *argv[])
   if (rlist_cnt > 0)
     qsort(rlist, rlist_cnt, sizeof(rlist[0]), cmpstringp);
 
+  qsort(unwanted_syms, ARRAY_SIZE(unwanted_syms),
+    sizeof(unwanted_syms[0]), cmpstringp);
+
+  last_sym[0] = 0;
+
   while (1) {
     next_section(fasm, line);
     if (feof(fasm))
@@ -492,17 +531,20 @@ int main(int argc, char *argv[])
         aerr("unhandled decl: '%s %s'\n", words[0], words[1]);
 
       if (sym != NULL) {
-        // public/global name
-        if (pub_sym_cnt >= pub_sym_alloc) {
-          pub_sym_alloc *= 2;
-          pub_syms = realloc(pub_syms, pub_sym_alloc * sizeof(pub_syms[0]));
-          my_assert_not(pub_syms, NULL);
-        }
-        pub_syms[pub_sym_cnt++] = strdup(sym);
+        snprintf(last_sym, sizeof(last_sym), "%s", sym);
 
         pp = proto_parse(fhdr, sym, 1);
-        if (pp != NULL)
+        if (pp != NULL) {
           g_func_sym_pp = NULL;
+
+          // public/global name
+          if (pub_sym_cnt >= pub_sym_alloc) {
+            pub_sym_alloc *= 2;
+            pub_syms = realloc(pub_syms, pub_sym_alloc * sizeof(pub_syms[0]));
+            my_assert_not(pub_syms, NULL);
+          }
+          pub_syms[pub_sym_cnt++] = strdup(sym);
+        }
 
         len = strlen(sym);
         fprintf(fout, "%s%s:", no_decorations ? "" : "_", sym);
@@ -521,7 +563,26 @@ int main(int argc, char *argv[])
         fprintf(fout, "\t\t  ");
       }
 
-      if (type == DXT_BYTE
+      // fill out some unwanted strings with zeroes..
+      if (type == DXT_BYTE && words[w][0] == '\''
+        && is_unwanted_sym(last_sym))
+      {
+        len = 0;
+        for (; w < wordc; w++) {
+          if (words[w][0] == '\'') {
+            p = words[w] + 1;
+            for (; *p && *p != '\''; p++)
+              len++;
+          }
+          else {
+            // assume encoded byte
+            len++;
+          }
+        }
+        fprintf(fout, ".skip %d", len);
+        goto fin;
+      }
+      else if (type == DXT_BYTE
         && (words[w][0] == '\''
             || (w + 1 < wordc && words[w + 1][0] == '\'')))
       {
