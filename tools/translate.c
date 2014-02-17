@@ -128,9 +128,10 @@ struct parsed_opr {
   unsigned int size_mismatch:1; // type override differs from C
   unsigned int size_lt:1;  // type override is larger than C
   unsigned int had_ds:1;   // had ds: prefix
+  const struct parsed_proto *pp; // for OPT_LABEL
   int reg;
   unsigned int val;
-  char name[256];
+  char name[112];
 };
 
 struct parsed_op {
@@ -148,7 +149,7 @@ struct parsed_op {
   int cc_scratch;         // scratch storage during analysis
   int bt_i;               // branch target for branches
   struct parsed_data *btj;// branch targets for jumptables
-  struct parsed_proto *pp;
+  struct parsed_proto *pp;// parsed_proto for OP_CALL
   void *datap;
 };
 
@@ -507,6 +508,24 @@ static int guess_lmod_from_c_type(enum opr_lenmod *lmod,
   return 0;
 }
 
+static char *default_cast_to(char *buf, size_t buf_size,
+  struct parsed_opr *opr)
+{
+  buf[0] = 0;
+
+  if (!opr->is_ptr)
+    return buf;
+  if (opr->pp == NULL || opr->pp->type.name == NULL
+    || opr->pp->is_fptr)
+  {
+    snprintf(buf, buf_size, "%s", "(void *)");
+    return buf;
+  }
+
+  snprintf(buf, buf_size, "(%s)", opr->pp->type.name);
+  return buf;
+}
+
 static enum opr_type lmod_from_directive(const char *d)
 {
   if (IS(d, "dd"))
@@ -699,6 +718,7 @@ do_label:
     }
     opr->is_array = pp->type.is_array;
   }
+  opr->pp = pp;
 
   if (opr->lmod == OPLM_UNSPEC)
     guess_lmod_from_name(opr);
@@ -3807,9 +3827,10 @@ tailcall:
         assert_operand_cnt(2);
         propagate_lmod(po, &po->operand[0], &po->operand[1]);
         out_dst_opr(buf1, sizeof(buf1), po, &po->operand[0]);
+        default_cast_to(buf3, sizeof(buf3), &po->operand[0]);
         fprintf(fout, "  %s = %s;", buf1,
             out_src_opr(buf2, sizeof(buf2), po, &po->operand[1],
-              po->operand[0].is_ptr ? "(void *)" : "", 0));
+              buf3, 0));
         break;
 
       case OP_LEA:
@@ -3853,9 +3874,11 @@ tailcall:
           out_src_opr(buf1, sizeof(buf1), po, &po->operand[0], "", 0));
         fprintf(fout, " %s = %s;",
           out_dst_opr(buf1, sizeof(buf1), po, &po->operand[0]),
-          out_src_opr(buf2, sizeof(buf2), po, &po->operand[1], "", 0));
-        fprintf(fout, " %s = tmp;",
-          out_dst_opr(buf1, sizeof(buf1), po, &po->operand[1]));
+          out_src_opr(buf2, sizeof(buf2), po, &po->operand[1],
+            default_cast_to(buf3, sizeof(buf3), &po->operand[0]), 0));
+        fprintf(fout, " %s = %stmp;",
+          out_dst_opr(buf1, sizeof(buf1), po, &po->operand[1]),
+          default_cast_to(buf3, sizeof(buf3), &po->operand[1]));
         snprintf(g_comment, sizeof(g_comment), "xchg");
         break;
 
@@ -4544,7 +4567,7 @@ tailcall:
           fprintf(fout, "  %s = %s;", buf1,
             out_src_opr(buf2, sizeof(buf2),
               tmp_op, &tmp_op->operand[0],
-              po->operand[0].is_ptr ? "(void *)" : "", 0));
+              default_cast_to(buf3, sizeof(buf3), &po->operand[0]), 0));
           break;
         }
         else if (g_func_pp->is_userstack) {

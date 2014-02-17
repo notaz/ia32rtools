@@ -166,7 +166,7 @@ static const char *known_ptr_types[] = {
 	"HGLOBAL",
 	"HICON",
 	"HINSTANCE",
-	//"HIMC", // DWORD
+	"HIMC", // DWORD in mingw, ptr in wine..
 	"HMODULE",
 	"HPALETTE",
 	"HRGN",
