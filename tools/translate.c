@@ -3903,7 +3903,7 @@ tailcall:
           ferr(po, "TODO\n");
         }
         else {
-          fprintf(fout, "  eax = %sedi; esi %c= %d;",
+          fprintf(fout, "  eax = %sesi; esi %c= %d;",
             lmod_cast_u_ptr(po, po->operand[0].lmod),
             (po->flags & OPF_DF) ? '-' : '+',
             lmod_bytes(po, po->operand[0].lmod));
@@ -3962,11 +3962,11 @@ tailcall:
           if (pfomask & (1 << PFO_C)) {
             // ugh..
             fprintf(fout,
-            "    cond_c = %sedi < %sesi;\n", buf1, buf1);
+            "    cond_c = %sesi < %sedi;\n", buf1, buf1);
             pfomask &= ~(1 << PFO_C);
           }
           fprintf(fout,
-            "    cond_z = (%sedi == %sesi); edi %c= %d, esi %c= %d;\n",
+            "    cond_z = (%sesi == %sedi); esi %c= %d, edi %c= %d;\n",
               buf1, buf1, l, j, l, j);
           fprintf(fout,
             "    if (cond_z %s 0) break;\n",
@@ -3978,7 +3978,7 @@ tailcall:
         }
         else {
           fprintf(fout,
-            "  cond_z = (%sedi = %sesi); edi %c= %d; esi %c= %d;",
+            "  cond_z = (%sesi == %sedi); esi %c= %d; edi %c= %d;",
             buf1, buf1, l, j, l, j);
           strcpy(g_comment, "cmps");
         }
@@ -4009,7 +4009,7 @@ tailcall:
             (po->flags & OPF_REPZ) ? "e" : "ne");
         }
         else {
-          fprintf(fout, "  cond_z = (%seax = %sedi); edi %c= %d;",
+          fprintf(fout, "  cond_z = (%seax == %sedi); edi %c= %d;",
               lmod_cast_u(po, po->operand[0].lmod),
               lmod_cast_u_ptr(po, po->operand[0].lmod), l, j);
           strcpy(g_comment, "scas");
