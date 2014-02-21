@@ -151,6 +151,7 @@ struct parsed_op {
   struct parsed_data *btj;// branch targets for jumptables
   struct parsed_proto *pp;// parsed_proto for OP_CALL
   void *datap;
+  int asmln;
 };
 
 // datap:
@@ -212,13 +213,13 @@ static int g_stack_fsz;
 static int g_ida_func_attr;
 static int g_allow_regfunc;
 #define ferr(op_, fmt, ...) do { \
-  printf("error:%s:#%zd: '%s': " fmt, g_func, (op_) - ops, \
+  printf("%s:%d: error: [%s] '%s': " fmt, asmfn, (op_)->asmln, g_func, \
     dump_op(op_), ##__VA_ARGS__); \
   fcloseall(); \
   exit(1); \
 } while (0)
 #define fnote(op_, fmt, ...) \
-  printf("error:%s:#%zd: '%s': " fmt, g_func, (op_) - ops, \
+  printf("%s:%d: note: [%s] '%s': " fmt, asmfn, (op_)->asmln, g_func, \
     dump_op(op_), ##__VA_ARGS__)
 
 #define MAX_REGS 8
@@ -904,6 +905,7 @@ static void parse_op(struct parsed_op *op, char words[16][256], int wordc)
   op->pfo = op_table[i].pfo;
   op->pfo_inv = op_table[i].pfo_inv;
   op->regmask_src = op->regmask_dst = 0;
+  op->asmln = asmln;
 
   for (opr = 0; opr < op_table[i].minopr; opr++) {
     regmask = regmask_ind = 0;
@@ -4365,10 +4367,14 @@ tailcall:
           fprintf(fout, " {\n");
         }
 
-        if (pp->is_fptr && !pp->is_arg)
+        if (pp->is_fptr && !pp->is_arg) {
           fprintf(fout, "%s%s = %s;\n", buf3, pp->name,
             out_src_opr(buf1, sizeof(buf1), po, &po->operand[0],
               "(void *)", 0));
+          if (pp->is_unresolved)
+            fprintf(fout, "%sunresolved_call(\"%s:%d\", %s);\n",
+              buf3, asmfn, po->asmln, pp->name);
+        }
 
         fprintf(fout, "%s", buf3);
         if (strstr(pp->ret_type.name, "int64")) {
@@ -4466,7 +4472,7 @@ tailcall:
         }
 
         if (pp->is_unresolved) {
-          snprintf(buf2, sizeof(buf2), " unresoved %dreg",
+          snprintf(buf2, sizeof(buf2), " unresolved %dreg",
             pp->argc_reg);
           strcat(g_comment, buf2);
         }
@@ -5296,7 +5302,7 @@ do_pending_endp:
     parse_op(&ops[pi], words, wordc);
 
     if (sctproto != NULL) {
-      if (ops[pi].op == OP_CALL)
+      if (ops[pi].op == OP_CALL || ops[pi].op == OP_JMP)
         ops[pi].datap = sctproto;
       sctproto = NULL;
     }
