@@ -9,16 +9,21 @@ endif
 LDFLAGS += -ggdb
 
 ifdef ARM
-WGCC_FLAGS += -marm -b$(patsubst %-,%,$(CROSS_COMPILE))
-# WGCC_FLAGS += --sysroot $(HOME)/stuff/wine_arm/wine-arm-build/
-CFLAGS += $(WGCC_FLAGS)
 CFLAGS += -mcpu=cortex-a8 -mtune=cortex-a8 -mfloat-abi=softfp -mfpu=neon
 CFLAGS += -Wno-unused
+WGCC_FLAGS += -marm -b$(patsubst %-,%,$(CROSS_COMPILE))
+# wine defines wchar_t correctly, doesn't use -fshort-wchar, we can't too
+WGCC_FLAGS += -fno-short-wchar
+# WGCC_FLAGS += --sysroot $(WINEROOT)
+CFLAGS += $(WGCC_FLAGS)
 LDFLAGS += $(WGCC_FLAGS)
+
 # should not be needed, but..
-CFLAGS += -isystem$(HOME)/stuff/wine_arm/inst/include/wine/msvcrt
-CFLAGS += -isystem$(HOME)/stuff/wine_arm/inst/include/wine/windows
-LDFLAGS += -L$(HOME)/stuff/wine_arm/inst/lib/wine
+WINEROOT ?= $(HOME)/stuff/wine_arm/inst
+CFLAGS += -isystem$(WINEROOT)/include/wine/msvcrt
+CFLAGS += -isystem$(WINEROOT)/include/wine/windows
+LDFLAGS += -L$(WINEROOT)/lib/wine -L$(WINEROOT)/lib
+
 CVT_OPT = -a
 BUILTIN = 1
 else
