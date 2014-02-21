@@ -19,6 +19,7 @@ static const struct parsed_proto *g_func_sym_pp;
 static char g_comment[256];
 static int g_warn_cnt;
 static int g_cconv_novalidate;
+static int g_arm_mode;
 
 // note: must be in ascending order
 enum dx_type {
@@ -323,6 +324,18 @@ static void output_decorated_pp(FILE *fout,
     fprintf(fout, "@%d", pp->argc * 4);
 }
 
+static int align_value(int src_val)
+{
+  if (src_val <= 0) {
+    awarn("bad align: %d\n", src_val);
+    src_val = 1;
+  }
+  if (!g_arm_mode)
+    return src_val;
+
+  return __builtin_ffs(src_val) - 1;
+}
+
 static int cmpstringp(const void *p1, const void *p2)
 {
   return strcmp(*(char * const *)p1, *(char * const *)p2);
@@ -366,6 +379,7 @@ int main(int argc, char *argv[])
   FILE *fout, *fasm, *fhdr, *frlist;
   const struct parsed_proto *pp;
   int no_decorations = 0;
+  char comment_char = '#';
   char words[20][256];
   char word[256];
   char line[256];
@@ -393,7 +407,7 @@ int main(int argc, char *argv[])
 
   if (argc < 4) {
     // -nd: no symbol decorations
-    printf("usage:\n%s [-nd] [-i] <.s> <.asm> <hdrf> [rlist]*\n",
+    printf("usage:\n%s [-nd] [-i] [-a] <.s> <.asm> <hdrf> [rlist]*\n",
       argv[0]);
     return 1;
   }
@@ -403,6 +417,10 @@ int main(int argc, char *argv[])
       no_decorations = 1;
     else if (IS(argv[arg], "-i"))
       g_cconv_novalidate = 1;
+    else if (IS(argv[arg], "-a")) {
+      comment_char = '@';
+      g_arm_mode = 1;
+    }
     else
       break;
   }
@@ -475,7 +493,7 @@ int main(int argc, char *argv[])
     else
       aerr("unhandled section: '%s'\n", line);
 
-    fprintf(fout, ".align 4\n");
+    fprintf(fout, ".align %d\n", align_value(4));
 
     while (fgets(line, sizeof(line), fasm))
     {
@@ -516,7 +534,7 @@ int main(int argc, char *argv[])
 
       if (IS(words[0], "align")) {
         val = parse_number(words[1]);
-        fprintf(fout, "\t\t  .align %ld", val);
+        fprintf(fout, "\t\t  .align %d", align_value(val));
         goto fin;
       }
 
@@ -653,7 +671,13 @@ int main(int argc, char *argv[])
         if (w != wordc - 1)
           aerr("TODO\n");
 
-        fprintf(fout, "%s %s", type_name_float(type), words[w]);
+        if (g_arm_mode && type == DXT_TEN) {
+          fprintf(fout, ".fill 10");
+          snprintf(g_comment, sizeof(g_comment), "%s %s",
+            type_name_float(type), words[w]);
+        }
+        else
+          fprintf(fout, "%s %s", type_name_float(type), words[w]);
         goto fin;
       }
 
@@ -719,7 +743,7 @@ int main(int argc, char *argv[])
 
 fin:
       if (g_comment[0] != 0) {
-        fprintf(fout, "\t\t# %s", g_comment);
+        fprintf(fout, "\t\t%c %s", comment_char, g_comment);
         g_comment[0] = 0;
       }
       fprintf(fout, "\n");
