@@ -1706,6 +1706,9 @@ void __cdecl _endthreadex (unsigned int);
 // 18 sctproto: int (WINAPI *dsound_SetCooperativeLevel)(void *iface, HWND hwnd, DWORD level)
 // IDirectSoundBuffer8
 // 10 sctproto: int (WINAPI *dsndbuf_GetCurrentPosition)(void *iface, DWORD *playpos, DWORD *writepos)
+// 14 sctproto: int (WINAPI *dsndbuf_GetFormat)(void *iface, void *lpwf, DWORD wfsize, DWORD *wfwritten)
+// 18 sctproto: int (WINAPI *dsndbuf_GetVolume)(void *iface, LONG *vol)
+// 1C sctproto: int (WINAPI *dsndbuf_GetPan)(void *iface, LONG *pan)
 // 2C sctproto: int (WINAPI *dsndbuf_Lock)(void *iface, DWORD, void **, DWORD *, void *, void **, DWORD *, DWORD)
 // 30 sctproto: int (WINAPI *dsndbuf_Play)(void *iface, DWORD, DWORD, DWORD flags)
 // 34 sctproto: int (WINAPI *dsndbuf_SetCurrentPosition)(void *iface, DWORD newpos)
