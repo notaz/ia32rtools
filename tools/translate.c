@@ -2893,39 +2893,7 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
   if (g_func_pp == NULL)
     ferr(ops, "proto_parse failed for '%s'\n", funcn);
 
-  fprintf(fout, "%s ", g_func_pp->ret_type.name);
-  output_pp_attrs(fout, g_func_pp, g_ida_func_attr & IDAFA_NORETURN);
-  fprintf(fout, "%s(", g_func_pp->name);
-
   for (i = 0; i < g_func_pp->argc; i++) {
-    if (i > 0)
-      fprintf(fout, ", ");
-    if (g_func_pp->arg[i].fptr != NULL) {
-      // func pointer..
-      pp = g_func_pp->arg[i].fptr;
-      fprintf(fout, "%s (", pp->ret_type.name);
-      output_pp_attrs(fout, pp, 0);
-      fprintf(fout, "*a%d)(", i + 1);
-      for (j = 0; j < pp->argc; j++) {
-        if (j > 0)
-          fprintf(fout, ", ");
-        if (pp->arg[j].fptr)
-          ferr(ops, "nested fptr\n");
-        fprintf(fout, "%s", pp->arg[j].type.name);
-      }
-      if (pp->is_vararg) {
-        if (j > 0)
-          fprintf(fout, ", ");
-        fprintf(fout, "...");
-      }
-      fprintf(fout, ")");
-    }
-    else if (g_func_pp->arg[i].type.is_retreg) {
-      fprintf(fout, "u32 *r_%s", g_func_pp->arg[i].reg);
-    }
-    else {
-      fprintf(fout, "%s a%d", g_func_pp->arg[i].type.name, i + 1);
-    }
     if (g_func_pp->arg[i].reg != NULL) {
       reg = char_array_i(regs_r32,
               ARRAY_SIZE(regs_r32), g_func_pp->arg[i].reg);
@@ -2934,13 +2902,6 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
       regmask_arg |= 1 << reg;
     }
   }
-  if (g_func_pp->is_vararg) {
-    if (i > 0)
-      fprintf(fout, ", ");
-    fprintf(fout, "...");
-  }
-
-  fprintf(fout, ")\n{\n");
 
   // pass1:
   // - handle ebp/esp frame, remove ops related to it
@@ -3514,39 +3475,6 @@ tailcall:
           }
         }
       }
-
-      // declare indirect funcs
-      if (pp->is_fptr && !(pp->name[0] != 0 && pp->is_arg)) {
-        if (pp->name[0] != 0) {
-          memmove(pp->name + 2, pp->name, strlen(pp->name) + 1);
-          memcpy(pp->name, "i_", 2);
-
-          // might be declared already
-          found = 0;
-          for (j = 0; j < i; j++) {
-            if (ops[j].op == OP_CALL && (pp_tmp = ops[j].pp)) {
-              if (pp_tmp->is_fptr && IS(pp->name, pp_tmp->name)) {
-                found = 1;
-                break;
-              }
-            }
-          }
-          if (found)
-            continue;
-        }
-        else
-          snprintf(pp->name, sizeof(pp->name), "icall%d", i);
-
-        fprintf(fout, "  %s (", pp->ret_type.name);
-        output_pp_attrs(fout, pp, 0);
-        fprintf(fout, "*%s)(", pp->name);
-        for (j = 0; j < pp->argc; j++) {
-          if (j > 0)
-            fprintf(fout, ", ");
-          fprintf(fout, "%s a%d", pp->arg[j].type.name, j + 1);
-        }
-        fprintf(fout, ");\n");
-      }
     }
     else if (po->op == OP_RET && !IS(g_func_pp->ret_type.name, "void"))
       regmask |= 1 << xAX;
@@ -3584,6 +3512,102 @@ tailcall:
     }
   }
 
+  // output starts here
+
+  // define userstack size
+  if (g_func_pp->is_userstack) {
+    fprintf(fout, "#ifndef US_SZ_%s\n", g_func_pp->name);
+    fprintf(fout, "#define US_SZ_%s USERSTACK_SIZE\n", g_func_pp->name);
+    fprintf(fout, "#endif\n");
+  }
+
+  // the function itself
+  fprintf(fout, "%s ", g_func_pp->ret_type.name);
+  output_pp_attrs(fout, g_func_pp, g_ida_func_attr & IDAFA_NORETURN);
+  fprintf(fout, "%s(", g_func_pp->name);
+
+  for (i = 0; i < g_func_pp->argc; i++) {
+    if (i > 0)
+      fprintf(fout, ", ");
+    if (g_func_pp->arg[i].fptr != NULL) {
+      // func pointer..
+      pp = g_func_pp->arg[i].fptr;
+      fprintf(fout, "%s (", pp->ret_type.name);
+      output_pp_attrs(fout, pp, 0);
+      fprintf(fout, "*a%d)(", i + 1);
+      for (j = 0; j < pp->argc; j++) {
+        if (j > 0)
+          fprintf(fout, ", ");
+        if (pp->arg[j].fptr)
+          ferr(ops, "nested fptr\n");
+        fprintf(fout, "%s", pp->arg[j].type.name);
+      }
+      if (pp->is_vararg) {
+        if (j > 0)
+          fprintf(fout, ", ");
+        fprintf(fout, "...");
+      }
+      fprintf(fout, ")");
+    }
+    else if (g_func_pp->arg[i].type.is_retreg) {
+      fprintf(fout, "u32 *r_%s", g_func_pp->arg[i].reg);
+    }
+    else {
+      fprintf(fout, "%s a%d", g_func_pp->arg[i].type.name, i + 1);
+    }
+  }
+  if (g_func_pp->is_vararg) {
+    if (i > 0)
+      fprintf(fout, ", ");
+    fprintf(fout, "...");
+  }
+
+  fprintf(fout, ")\n{\n");
+
+  // declare indirect functions
+  for (i = 0; i < opcnt; i++) {
+    po = &ops[i];
+    if (po->flags & OPF_RMD)
+      continue;
+
+    if (po->op == OP_CALL) {
+      pp = po->pp;
+      if (pp == NULL)
+        ferr(po, "NULL pp\n");
+
+      if (pp->is_fptr && !(pp->name[0] != 0 && pp->is_arg)) {
+        if (pp->name[0] != 0) {
+          memmove(pp->name + 2, pp->name, strlen(pp->name) + 1);
+          memcpy(pp->name, "i_", 2);
+
+          // might be declared already
+          found = 0;
+          for (j = 0; j < i; j++) {
+            if (ops[j].op == OP_CALL && (pp_tmp = ops[j].pp)) {
+              if (pp_tmp->is_fptr && IS(pp->name, pp_tmp->name)) {
+                found = 1;
+                break;
+              }
+            }
+          }
+          if (found)
+            continue;
+        }
+        else
+          snprintf(pp->name, sizeof(pp->name), "icall%d", i);
+
+        fprintf(fout, "  %s (", pp->ret_type.name);
+        output_pp_attrs(fout, pp, 0);
+        fprintf(fout, "*%s)(", pp->name);
+        for (j = 0; j < pp->argc; j++) {
+          if (j > 0)
+            fprintf(fout, ", ");
+          fprintf(fout, "%s a%d", pp->arg[j].type.name, j + 1);
+        }
+        fprintf(fout, ");\n");
+      }
+    }
+  }
 
   // output LUTs/jumptables
   for (i = 0; i < g_func_pd_cnt; i++) {
@@ -3620,8 +3644,8 @@ tailcall:
   }
 
   if (g_func_pp->is_userstack) {
-    fprintf(fout, "  u32 fake_sf[1024];\n");
-    fprintf(fout, "  u32 *esp = &fake_sf[1024];\n");
+    fprintf(fout, "  u32 fake_sf[US_SZ_%s / 4];\n", g_func_pp->name);
+    fprintf(fout, "  u32 *esp = &fake_sf[sizeof(fake_sf) / 4];\n");
     had_decl = 1;
   }
 
