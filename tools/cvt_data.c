@@ -138,7 +138,7 @@ static const char *type_name(enum dx_type type)
   case DXT_BYTE:
     return ".byte";
   case DXT_WORD:
-    return ".word";
+    return ".hword";
   case DXT_DWORD:
     return ".long";
   case DXT_QUAD:
@@ -501,8 +501,18 @@ int main(int argc, char *argv[])
       asmln++;
 
       p = sskip(line);
-      if (*p == 0 || *p == ';')
+      if (*p == 0)
         continue;
+
+      if (*p == ';') {
+        if (IS_START(p, ";org") && sscanf(p + 5, "%Xh", &i) == 1) {
+          // ;org is only seen at section start, so assume . addr 0
+          i &= 0xfff;
+          if (i != 0)
+            fprintf(fout, "\t\t  .skip 0x%x\n", i);
+        }
+        continue;
+      }
 
       for (wordc = 0; wordc < ARRAY_SIZE(words); wordc++) {
         p = sskip(next_word_s(words[wordc], sizeof(words[0]), p));
