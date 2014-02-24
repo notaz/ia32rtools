@@ -742,6 +742,30 @@ struct parsed_proto *proto_clone(const struct parsed_proto *pp_c)
 	return pp;
 }
 
+
+static inline int pp_cmp_func(const struct parsed_proto *pp1,
+  const struct parsed_proto *pp2)
+{
+  int i;
+
+  if (pp1->argc != pp2->argc || pp1->argc_reg != pp2->argc_reg)
+    return 1;
+  else {
+    for (i = 0; i < pp1->argc; i++) {
+      if ((pp1->arg[i].reg != NULL) != (pp2->arg[i].reg != NULL))
+        return 1;
+
+      if ((pp1->arg[i].reg != NULL)
+        && !IS(pp1->arg[i].reg, pp2->arg[i].reg))
+      {
+        return 1;
+      }
+    }
+  }
+
+  return 0;
+}
+
 static inline void pp_print(char *buf, size_t buf_size,
   const struct parsed_proto *pp)
 {

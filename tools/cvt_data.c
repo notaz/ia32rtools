@@ -240,7 +240,6 @@ static const struct parsed_proto *check_var(FILE *fhdr,
 {
   const struct parsed_proto *pp, *pp_sym;
   char fp_sym[256], fp_var[256];
-  int i, bad = 0;
 
   pp = proto_parse(fhdr, varname, 1);
   if (pp == NULL) {
@@ -287,24 +286,7 @@ check_sym:
       return pp;
   }
 
-  if (pp->argc != pp_sym->argc || pp->argc_reg != pp_sym->argc_reg)
-    bad = 1;
-  else {
-    for (i = 0; i < pp->argc; i++) {
-      if ((pp->arg[i].reg != NULL) != (pp_sym->arg[i].reg != NULL)) {
-        bad = 1;
-        break;
-      }
-      if ((pp->arg[i].reg != NULL)
-        && !IS(pp->arg[i].reg, pp_sym->arg[i].reg))
-      {
-        bad = 1;
-        break;
-      }
-    }
-  }
-
-  if (bad) {
+  if (pp_cmp_func(pp, pp_sym)) {
     pp_print(fp_sym, sizeof(fp_sym), pp_sym);
     anote("var: %s\n", fp_var);
     anote("sym: %s\n", fp_sym);

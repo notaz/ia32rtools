@@ -625,8 +625,10 @@ static int parse_operand(struct parsed_opr *opr,
   if (wordc_in == 2) {
     if (IS(words[w], "offset")) {
       opr->type = OPT_OFFSET;
+      opr->lmod = OPLM_DWORD;
       strcpy(opr->name, words[w + 1]);
-      return wordc;
+      pp = proto_parse(g_fhdr, opr->name, 1);
+      goto do_label;
     }
     if (IS(words[w], "(offset")) {
       p = strchr(words[w + 1], ')');
@@ -3473,6 +3475,25 @@ tailcall:
             regmask_init |= 1 << reg;
             regmask |= 1 << reg;
           }
+        }
+      }
+    }
+    else if (po->op == OP_MOV && po->operand[0].pp != NULL
+      && po->operand[1].pp != NULL)
+    {
+      // <var> = offset <something>
+      if ((po->operand[1].pp->is_func || po->operand[1].pp->is_fptr)
+        && !IS_START(po->operand[1].name, "off_"))
+      {
+        if (!po->operand[0].pp->is_fptr)
+          ferr(po, "%s not declared as fptr when it should be\n",
+            po->operand[0].name);
+        if (pp_cmp_func(po->operand[0].pp, po->operand[1].pp)) {
+          pp_print(buf1, sizeof(buf1), po->operand[0].pp);
+          pp_print(buf2, sizeof(buf2), po->operand[1].pp);
+          fnote(po, "var:  %s\n", buf1);
+          fnote(po, "func: %s\n", buf2);
+          ferr(po, "^ mismatch\n");
         }
       }
     }
