@@ -474,6 +474,8 @@ static int guess_lmod_from_c_type(enum opr_lenmod *lmod,
     "uint8_t", "int8_t", "char",
     "unsigned __int8", "__int8", "BYTE", "_BYTE",
     "CHAR", "_UNKNOWN",
+    // structures.. deal the same as with _UNKNOWN for now
+    "CRITICAL_SECTION",
   };
   const char *n;
   int i;
