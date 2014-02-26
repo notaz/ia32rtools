@@ -3395,8 +3395,12 @@ tailcall:
             pfomask = 1 << po->pfo;
           }
 
-          if (tmp_op->op == OP_ADD && po->pfo == PFO_C)
-            need_tmp64 = 1;
+          if (tmp_op->op == OP_ADD && po->pfo == PFO_C) {
+            propagate_lmod(tmp_op, &tmp_op->operand[0],
+              &tmp_op->operand[1]);
+            if (tmp_op->operand[0].lmod == OPLM_DWORD)
+              need_tmp64 = 1;
+          }
         }
         if (pfomask) {
           tmp_op->pfomask |= pfomask;
@@ -3417,7 +3421,8 @@ tailcall:
     else if (po->op == OP_MUL
       || (po->op == OP_IMUL && po->operand_cnt == 1))
     {
-      need_tmp64 = 1;
+      if (po->operand[0].lmod == OPLM_DWORD)
+        need_tmp64 = 1;
     }
     else if (po->op == OP_CALL) {
       pp = po->pp;
@@ -4203,13 +4208,22 @@ tailcall:
         assert_operand_cnt(2);
         propagate_lmod(po, &po->operand[0], &po->operand[1]);
         if (pfomask & (1 << PFO_C)) {
-          fprintf(fout, "  tmp64 = (u64)%s + %s;\n",
-            out_src_opr_u32(buf1, sizeof(buf1), po, &po->operand[0]),
-            out_src_opr_u32(buf2, sizeof(buf2), po, &po->operand[1]));
-          fprintf(fout, "  cond_c = tmp64 >> 32;\n");
-          fprintf(fout, "  %s = (u32)tmp64;",
-            out_dst_opr(buf1, sizeof(buf1), po, &po->operand[0]));
-          strcat(g_comment, "add64");
+          out_src_opr_u32(buf1, sizeof(buf1), po, &po->operand[0]);
+          out_src_opr_u32(buf2, sizeof(buf2), po, &po->operand[1]);
+          if (po->operand[0].lmod == OPLM_DWORD) {
+            fprintf(fout, "  tmp64 = (u64)%s + %s;\n", buf1, buf2);
+            fprintf(fout, "  cond_c = tmp64 >> 32;\n");
+            fprintf(fout, "  %s = (u32)tmp64;",
+              out_dst_opr(buf1, sizeof(buf1), po, &po->operand[0]));
+            strcat(g_comment, "add64");
+          }
+          else {
+            fprintf(fout, "  cond_c = ((u32)%s + %s) >> %d;\n",
+              buf1, buf2, lmod_bytes(po, po->operand[0].lmod) * 8);
+            fprintf(fout, "  %s += %s;",
+              out_dst_opr(buf1, sizeof(buf1), po, &po->operand[0]),
+              buf2);
+          }
           pfomask &= ~(1 << PFO_C);
           output_std_flags(fout, po, &pfomask, buf1);
           last_arith_dst = &po->operand[0];
@@ -4302,11 +4316,24 @@ tailcall:
         // fallthrough
       case OP_MUL:
         assert_operand_cnt(1);
-        strcpy(buf1, po->op == OP_IMUL ? "(s64)(s32)" : "(u64)");
-        fprintf(fout, "  tmp64 = %seax * %s%s;\n", buf1, buf1,
-          out_src_opr_u32(buf2, sizeof(buf2), po, &po->operand[0]));
-        fprintf(fout, "  edx = tmp64 >> 32;\n");
-        fprintf(fout, "  eax = tmp64;");
+        switch (po->operand[0].lmod) {
+        case OPLM_DWORD:
+          strcpy(buf1, po->op == OP_IMUL ? "(s64)(s32)" : "(u64)");
+          fprintf(fout, "  tmp64 = %seax * %s%s;\n", buf1, buf1,
+            out_src_opr_u32(buf2, sizeof(buf2), po, &po->operand[0]));
+          fprintf(fout, "  edx = tmp64 >> 32;\n");
+          fprintf(fout, "  eax = tmp64;");
+          break;
+        case OPLM_BYTE:
+          strcpy(buf1, po->op == OP_IMUL ? "(s16)(s8)" : "(u16)(u8)");
+          fprintf(fout, "  LOWORD(eax) = %seax * %s;", buf1,
+            out_src_opr(buf2, sizeof(buf2), po, &po->operand[0],
+              buf1, 0));
+          break;
+        default:
+          ferr(po, "TODO: unhandled mul type\n");
+          break;
+        }
         last_arith_dst = NULL;
         delayed_flag_op = NULL;
         break;
