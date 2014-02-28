@@ -61,6 +61,7 @@ _fgetc
 __filbuf
 __mbsicmp
 __beginthreadex
+__endthreadex
 __onexit
 _atexit
 __stricmp
