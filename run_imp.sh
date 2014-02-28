@@ -1,13 +1,19 @@
 #!/bin/sh
 
-grep 'extrn ' $1 | awk '{print $2}' | awk -F: '{print $1}' > $2_implist
-extra_libs=`ls *.lib 2> /dev/null`
+target_s=$1
+src_asm=$2
+implist=${target_s}_implist
+tmpsym=${target_s}_tmpsym
+shift 2
 
-echo ".data" > $2
-echo ".align 4" >> $2
+grep 'extrn ' $src_asm | awk '{print $2}' | \
+  awk -F: '{print $1}' > $implist
 
-cat $2_implist | while read i; do
-  rm -f $2_tmpsym
+echo ".data" > $target_s
+echo ".align 4" >> $target_s
+
+cat $implist | while read i; do
+  rm -f $tmpsym
   case $i in
   __imp_*)
     si=`echo $i | cut -c 7-`
@@ -17,22 +23,22 @@ cat $2_implist | while read i; do
     ;;
   esac
 
-  grep "\<_$si\>" /usr/i586-mingw32msvc/lib/lib* $extra_libs | awk '{print $3}' | \
+  grep "\<_$si\>" /usr/i586-mingw32msvc/lib/lib* "$@" | awk '{print $3}' | \
     while read f; do
       sym=`i586-mingw32msvc-nm $f | grep "\<_$si\>" | grep ' T ' | awk '{print $3}'`
       if test -n "$sym"; then
-        echo $sym > $2_tmpsym
+        echo $sym > $tmpsym
         break
       fi
     done
-  sym=`cat $2_tmpsym`
+  sym=`cat $tmpsym`
   if test -z "$sym"; then
     echo "no file/sym for $i, lf $f"
     exit 1
   fi
 
-  echo ".globl $i" >> $2
-  echo "$i:" >> $2
-  echo "  .long $sym" >> $2
-  echo >> $2
+  echo ".globl $i" >> $target_s
+  echo "$i:" >> $target_s
+  echo "  .long $sym" >> $target_s
+  echo >> $target_s
 done
