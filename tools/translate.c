@@ -467,7 +467,7 @@ static int guess_lmod_from_c_type(enum opr_lenmod *lmod,
     "LONG", "HIMC",
   };
   static const char *word_types[] = {
-    "uint16_t", "int16_t", "_WORD",
+    "uint16_t", "int16_t", "_WORD", "WORD",
     "unsigned __int16", "__int16",
   };
   static const char *byte_types[] = {
@@ -3172,6 +3172,8 @@ tailcall:
         // indirect call
         pp_c = resolve_icall(i, opcnt, &l);
         if (pp_c != NULL) {
+          if (!pp_c->is_func && !pp_c->is_fptr)
+            ferr(po, "call to non-func: %s\n", pp_c->name);
           pp = proto_clone(pp_c);
           my_assert_not(pp, NULL);
           if (l)
