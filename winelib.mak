@@ -26,6 +26,7 @@ LDFLAGS += -L$(WINEROOT)/lib/wine -L$(WINEROOT)/lib
 
 CVT_OPT = -a
 BUILTIN = 1
+export ARM
 else
 CFLAGS += -Wno-unused-but-set-variable
 CFLAGS += -m32
