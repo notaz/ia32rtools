@@ -54,6 +54,7 @@ enum op_flags {
   OPF_ATAIL  = (1 << 14), /* tail call with reused arg frame */
   OPF_32BIT  = (1 << 15), /* 32bit division */
   OPF_LOCK   = (1 << 16), /* op has lock prefix */
+  OPF_VAPUSH = (1 << 17), /* vararg ptr push (as call arg) */
 };
 
 enum op_op {
@@ -2582,8 +2583,10 @@ static const struct parsed_proto *resolve_icall(int i, int opcnt,
   return pp;
 }
 
-static int try_resolve_const(int i, const struct parsed_opr *opr,
-  int magic, unsigned int *val)
+// find an instruction that changed opr before i op
+// *op_i must be set to -1
+static int resolve_origin(int i, const struct parsed_opr *opr,
+  int magic, int *op_i)
 {
   struct label_ref *lr;
   int ret = 0;
@@ -2594,7 +2597,7 @@ static int try_resolve_const(int i, const struct parsed_opr *opr,
     if (g_labels[i][0] != 0) {
       lr = &g_label_refs[i];
       for (; lr != NULL; lr = lr->next)
-        ret |= try_resolve_const(lr->i, opr, magic, val);
+        ret |= resolve_origin(lr->i, opr, magic, op_i);
       if (i > 0 && LAST_OP(i - 1))
         return ret;
     }
@@ -2611,12 +2614,36 @@ static int try_resolve_const(int i, const struct parsed_opr *opr,
       continue;
     if (!is_opr_modified(opr, &ops[i]))
       continue;
+
+    if (*op_i >= 0) {
+      if (*op_i == i)
+        return 1;
+      // XXX: could check if the other op does the same
+      return -1;
+    }
+
+    *op_i = i;
+    return 1;
+  }
+}
+
+static int try_resolve_const(int i, const struct parsed_opr *opr,
+  int magic, unsigned int *val)
+{
+  int s_i = -1;
+  int ret = 0;
+
+  ret = resolve_origin(i, opr, magic, &s_i);
+  if (ret == 1) {
+    i = s_i;
     if (ops[i].op != OP_MOV && ops[i].operand[1].type != OPT_CONST)
       return -1;
 
     *val = ops[i].operand[1].val;
     return 1;
   }
+
+  return -1;
 }
 
 static int collect_call_args_r(struct parsed_op *po, int i,
@@ -2626,8 +2653,10 @@ static int collect_call_args_r(struct parsed_op *po, int i,
   struct parsed_proto *pp_tmp;
   struct label_ref *lr;
   int need_to_save_current;
+  int save_args;
   int ret = 0;
-  int j;
+  char buf[32];
+  int j, k;
 
   if (i < 0) {
     ferr(po, "dead label encountered\n");
@@ -2720,6 +2749,7 @@ static int collect_call_args_r(struct parsed_op *po, int i,
 
       pp->arg[arg].datap = &ops[j];
       need_to_save_current = 0;
+      save_args = 0;
       if (!need_op_saving) {
         ret = scan_for_mod(&ops[j], j + 1, i, 1);
         need_to_save_current = (ret >= 0);
@@ -2729,7 +2759,7 @@ static int collect_call_args_r(struct parsed_op *po, int i,
         ops[j].flags &= ~OPF_RMD;
         if (ops[j].argnum == 0) {
           ops[j].argnum = arg + 1;
-          *save_arg_vars |= 1 << arg;
+          save_args |= 1 << arg;
         }
         else if (ops[j].argnum < arg + 1)
           ferr(&ops[j], "argnum conflict (%d<%d) for '%s'\n",
@@ -2746,6 +2776,32 @@ static int collect_call_args_r(struct parsed_op *po, int i,
 
       ops[j].flags &= ~OPF_RSAVE;
 
+      // check for __VALIST
+      if (!pp->is_unresolved && g_func_pp->is_vararg
+        && IS(pp->arg[arg].type.name, "__VALIST"))
+      {
+        snprintf(buf, sizeof(buf), "arg_%X",
+          g_func_pp->argc_stack * 4);
+        k = -1;
+        ret = resolve_origin(j, &ops[j].operand[0], magic + 1, &k);
+        if (ret == 1 && k >= 0 && ops[k].op == OP_LEA
+          && strstr(ops[k].operand[1].name, buf))
+        {
+          ops[k].flags |= OPF_RMD;
+          ops[j].flags |= OPF_RMD | OPF_VAPUSH;
+          save_args &= ~(1 << arg);
+        }
+      }
+
+      *save_arg_vars |= save_args;
+
+      // tracking reg usage
+      if (!(ops[j].flags & OPF_VAPUSH)
+        && ops[j].operand[0].type == OPT_REG)
+      {
+        *regmask |= 1 << ops[j].operand[0].reg;
+      }
+
       arg++;
       if (!pp->is_unresolved) {
         // next arg
@@ -2754,10 +2810,6 @@ static int collect_call_args_r(struct parsed_op *po, int i,
             break;
       }
       magic = (magic & 0xffffff) | (arg << 24);
-
-      // tracking reg usage
-      if (ops[j].operand[0].type == OPT_REG)
-        *regmask |= 1 << ops[j].operand[0].reg;
     }
   }
 
@@ -4537,7 +4589,11 @@ tailcall:
             tmp_op = pp->arg[arg].datap;
             if (tmp_op == NULL)
               ferr(po, "parsed_op missing for arg%d\n", arg);
-            if (tmp_op->argnum != 0) {
+
+            if (tmp_op->flags & OPF_VAPUSH) {
+              fprintf(fout, "ap");
+            }
+            else if (tmp_op->argnum != 0) {
               fprintf(fout, "%ss_a%d", cast, tmp_op->argnum);
             }
             else {

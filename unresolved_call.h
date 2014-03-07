@@ -1,5 +1,7 @@
-#define unresolved_call(n, p) \
-  printf("%s: unresolved_call %p %s\n", n, p, addr_to_sym(p))
+#define unresolved_call(n, p) do {\
+  printf("%s: unresolved_call %p %s\n", n, p, addr_to_sym(p)); \
+  fflush(stdout); \
+} while (0)
 
 /* mingw is missing dbghelp stuff.. */
 static const char *addr_to_sym(void *addr)
