@@ -41,7 +41,8 @@ struct parsed_proto {
 	unsigned int is_noreturn:1;
 	unsigned int is_unresolved:1;
 	unsigned int is_userstack:1;
-	unsigned int is_arg:1;        // decl in func arg
+	unsigned int is_oslib:1;      // OS/system library func
+	unsigned int is_arg:1;        // declared in some func arg
 	unsigned int has_structarg:1;
 	unsigned int has_retreg:1;
 };
@@ -52,7 +53,7 @@ static int hdrfline = 0;
 static void pp_copy_arg(struct parsed_proto_arg *d,
 	const struct parsed_proto_arg *s);
 
-static int b_pp_c_handler(char *proto, const char *fname);
+static int b_pp_c_handler(char *proto, const char *fname, int is_oslib);
 
 static int do_protostrs(FILE *fhdr, const char *fname)
 {
@@ -61,6 +62,7 @@ static int do_protostrs(FILE *fhdr, const char *fname)
 	char protostr[256];
 	char path[256];
 	char fname_inc[256];
+	int is_oslib;
 	FILE *finc;
 	int line = 0;
 	int ret;
@@ -68,6 +70,9 @@ static int do_protostrs(FILE *fhdr, const char *fname)
 
 	hdrfn_saved = hdrfn;
 	hdrfn = fname;
+
+	is_oslib = strstr(fname, "stdc.hlist")
+		 || strstr(fname, "win32.hlist");
 
 	while (fgets(protostr, sizeof(protostr), fhdr))
 	{
@@ -110,7 +115,7 @@ static int do_protostrs(FILE *fhdr, const char *fname)
 
 		hdrfline = line;
 
-		ret = b_pp_c_handler(protostr, hdrfn);
+		ret = b_pp_c_handler(protostr, hdrfn, is_oslib);
 		if (ret < 0)
 			break;
 	}
@@ -653,7 +658,7 @@ static struct parsed_proto *pp_cache;
 static int pp_cache_size;
 static int pp_cache_alloc;
 
-static int b_pp_c_handler(char *proto, const char *fname)
+static int b_pp_c_handler(char *proto, const char *fname, int is_oslib)
 {
 	int ret;
 
@@ -671,6 +676,7 @@ static int b_pp_c_handler(char *proto, const char *fname)
 	if (ret < 0)
 		return -1;
 
+	pp_cache[pp_cache_size].is_oslib = is_oslib;
 	pp_cache_size++;
 	return 0;
 }

@@ -473,7 +473,7 @@ static int guess_lmod_from_c_type(enum opr_lenmod *lmod,
   static const char *dword_types[] = {
     "int", "_DWORD", "UINT_PTR", "DWORD",
     "WPARAM", "LPARAM", "UINT", "__int32",
-    "LONG", "HIMC",
+    "LONG", "HIMC", "BOOL",
   };
   static const char *word_types[] = {
     "uint16_t", "int16_t", "_WORD", "WORD",
@@ -1561,7 +1561,9 @@ static void stack_frame_access(struct parsed_op *po,
 static void check_func_pp(struct parsed_op *po,
   const struct parsed_proto *pp, const char *pfx)
 {
+  enum opr_lenmod tmp_lmod;
   char buf[256];
+  int ret, i;
 
   if (pp->argc_reg != 0) {
     if (/*!g_allow_regfunc &&*/ !pp->is_fastcall) {
@@ -1571,6 +1573,18 @@ static void check_func_pp(struct parsed_op *po,
     if (pp->argc_stack > 0 && pp->argc_reg != 2)
       ferr(po, "%s: %d reg arg(s) with %d stack arg(s)\n",
         pfx, pp->argc_reg, pp->argc_stack);
+  }
+
+  // fptrs must use 32bit args, callsite might have no information and
+  // lack a cast to smaller types, which results in incorrectly masked
+  // args passed (callee may assume masked args, it does on ARM)
+  if (!pp->is_oslib) {
+    for (i = 0; i < pp->argc; i++) {
+      ret = guess_lmod_from_c_type(&tmp_lmod, &pp->arg[i].type);
+      if (ret && tmp_lmod != OPLM_DWORD)
+        ferr(po, "reference to %s with arg%d '%s'\n", pp->name,
+          i + 1, pp->arg[i].type.name);
+    }
   }
 }
 

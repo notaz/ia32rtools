@@ -247,7 +247,8 @@ static const struct parsed_proto *check_var(FILE *fhdr,
   const char *sym, const char *varname)
 {
   const struct parsed_proto *pp, *pp_sym;
-  char fp_sym[256], fp_var[256];
+  char fp_sym[256], fp_var[256], *p;
+  int i;
 
   pp = proto_parse(fhdr, varname, 1);
   if (pp == NULL) {
@@ -277,6 +278,20 @@ static const struct parsed_proto *check_var(FILE *fhdr,
   }
 
 check_sym:
+  // fptrs must use 32bit args, callsite might have no information and
+  // lack a cast to smaller types, which results in incorrectly masked
+  // args passed (callee may assume masked args, it does on ARM)
+  for (i = 0; i < pp->argc; i++) {
+    if (pp->arg[i].type.is_ptr)
+      continue;
+    p = pp->arg[i].type.name;
+    if (strstr(p, "int8") || strstr(p, "int16")
+      || strstr(p, "char") || strstr(p, "short"))
+    {
+      awarn("reference to %s with arg%d '%s'\n", pp->name, i + 1, p);
+    }
+  }
+
   sprint_pp_short(pp, g_comment, sizeof(g_comment));
 
   if (sym != NULL) {
