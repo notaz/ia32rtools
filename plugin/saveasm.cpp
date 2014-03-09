@@ -1,3 +1,11 @@
+/*
+ * ia32rtools
+ * (C) notaz, 2013,2014
+ *
+ * This work is licensed under the terms of 3-clause BSD license.
+ * See COPYING file in the top-level directory.
+ */
+
 #define NO_OBSOLETE_FUNCS
 #include <ida.hpp>
 #include <idp.hpp>
@@ -8,6 +16,7 @@
 #include <name.hpp>
 #include <frame.hpp>
 #include <struct.hpp>
+#include <offset.hpp>
 #include <auto.hpp>
 #include <intel.hpp>
 
@@ -248,8 +257,8 @@ static void idaapi run(int /*arg*/)
           }
         }
       }
-      // detect code alignment
       else if (cmd.itype == NN_lea) {
+        // detect code alignment
         if (cmd.Operands[0].reg == cmd.Operands[1].reg
           && cmd.Operands[1].type == o_displ
           && cmd.Operands[1].addr == 0)
@@ -262,6 +271,24 @@ static void idaapi run(int /*arg*/)
             msg("%x: align %d\n", ea, 1 << n);
             do_unknown(ea, DOUNK_SIMPLE);
             doAlign(ea, tmp_ea - ea, n);
+          }
+        }
+        else if (!isDefArg1(ea_flags)
+          && cmd.Operands[1].type == o_mem // why o_mem?
+          && cmd.Operands[1].dtyp == dt_dword)
+        {
+          if (inf.minEA <= cmd.Operands[1].addr
+            && cmd.Operands[1].addr < inf.maxEA)
+          {
+            // lea to segments, like ds:58D6A8h[edx*8]
+            msg("%x: lea offset to %x\n", ea, cmd.Operands[1].addr);
+            op_offset(ea, 1, REF_OFF32);
+          }
+          else
+          {
+            // ds:0[eax*8] -> [eax*8+0]
+            msg("%x: dropping ds: for %x\n", ea, cmd.Operands[1].addr);
+            op_hex(ea, 1);
           }
         }
       }

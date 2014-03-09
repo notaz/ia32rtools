@@ -1,4 +1,4 @@
-CROSS_COMPILE ?= i586-mingw32msvc-
+CROSS_COMPILE = i586-mingw32msvc-
 CC = $(CROSS_COMPILE)gcc
 CXX = $(CROSS_COMPILE)g++
 IDASDK = $(wildcard idasdk*)
