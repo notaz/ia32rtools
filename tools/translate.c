@@ -1496,7 +1496,8 @@ static int stack_frame_access(struct parsed_op *po,
     // common problem
     guess_lmod_from_c_type(&tmp_lmod, &g_func_pp->arg[i].type);
     if (tmp_lmod != OPLM_DWORD
-      && (unaligned || (!is_src && tmp_lmod < popr->lmod)))
+      && (unaligned || (!is_src && lmod_bytes(po, tmp_lmod)
+                         < lmod_bytes(po, popr->lmod) + (offset & 3))))
     {
       ferr(po, "bp_arg arg%d/w offset %d and type '%s' is too small\n",
         i + 1, offset, g_func_pp->arg[i].type.name);
