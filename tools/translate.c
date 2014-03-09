@@ -150,11 +150,12 @@ struct parsed_op {
   unsigned char pfo;
   unsigned char pfo_inv;
   unsigned char operand_cnt;
-  unsigned char pad;
+  unsigned char p_argnum; // push: altered before call arg #
+  unsigned char p_argpass;// push: arg of host func
+  unsigned char pad[3];
   int regmask_src;        // all referensed regs
   int regmask_dst;
   int pfomask;            // flagop: parsed_flag_op that can't be delayed
-  int argnum;             // push: altered before call arg #
   int cc_scratch;         // scratch storage during analysis
   int bt_i;               // branch target for branches
   struct parsed_data *btj;// branch targets for jumptables
@@ -1370,7 +1371,7 @@ static void parse_stack_access(struct parsed_op *po,
     *bp_arg_out = bp_arg;
 }
 
-static void stack_frame_access(struct parsed_op *po,
+static int stack_frame_access(struct parsed_op *po,
   struct parsed_opr *popr, char *buf, size_t buf_size,
   const char *name, const char *cast, int is_src, int is_lea)
 {
@@ -1382,6 +1383,7 @@ static void stack_frame_access(struct parsed_op *po,
   int unaligned = 0;
   int stack_ra = 0;
   int offset = 0;
+  int retval = -1;
   int sf_ofs;
   int lim;
 
@@ -1403,7 +1405,7 @@ static void stack_frame_access(struct parsed_op *po,
         if (cast[0] == 0)
           cast = "(u32)";
         snprintf(buf, buf_size, "%sap", cast);
-        return;
+        return -1;
       }
       ferr(po, "offset %d (%s,%d) doesn't map to any arg\n",
         offset, bp_arg, arg_i);
@@ -1422,6 +1424,7 @@ static void stack_frame_access(struct parsed_op *po,
       ferr(po, "arg %d not in prototype?\n", arg_i);
 
     popr->is_ptr = g_func_pp->arg[i].type.is_ptr;
+    retval = i;
 
     switch (popr->lmod)
     {
@@ -1556,6 +1559,8 @@ static void stack_frame_access(struct parsed_op *po,
       ferr(po, "bp_stack bad lmod: %d\n", popr->lmod);
     }
   }
+
+  return retval;
 }
 
 static void check_func_pp(struct parsed_op *po,
@@ -2011,7 +2016,7 @@ static int scan_for_pop(int i, int opcnt, const char *reg,
     }
 
     if ((po->flags & OPF_RMD)
-        || (po->op == OP_PUSH && po->argnum != 0)) // arg push
+        || (po->op == OP_PUSH && po->p_argnum != 0)) // arg push
       continue;
 
     if ((po->flags & OPF_JMP) && po->op != OP_CALL) {
@@ -2669,6 +2674,7 @@ static int collect_call_args_r(struct parsed_op *po, int i,
   int need_to_save_current;
   int save_args;
   int ret = 0;
+  int reg;
   char buf[32];
   int j, k;
 
@@ -2764,6 +2770,10 @@ static int collect_call_args_r(struct parsed_op *po, int i,
       pp->arg[arg].datap = &ops[j];
       need_to_save_current = 0;
       save_args = 0;
+      reg = -1;
+      if (ops[j].operand[0].type == OPT_REG)
+        reg = ops[j].operand[0].reg;
+
       if (!need_op_saving) {
         ret = scan_for_mod(&ops[j], j + 1, i, 1);
         need_to_save_current = (ret >= 0);
@@ -2771,15 +2781,15 @@ static int collect_call_args_r(struct parsed_op *po, int i,
       if (need_op_saving || need_to_save_current) {
         // mark this push as one that needs operand saving
         ops[j].flags &= ~OPF_RMD;
-        if (ops[j].argnum == 0) {
-          ops[j].argnum = arg + 1;
+        if (ops[j].p_argnum == 0) {
+          ops[j].p_argnum = arg + 1;
           save_args |= 1 << arg;
         }
-        else if (ops[j].argnum < arg + 1)
-          ferr(&ops[j], "argnum conflict (%d<%d) for '%s'\n",
-            ops[j].argnum, arg + 1, pp->name);
+        else if (ops[j].p_argnum < arg + 1)
+          ferr(&ops[j], "p_argnum conflict (%d<%d) for '%s'\n",
+            ops[j].p_argnum, arg + 1, pp->name);
       }
-      else if (ops[j].argnum == 0)
+      else if (ops[j].p_argnum == 0)
         ops[j].flags |= OPF_RMD;
 
       // some PUSHes are reused by different calls on other branches,
@@ -2791,30 +2801,47 @@ static int collect_call_args_r(struct parsed_op *po, int i,
       ops[j].flags &= ~OPF_RSAVE;
 
       // check for __VALIST
-      if (!pp->is_unresolved && g_func_pp->is_vararg
-        && IS(pp->arg[arg].type.name, "__VALIST"))
-      {
-        snprintf(buf, sizeof(buf), "arg_%X",
-          g_func_pp->argc_stack * 4);
+      if (!pp->is_unresolved && pp->arg[arg].type.is_va_list) {
         k = -1;
         ret = resolve_origin(j, &ops[j].operand[0], magic + 1, &k);
-        if (ret == 1 && k >= 0 && ops[k].op == OP_LEA
-          && strstr(ops[k].operand[1].name, buf))
+        if (ret == 1 && k >= 0)
         {
-          ops[k].flags |= OPF_RMD;
-          ops[j].flags |= OPF_RMD | OPF_VAPUSH;
-          save_args &= ~(1 << arg);
+          if (ops[k].op == OP_LEA) {
+            snprintf(buf, sizeof(buf), "arg_%X",
+              g_func_pp->argc_stack * 4);
+            if (!g_func_pp->is_vararg
+              || strstr(ops[k].operand[1].name, buf))
+            {
+              ops[k].flags |= OPF_RMD;
+              ops[j].flags |= OPF_RMD | OPF_VAPUSH;
+              save_args &= ~(1 << arg);
+              reg = -1;
+            }
+            else
+              ferr(&ops[j], "lea va_list used, but no vararg?\n");
+          }
+          // check for va_list from g_func_pp arg too
+          else if (ops[k].op == OP_MOV
+            && is_stack_access(&ops[k], &ops[k].operand[1]))
+          {
+            ret = stack_frame_access(&ops[k], &ops[k].operand[1],
+              buf, sizeof(buf), ops[k].operand[1].name, "", 1, 0);
+            if (ret >= 0) {
+              ops[k].flags |= OPF_RMD;
+              ops[j].flags |= OPF_RMD;
+              ops[j].p_argpass = ret + 1;
+              save_args &= ~(1 << arg);
+              reg = -1;
+            }
+          }
         }
       }
 
       *save_arg_vars |= save_args;
 
       // tracking reg usage
-      if (!(ops[j].flags & OPF_VAPUSH)
-        && ops[j].operand[0].type == OPT_REG)
-      {
-        *regmask |= 1 << ops[j].operand[0].reg;
-      }
+      if (reg >= 0)
+        *regmask |= 1 << reg;
 
       arg++;
       if (!pp->is_unresolved) {
@@ -3363,7 +3390,7 @@ tailcall:
         regmask_save |= 1 << reg;
     }
 
-    if (po->op == OP_PUSH && po->argnum == 0
+    if (po->op == OP_PUSH && po->p_argnum == 0
       && !(po->flags & OPF_RSAVE) && !g_func_pp->is_userstack)
     {
       if (po->operand[0].type == OPT_REG)
@@ -3519,7 +3546,7 @@ tailcall:
           tmp_op = pp->arg[arg].datap;
           if (tmp_op == NULL)
             ferr(po, "parsed_op missing for arg%d\n", arg);
-          if (tmp_op->argnum == 0 && tmp_op->operand[0].type == OPT_REG)
+          if (tmp_op->p_argnum == 0 && tmp_op->operand[0].type == OPT_REG)
             regmask_stack |= 1 << tmp_op->operand[0].reg;
         }
 
@@ -4607,8 +4634,11 @@ tailcall:
             if (tmp_op->flags & OPF_VAPUSH) {
               fprintf(fout, "ap");
             }
-            else if (tmp_op->argnum != 0) {
-              fprintf(fout, "%ss_a%d", cast, tmp_op->argnum);
+            else if (tmp_op->p_argpass != 0) {
+              fprintf(fout, "a%d", tmp_op->p_argpass);
+            }
+            else if (tmp_op->p_argnum != 0) {
+              fprintf(fout, "%ss_a%d", cast, tmp_op->p_argnum);
             }
             else {
               fprintf(fout, "%s",
@@ -4696,9 +4726,9 @@ tailcall:
 
       case OP_PUSH:
         out_src_opr_u32(buf1, sizeof(buf1), po, &po->operand[0]);
-        if (po->argnum != 0) {
+        if (po->p_argnum != 0) {
           // special case - saved func arg
-          fprintf(fout, "  s_a%d = %s;", po->argnum, buf1);
+          fprintf(fout, "  s_a%d = %s;", po->p_argnum, buf1);
           break;
         }
         else if (po->flags & OPF_RSAVE) {

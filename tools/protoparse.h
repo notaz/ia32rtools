@@ -13,7 +13,8 @@ struct parsed_type {
 	unsigned int is_array:1;
 	unsigned int is_ptr:1;
 	unsigned int is_struct:1; // split for args
-	unsigned int is_retreg:1; // register to return
+	unsigned int is_retreg:1; // register to return to caller
+	unsigned int is_va_list:1;
 };
 
 struct parsed_proto_arg {
@@ -292,6 +293,8 @@ static int check_type(const char *name, struct parsed_type *type)
 
 	ret = n1 - name;
 	type->name = strndup(name, ret);
+	if (IS(type->name, "__VALIST") || IS(type->name, "va_list"))
+		type->is_va_list = 1;
 	if (IS(type->name, "VOID"))
 		memcpy(type->name, "void", 4);
 
