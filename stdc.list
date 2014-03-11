@@ -83,8 +83,21 @@ __isatty
 _xtoa
 __itoa
 __close
+_sscanf
+_ftell
+_fflush
+_mbtowc
+_ungetc
+__strcmpi
+__splitpath
 
-# not from mingw
-_memcpy_0
+# float
+__control87
+__controlfp
+
 # math
 # __ftol2 - todo
+_ceil
+
+# not in mingw
+_memcpy_0
