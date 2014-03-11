@@ -373,7 +373,8 @@ static int is_reg_in_str(const char *s)
   return 0;
 }
 
-static const char *parse_stack_el(const char *name, char *extra_reg)
+static const char *parse_stack_el(const char *name, char *extra_reg,
+  int early_try)
 {
   const char *p, *p2, *s;
   char *endp = NULL;
@@ -381,31 +382,34 @@ static const char *parse_stack_el(const char *name, char *extra_reg)
   long val;
   int len;
 
-  p = name;
-  if (IS_START(p + 3, "+ebp+") && is_reg_in_str(p)) {
-    p += 4;
-    if (extra_reg != NULL) {
-      strncpy(extra_reg, name, 3);
-      extra_reg[4] = 0;
-    }
-  }
-
-  if (IS_START(p, "ebp+")) {
-    p += 4;
-
-    p2 = strchr(p, '+');
-    if (p2 != NULL && is_reg_in_str(p)) {
+  if (g_bp_frame || early_try)
+  {
+    p = name;
+    if (IS_START(p + 3, "+ebp+") && is_reg_in_str(p)) {
+      p += 4;
       if (extra_reg != NULL) {
-        strncpy(extra_reg, p, p2 - p);
-        extra_reg[p2 - p] = 0;
+        strncpy(extra_reg, name, 3);
+        extra_reg[4] = 0;
       }
-      p = p2 + 1;
     }
 
-    if (!('0' <= *p && *p <= '9'))
-      return p;
+    if (IS_START(p, "ebp+")) {
+      p += 4;
 
-    return NULL;
+      p2 = strchr(p, '+');
+      if (p2 != NULL && is_reg_in_str(p)) {
+        if (extra_reg != NULL) {
+          strncpy(extra_reg, p, p2 - p);
+          extra_reg[p2 - p] = 0;
+        }
+        p = p2 + 1;
+      }
+
+      if (!('0' <= *p && *p <= '9'))
+        return p;
+
+      return NULL;
+    }
   }
 
   if (!IS_START(name, "esp+"))
@@ -474,7 +478,7 @@ static int guess_lmod_from_c_type(enum opr_lenmod *lmod,
   static const char *dword_types[] = {
     "int", "_DWORD", "UINT_PTR", "DWORD",
     "WPARAM", "LPARAM", "UINT", "__int32",
-    "LONG", "HIMC", "BOOL",
+    "LONG", "HIMC", "BOOL", "size_t",
   };
   static const char *word_types[] = {
     "uint16_t", "int16_t", "_WORD", "WORD",
@@ -669,10 +673,11 @@ static int parse_operand(struct parsed_opr *opr,
       aerr("[] parse failure\n");
 
     parse_indmode(opr->name, regmask_indirect, 1);
-    if (opr->lmod == OPLM_UNSPEC && parse_stack_el(opr->name, NULL)) {
+    if (opr->lmod == OPLM_UNSPEC && parse_stack_el(opr->name, NULL, 1))
+    {
       // might be an equ
       struct parsed_equ *eq =
-        equ_find(NULL, parse_stack_el(opr->name, NULL), &i);
+        equ_find(NULL, parse_stack_el(opr->name, NULL, 1), &i);
       if (eq)
         opr->lmod = eq->lmod;
     }
@@ -1316,7 +1321,7 @@ static struct parsed_equ *equ_find(struct parsed_op *po, const char *name,
 static int is_stack_access(struct parsed_op *po,
   const struct parsed_opr *popr)
 {
-  return (parse_stack_el(popr->name, NULL)
+  return (parse_stack_el(popr->name, NULL, 0)
     || (g_bp_frame && !(po->flags & OPF_EBP_S)
         && IS_START(popr->name, "ebp")));
 }
@@ -1347,7 +1352,7 @@ static void parse_stack_access(struct parsed_op *po,
       ferr(po, "ebp- parse of '%s' failed\n", name);
   }
   else {
-    bp_arg = parse_stack_el(name, ofs_reg);
+    bp_arg = parse_stack_el(name, ofs_reg, 0);
     snprintf(g_comment, sizeof(g_comment), "%s", bp_arg);
     eq = equ_find(po, bp_arg, &offset);
     if (eq == NULL)
@@ -3096,22 +3101,33 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
     } while (i < opcnt);
   }
   else {
-    for (i = 0; i < opcnt; i++) {
+    int ecx_push = 0, esp_sub = 0;
+
+    i = 0;
+    while (ops[i].op == OP_PUSH && IS(opr_name(&ops[i], 0), "ecx")) {
+      ops[i].flags |= OPF_RMD;
+      g_stack_fsz += 4;
+      ecx_push++;
+      i++;
+    }
+
+    for (; i < opcnt; i++) {
       if (ops[i].op == OP_PUSH || (ops[i].flags & (OPF_JMP|OPF_TAIL)))
         break;
       if (ops[i].op == OP_SUB && ops[i].operand[0].reg == xSP
         && ops[i].operand[1].type == OPT_CONST)
       {
-        g_sp_frame = 1;
+        g_stack_fsz = ops[i].operand[1].val;
+        ops[i].flags |= OPF_RMD;
+        esp_sub = 1;
         break;
       }
     }
 
     found = 0;
-    if (g_sp_frame)
+    if (ecx_push || esp_sub)
     {
-      g_stack_fsz = ops[i].operand[1].val;
-      ops[i].flags |= OPF_RMD;
+      g_sp_frame = 1;
 
       i++;
       do {
@@ -3125,14 +3141,31 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
           j--;
         }
 
-        if (ops[j].op != OP_ADD
-            || !IS(opr_name(&ops[j], 0), "esp")
-            || ops[j].operand[1].type != OPT_CONST
-            || ops[j].operand[1].val != g_stack_fsz)
-          ferr(&ops[j], "'add esp' expected\n");
-        ops[j].flags |= OPF_RMD;
+        if (ecx_push > 0) {
+          for (l = 0; l < ecx_push; l++) {
+            if (ops[j].op != OP_POP
+              || !IS(opr_name(&ops[j], 0), "ecx"))
+            {
+              ferr(&ops[j], "'pop ecx' expected\n");
+            }
+            ops[j].flags |= OPF_RMD;
+            j--;
+          }
 
-        found = 1;
+          found = 1;
+        }
+
+        if (esp_sub) {
+          if (ops[j].op != OP_ADD
+              || !IS(opr_name(&ops[j], 0), "esp")
+              || ops[j].operand[1].type != OPT_CONST
+              || ops[j].operand[1].val != g_stack_fsz)
+            ferr(&ops[j], "'add esp' expected\n");
+          ops[j].flags |= OPF_RMD;
+
+          found = 1;
+        }
+
         i++;
       } while (i < opcnt);
     }
