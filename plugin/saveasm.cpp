@@ -439,7 +439,7 @@ static void idaapi run(int /*arg*/)
   for (;;)
   {
     int drop_large = 0, do_rva = 0, set_scale = 0, jmp_near = 0;
-    int word_imm = 0, dword_imm = 0, do_pushf = 0;
+    int word_imm = 0, dword_imm = 0, do_pushf = 0, do_nops = 0;
 
     if ((ea >> 14) != ui_ea_block) {
       ui_ea_block = ea >> 14;
@@ -496,6 +496,12 @@ static void idaapi run(int /*arg*/)
         {
           if (get_word(ea + opr.offb) == (ushort)opr.value)
             word_imm = 1;
+        }
+        else if (opr.type == o_displ && opr.addr == 0
+          && opr.offb != 0 && opr.hasSIB && opr.sib == 0x24)
+        {
+          // uses [esp+0] with 0 encoded into op
+          do_nops++;
         }
       }
     }
@@ -592,6 +598,9 @@ pass:
       fout_line++;
       qfprintf(fout, "%s\n", buf);
     }
+
+    while (do_nops-- > 0)
+      qfprintf(fout, "                nop ; adj\n");
 
     // note: next_head skips some undefined stuff
     ea = next_not_tail(ea); // correct?
