@@ -275,6 +275,22 @@ static void printf_number(char *buf, size_t buf_size,
   snprintf(buf, buf_size, number < 10 ? "%lu" : "0x%02lx", number);
 }
 
+static int check_segment_prefix(const char *s)
+{
+  if (s[0] == 0 || s[1] != 's' || s[2] != ':')
+    return 0;
+
+  switch (s[0]) {
+  case 'c': return 1;
+  case 'd': return 2;
+  case 's': return 3;
+  case 'e': return 4;
+  case 'f': return 5;
+  case 'g': return 6;
+  default:  return 0;
+  }
+}
+
 static int parse_reg(enum opr_lenmod *reg_lmod, const char *s)
 {
   int reg;
@@ -326,8 +342,8 @@ static int parse_indmode(char *name, int *regmask, int need_c_cvt)
       s++;
     *d = 0;
 
-    // skip 'ds:' prefix
-    if (IS_START(s, "ds:"))
+    // skip '?s:' prefixes
+    if (check_segment_prefix(s))
       s += 3;
 
     s = next_idt(w, sizeof(w), s);
@@ -614,7 +630,10 @@ static int parse_operand(struct parsed_opr *opr,
 
     if (label != NULL) {
       opr->type = OPT_LABEL;
-      if (IS_START(label, "ds:")) {
+      ret = check_segment_prefix(label);
+      if (ret != 0) {
+        if (ret >= 5)
+          aerr("fs/gs used\n");
         opr->had_ds = 1;
         label += 3;
       }
@@ -660,7 +679,10 @@ static int parse_operand(struct parsed_opr *opr,
   if (wordc_in != 1)
     aerr("parse_operand 1 word expected\n");
 
-  if (IS_START(words[w], "ds:")) {
+  ret = check_segment_prefix(words[w]);
+  if (ret != 0) {
+    if (ret >= 5)
+      aerr("fs/gs used\n");
     opr->had_ds = 1;
     memmove(words[w], words[w] + 3, strlen(words[w]) - 2);
   }
@@ -2748,12 +2770,16 @@ static int collect_call_args_r(struct parsed_op *po, int i,
         ferr(po, "arg collect %d/%d hit '%s' with %d stack args\n",
           arg, pp->argc, opr_name(&ops[j], 0), pp_tmp->argc_stack);
     }
-    else if (ops[j].op == OP_ADD && ops[j].operand[0].reg == xSP) {
+    // esp adjust of 0 means we collected it before
+    else if (ops[j].op == OP_ADD && ops[j].operand[0].reg == xSP
+      && (ops[j].operand[1].type != OPT_CONST
+          || ops[j].operand[1].val != 0))
+    {
       if (pp->is_unresolved)
         break;
 
-      ferr(po, "arg collect %d/%d hit esp adjust\n",
-        arg, pp->argc);
+      ferr(po, "arg collect %d/%d hit esp adjust of %d\n",
+        arg, pp->argc, ops[j].operand[1].val);
     }
     else if (ops[j].op == OP_POP) {
       if (pp->is_unresolved)
@@ -2791,9 +2817,12 @@ static int collect_call_args_r(struct parsed_op *po, int i,
           ops[j].p_argnum = arg + 1;
           save_args |= 1 << arg;
         }
-        else if (ops[j].p_argnum < arg + 1)
-          ferr(&ops[j], "p_argnum conflict (%d<%d) for '%s'\n",
-            ops[j].p_argnum, arg + 1, pp->name);
+        else if (ops[j].p_argnum < arg + 1) {
+          // XXX: might kill valid var..
+          //*save_arg_vars &= ~(1 << (ops[j].p_argnum - 1));
+          ops[j].p_argnum = arg + 1;
+          save_args |= 1 << arg;
+        }
       }
       else if (ops[j].p_argnum == 0)
         ops[j].flags |= OPF_RMD;
