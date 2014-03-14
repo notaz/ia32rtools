@@ -86,6 +86,7 @@ enum op_op {
 	OP_SHL,
 	OP_SHR,
 	OP_SAR,
+	OP_SHRD,
 	OP_ROL,
 	OP_ROR,
 	OP_RCL,
@@ -828,6 +829,7 @@ static const struct {
   { "shr",  OP_SHR,    2, 2, OPF_DATA|OPF_FLAGS },
   { "sal",  OP_SHL,    2, 2, OPF_DATA|OPF_FLAGS },
   { "sar",  OP_SAR,    2, 2, OPF_DATA|OPF_FLAGS },
+  { "shrd", OP_SHRD,   3, 3, OPF_DATA|OPF_FLAGS },
   { "rol",  OP_ROL,    2, 2, OPF_DATA|OPF_FLAGS },
   { "ror",  OP_ROR,    2, 2, OPF_DATA|OPF_FLAGS },
   { "rcl",  OP_RCL,    2, 2, OPF_DATA|OPF_FLAGS|OPF_CC, PFO_C },
@@ -1063,6 +1065,11 @@ static void parse_op(struct parsed_op *op, char words[16][256], int wordc)
   case OP_ROR:
     if (op->operand[1].lmod == OPLM_UNSPEC)
       op->operand[1].lmod = OPLM_BYTE;
+    break;
+
+  case OP_SHRD:
+    if (op->operand[2].lmod == OPLM_UNSPEC)
+      op->operand[2].lmod = OPLM_BYTE;
     break;
 
   case OP_PUSH:
@@ -4298,6 +4305,21 @@ tailcall:
         delayed_flag_op = NULL;
         break;
 
+      case OP_SHRD:
+        assert_operand_cnt(3);
+        propagate_lmod(po, &po->operand[0], &po->operand[1]);
+        l = lmod_bytes(po, po->operand[0].lmod) * 8;
+        out_dst_opr(buf1, sizeof(buf1), po, &po->operand[0]);
+        out_src_opr_u32(buf2, sizeof(buf2), po, &po->operand[1]);
+        out_src_opr_u32(buf3, sizeof(buf3), po, &po->operand[2]);
+        fprintf(fout, "  %s >>= %s; %s |= %s << (%d - %s);",
+          buf1, buf3, buf1, buf2, l, buf3);
+        strcpy(g_comment, "shrd");
+        output_std_flags(fout, po, &pfomask, buf1);
+        last_arith_dst = &po->operand[0];
+        delayed_flag_op = NULL;
+        break;
+
       case OP_ROL:
       case OP_ROR:
         assert_operand_cnt(2);
@@ -4402,11 +4424,18 @@ tailcall:
       case OP_SUB:
         assert_operand_cnt(2);
         propagate_lmod(po, &po->operand[0], &po->operand[1]);
-        if (pfomask & (1 << PFO_C)) {
-          fprintf(fout, "  cond_c = %s < %s;\n",
-            out_src_opr_u32(buf1, sizeof(buf1), po, &po->operand[0]),
-            out_src_opr_u32(buf2, sizeof(buf2), po, &po->operand[1]));
-          pfomask &= ~(1 << PFO_C);
+        if (pfomask & ~((1 << PFO_Z) | (1 << PFO_S))) {
+          for (j = 0; j <= PFO_LE; j++) {
+            if (!(pfomask & (1 << j)))
+              continue;
+            if (j == PFO_Z || j == PFO_S)
+              continue;
+
+            out_cmp_for_cc(buf1, sizeof(buf1), po, j, 0);
+            fprintf(fout, "  cond_%s = %s;\n",
+              parsed_flag_op_names[j], buf1);
+            pfomask &= ~(1 << j);
+          }
         }
         goto dualop_arith;
 
