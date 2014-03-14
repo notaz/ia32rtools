@@ -248,7 +248,10 @@ static void idaapi run(int /*arg*/)
           if (cmd.Operands[o].type == o_mem) {
             tmp_ea = cmd.Operands[o].addr;
             flags_t tmp_ea_flags = get_flags_novalue(tmp_ea);
-            if (!isUnknown(tmp_ea_flags)) {
+            // ..but base float is ok..
+            int is_flt = isDwrd(tmp_ea_flags) || isFloat(tmp_ea_flags);
+            if (!is_flt && !isUnknown(tmp_ea_flags))
+            {
               buf[0] = 0;
               get_name(ea, tmp_ea, buf, sizeof(buf));
               msg("%x: undefining %x '%s'\n", ea, tmp_ea, buf);

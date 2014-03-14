@@ -495,6 +495,7 @@ static int guess_lmod_from_c_type(enum opr_lenmod *lmod,
     "int", "_DWORD", "UINT_PTR", "DWORD",
     "WPARAM", "LPARAM", "UINT", "__int32",
     "LONG", "HIMC", "BOOL", "size_t",
+    "float",
   };
   static const char *word_types[] = {
     "uint16_t", "int16_t", "_WORD", "WORD",
