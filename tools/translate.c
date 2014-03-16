@@ -108,6 +108,9 @@ enum op_op {
 	OP_JECXZ,
 	OP_JCC,
 	OP_SCC,
+	// x87
+	// mmx
+	OP_EMMS,
 };
 
 enum opr_type {
@@ -125,6 +128,7 @@ enum opr_lenmod {
 	OPLM_BYTE,
 	OPLM_WORD,
 	OPLM_DWORD,
+	OPLM_QWORD,
 };
 
 #define MAX_OPERANDS 3
@@ -233,9 +237,11 @@ static int g_allow_regfunc;
   printf("%s:%d: note: [%s] '%s': " fmt, asmfn, (op_)->asmln, g_func, \
     dump_op(op_), ##__VA_ARGS__)
 
-#define MAX_REGS 8
-
-const char *regs_r32[] = { "eax", "ebx", "ecx", "edx", "esi", "edi", "ebp", "esp" };
+const char *regs_r32[] = {
+  "eax", "ebx", "ecx", "edx", "esi", "edi", "ebp", "esp",
+  // not r32, but list here for easy parsing and printing
+  "mm0", "mm1", "mm2", "mm3", "mm4", "mm5", "mm6", "mm7",
+};
 const char *regs_r16[] = { "ax", "bx", "cx", "dx", "si", "di", "bp", "sp" };
 const char *regs_r8l[] = { "al", "bl", "cl", "dl" };
 const char *regs_r8h[] = { "ah", "bh", "ch", "dh" };
@@ -253,6 +259,11 @@ enum parsed_flag_op {
   PFO_L,  // c SF!=OF
   PFO_LE, // e ZF=1||SF!=OF
 };
+
+#define PFOB_O   (1 << PFO_O)
+#define PFOB_C   (1 << PFO_C)
+#define PFOB_Z   (1 << PFO_Z)
+#define PFOB_S   (1 << PFO_S)
 
 static const char *parsed_flag_op_names[] = {
   "o", "c", "z", "be", "s", "p", "l", "le"
@@ -297,6 +308,10 @@ static int parse_reg(enum opr_lenmod *reg_lmod, const char *s)
   int reg;
 
   reg = char_array_i(regs_r32, ARRAY_SIZE(regs_r32), s);
+  if (reg >= 8) {
+    *reg_lmod = OPLM_QWORD;
+    return reg;
+  }
   if (reg >= 0) {
     *reg_lmod = OPLM_DWORD;
     return reg;
@@ -486,6 +501,10 @@ static int guess_lmod_from_name(struct parsed_opr *opr)
     opr->lmod = OPLM_BYTE;
     return 1;
   }
+  if (!strncmp(opr->name, "qword_", 6)) {
+    opr->lmod = OPLM_QWORD;
+    return 1;
+  }
   return 0;
 }
 
@@ -652,6 +671,8 @@ static int parse_operand(struct parsed_opr *opr,
         opr->lmod = OPLM_WORD;
       else if (IS(words[w], "byte"))
         opr->lmod = OPLM_BYTE;
+      else if (IS(words[w], "qword"))
+        opr->lmod = OPLM_QWORD;
       else
         aerr("type parsing failed\n");
       w += 2;
@@ -908,6 +929,10 @@ static const struct {
   { "setng",  OP_SCC,  1, 1, OPF_DATA|OPF_CC, PFO_LE, 0 },
   { "setg",   OP_SCC,  1, 1, OPF_DATA|OPF_CC, PFO_LE, 1 },
   { "setnle", OP_SCC,  1, 1, OPF_DATA|OPF_CC, PFO_LE, 1 },
+  // x87
+  // mmx
+  { "emms",   OP_EMMS, 0, 0, OPF_DATA },
+  { "movq",   OP_MOV,  2, 2, OPF_DATA },
 };
 
 static void parse_op(struct parsed_op *op, char words[16][256], int wordc)
@@ -1163,6 +1188,8 @@ static const char *lmod_type_u(struct parsed_op *po,
   enum opr_lenmod lmod)
 {
   switch (lmod) {
+  case OPLM_QWORD:
+    return "u64";
   case OPLM_DWORD:
     return "u32";
   case OPLM_WORD:
@@ -1179,6 +1206,8 @@ static const char *lmod_cast_u(struct parsed_op *po,
   enum opr_lenmod lmod)
 {
   switch (lmod) {
+  case OPLM_QWORD:
+    return "";
   case OPLM_DWORD:
     return "";
   case OPLM_WORD:
@@ -1195,6 +1224,8 @@ static const char *lmod_cast_u_ptr(struct parsed_op *po,
   enum opr_lenmod lmod)
 {
   switch (lmod) {
+  case OPLM_QWORD:
+    return "*(u64 *)";
   case OPLM_DWORD:
     return "*(u32 *)";
   case OPLM_WORD:
@@ -1211,6 +1242,8 @@ static const char *lmod_cast_s(struct parsed_op *po,
   enum opr_lenmod lmod)
 {
   switch (lmod) {
+  case OPLM_QWORD:
+    return "(s64)";
   case OPLM_DWORD:
     return "(s32)";
   case OPLM_WORD:
@@ -1234,6 +1267,8 @@ static const char *lmod_cast(struct parsed_op *po,
 static int lmod_bytes(struct parsed_op *po, enum opr_lenmod lmod)
 {
   switch (lmod) {
+  case OPLM_QWORD:
+    return 8;
   case OPLM_DWORD:
     return 4;
   case OPLM_WORD:
@@ -1264,7 +1299,7 @@ static unsigned int opr_const(struct parsed_op *po, int opr_num)
 
 static const char *opr_reg_p(struct parsed_op *po, struct parsed_opr *popr)
 {
-  if ((unsigned int)popr->reg >= MAX_REGS)
+  if ((unsigned int)popr->reg >= ARRAY_SIZE(regs_r32))
     ferr(po, "invalid reg: %d\n", popr->reg);
   return regs_r32[popr->reg];
 }
@@ -1663,6 +1698,9 @@ static char *out_src_opr(char *buf, size_t buf_size,
       ferr(po, "lea from reg?\n");
 
     switch (popr->lmod) {
+    case OPLM_QWORD:
+      snprintf(buf, buf_size, "%s%s.q", cast, opr_reg_p(po, popr));
+      break;
     case OPLM_DWORD:
       snprintf(buf, buf_size, "%s%s", cast, opr_reg_p(po, popr));
       break;
@@ -1768,6 +1806,9 @@ static char *out_dst_opr(char *buf, size_t buf_size,
   switch (popr->type) {
   case OPT_REG:
     switch (popr->lmod) {
+    case OPLM_QWORD:
+      snprintf(buf, buf_size, "%s.q", opr_reg_p(po, popr));
+      break;
     case OPLM_DWORD:
       snprintf(buf, buf_size, "%s", opr_reg_p(po, popr));
       break;
@@ -1858,7 +1899,7 @@ static void out_cmp_for_cc(char *buf, size_t buf_size,
   char buf1[256], buf2[256];
   enum opr_lenmod lmod;
 
-  if (po->operand[0].lmod != po->operand[1].lmod)
+  if (po->op != OP_DEC && po->operand[0].lmod != po->operand[1].lmod)
     ferr(po, "%s: lmod mismatch: %d %d\n", __func__,
       po->operand[0].lmod, po->operand[1].lmod);
   lmod = po->operand[0].lmod;
@@ -1884,7 +1925,10 @@ static void out_cmp_for_cc(char *buf, size_t buf_size,
   }
 
   out_src_opr(buf1, sizeof(buf1), po, &po->operand[0], cast_use, 0);
-  out_src_opr(buf2, sizeof(buf2), po, &po->operand[1], cast_use, 0);
+  if (po->op == OP_DEC)
+    snprintf(buf2, sizeof(buf2), "1");
+  else
+    out_src_opr(buf2, sizeof(buf2), po, &po->operand[1], cast_use, 0);
 
   switch (pfo) {
   case PFO_C:
@@ -1924,7 +1968,7 @@ static void out_cmp_for_cc(char *buf, size_t buf_size,
       buf1, is_inv ? ">=" : "<", buf2);
     break;
 
-  case PFO_LE:
+  case PFO_LE: // !g
     snprintf(buf, buf_size, "(%s %s %s)",
       buf1, is_inv ? ">" : "<=", buf2);
     break;
@@ -3882,12 +3926,23 @@ tailcall:
 
   regmask_now = regmask & ~regmask_arg;
   regmask_now &= ~(1 << xSP);
-  if (regmask_now) {
+  if (regmask_now & 0x00ff) {
     for (reg = 0; reg < 8; reg++) {
       if (regmask_now & (1 << reg)) {
         fprintf(fout, "  u32 %s", regs_r32[reg]);
         if (regmask_init & (1 << reg))
           fprintf(fout, " = 0");
+        fprintf(fout, ";\n");
+        had_decl = 1;
+      }
+    }
+  }
+  if (regmask_now & 0xff00) {
+    for (reg = 8; reg < 16; reg++) {
+      if (regmask_now & (1 << reg)) {
+        fprintf(fout, "  mmxr %s", regs_r32[reg]);
+        if (regmask_init & (1 << reg))
+          fprintf(fout, " = { 0, }");
         fprintf(fout, ";\n");
         had_decl = 1;
       }
@@ -4473,8 +4528,27 @@ tailcall:
         strcat(g_comment, "bsf");
         break;
 
-      case OP_INC:
       case OP_DEC:
+        if (pfomask & ~(PFOB_S | PFOB_S | PFOB_C)) {
+          for (j = 0; j <= PFO_LE; j++) {
+            if (!(pfomask & (1 << j)))
+              continue;
+            if (j == PFO_Z || j == PFO_S || j == PFO_C)
+              continue;
+
+            out_cmp_for_cc(buf1, sizeof(buf1), po, j, 0);
+            fprintf(fout, "  cond_%s = %s;\n",
+              parsed_flag_op_names[j], buf1);
+            pfomask &= ~(1 << j);
+          }
+        }
+        // fallthrough
+
+      case OP_INC:
+        if (pfomask & (1 << PFO_C))
+          // carry is unaffected by inc/dec.. wtf?
+          ferr(po, "carry propagation needed\n");
+
         out_dst_opr(buf1, sizeof(buf1), po, &po->operand[0]);
         if (po->operand[0].type == OPT_REG) {
           strcpy(buf2, po->op == OP_INC ? "++" : "--");
@@ -4864,6 +4938,11 @@ tailcall:
 
       case OP_NOP:
         no_output = 1;
+        break;
+
+      // mmx
+      case OP_EMMS:
+        strcpy(g_comment, "(emms)");
         break;
 
       default:
@@ -5565,6 +5644,8 @@ do_pending_endp:
         g_eqs[g_eqcnt].lmod = OPLM_WORD;
       else if (IS(words[2], "byte"))
         g_eqs[g_eqcnt].lmod = OPLM_BYTE;
+      else if (IS(words[2], "qword"))
+        g_eqs[g_eqcnt].lmod = OPLM_QWORD;
       else
         aerr("bad lmod: '%s'\n", words[2]);
 

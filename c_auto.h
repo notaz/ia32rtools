@@ -10,6 +10,13 @@
 #define s16 int16_t
 #define s32 int32_t
 #define s64 int64_t
+typedef struct {
+  u64 q;
+  u32 d[2];
+  u16 w[4];
+  u8  b[8];
+} mmxr;
+
 #define bool int
 #define _BYTE BYTE
 #define _WORD WORD
