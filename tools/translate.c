@@ -132,6 +132,7 @@ enum opr_lenmod {
 };
 
 #define MAX_OPERANDS 3
+#define NAMELEN 112
 
 struct parsed_opr {
   enum opr_type type;
@@ -145,7 +146,7 @@ struct parsed_opr {
   const struct parsed_proto *pp; // for OPT_LABEL
   int reg;
   unsigned int val;
-  char name[112];
+  char name[NAMELEN];
 };
 
 struct parsed_op {
@@ -227,6 +228,8 @@ static int g_stack_frame_used;
 static int g_stack_fsz;
 static int g_ida_func_attr;
 static int g_allow_regfunc;
+static int g_quiet_pp;
+
 #define ferr(op_, fmt, ...) do { \
   printf("%s:%d: error: [%s] '%s': " fmt, asmfn, (op_)->asmln, g_func, \
     dump_op(op_), ##__VA_ARGS__); \
@@ -609,7 +612,7 @@ static int parse_operand(struct parsed_opr *opr,
   int *regmask, int *regmask_indirect,
   char words[16][256], int wordc, int w, unsigned int op_flags)
 {
-  const struct parsed_proto *pp;
+  const struct parsed_proto *pp = NULL;
   enum opr_lenmod tmplmod;
   unsigned long number;
   char buf[256];
@@ -756,7 +759,7 @@ static int parse_operand(struct parsed_opr *opr,
 
   // most likely var in data segment
   opr->type = OPT_LABEL;
-  pp = proto_parse(g_fhdr, opr->name, 0);
+  pp = proto_parse(g_fhdr, opr->name, g_quiet_pp);
 
 do_label:
   if (pp != NULL) {
@@ -976,21 +979,19 @@ static void parse_op(struct parsed_op *op, char words[16][256], int wordc)
   op->regmask_src = op->regmask_dst = 0;
   op->asmln = asmln;
 
-  for (opr = 0; opr < op_table[i].minopr; opr++) {
+  for (opr = 0; opr < op_table[i].maxopr; opr++) {
+    if (opr >= op_table[i].minopr && w >= wordc)
+      break;
+
     regmask = regmask_ind = 0;
     w = parse_operand(&op->operand[opr], &regmask, &regmask_ind,
       words, wordc, w, op->flags);
 
     if (opr == 0 && (op->flags & OPF_DATA))
       op->regmask_dst = regmask;
-    // for now, mark dst as src too
-    op->regmask_src |= regmask | regmask_ind;
-  }
-
-  for (; w < wordc && opr < op_table[i].maxopr; opr++) {
-    w = parse_operand(&op->operand[opr],
-      &op->regmask_src, &op->regmask_src,
-      words, wordc, w, op->flags);
+    else
+      op->regmask_src |= regmask;
+    op->regmask_src |= regmask_ind;
   }
 
   if (w < wordc)
@@ -1002,8 +1003,50 @@ static void parse_op(struct parsed_op *op, char words[16][256], int wordc)
   if (!strncmp(op_table[i].name, "set", 3))
     op->operand[0].lmod = OPLM_BYTE;
 
-  // ops with implicit argumets
   switch (op->op) {
+  // first operand is not dst
+  case OP_CMP:
+  case OP_TEST:
+    op->regmask_src |= op->regmask_dst;
+    op->regmask_dst = 0;
+    break;
+
+  // first operand is src too
+  case OP_NOT:
+  case OP_ADD:
+  case OP_AND:
+  case OP_OR:
+  case OP_RCL:
+  case OP_RCR:
+  case OP_ADC:
+  case OP_INC:
+  case OP_DEC:
+  case OP_NEG:
+  // more below..
+    op->regmask_src |= op->regmask_dst;
+    break;
+
+  // special
+  case OP_XCHG:
+    op->regmask_src |= op->regmask_dst;
+    op->regmask_dst |= op->regmask_src;
+    goto check_align;
+
+  case OP_SUB:
+  case OP_SBB:
+  case OP_XOR:
+    if (op->operand[0].type == OPT_REG && op->operand[1].type == OPT_REG
+     && op->operand[0].lmod == op->operand[1].lmod
+     && op->operand[0].reg == op->operand[1].reg
+     && IS(op->operand[0].name, op->operand[1].name)) // ! ah, al..
+    {
+      op->regmask_src = 0;
+    }
+    else
+      op->regmask_src |= op->regmask_dst;
+    break;
+
+  // ops with implicit argumets
   case OP_CDQ:
     op->operand_cnt = 2;
     setup_reg_opr(&op->operand[0], xDX, OPLM_DWORD, &op->regmask_dst);
@@ -1047,11 +1090,6 @@ static void parse_op(struct parsed_op *op, char words[16][256], int wordc)
     op->regmask_dst = op->regmask_src;
     break;
 
-  case OP_XCHG:
-    op->regmask_src |= op->regmask_dst;
-    op->regmask_dst |= op->regmask_src;
-    goto check_align;
-
   case OP_JECXZ:
     op->operand_cnt = 1;
     op->regmask_src = 1 << xCX;
@@ -1066,8 +1104,8 @@ static void parse_op(struct parsed_op *op, char words[16][256], int wordc)
     // fallthrough
   case OP_MUL:
     // singleop mul
+    op->regmask_src |= op->regmask_dst;
     op->regmask_dst = (1 << xDX) | (1 << xAX);
-    op->regmask_src |= (1 << xAX);
     if (op->operand[0].lmod == OPLM_UNSPEC)
       op->operand[0].lmod = OPLM_DWORD;
     break;
@@ -1076,9 +1114,8 @@ static void parse_op(struct parsed_op *op, char words[16][256], int wordc)
   case OP_IDIV:
     // we could set up operands for edx:eax, but there is no real need to
     // (see is_opr_modified())
-    regmask = (1 << xDX) | (1 << xAX);
-    op->regmask_dst = regmask;
-    op->regmask_src |= regmask;
+    op->regmask_src |= op->regmask_dst;
+    op->regmask_dst = (1 << xDX) | (1 << xAX);
     if (op->operand[0].lmod == OPLM_UNSPEC)
       op->operand[0].lmod = OPLM_DWORD;
     break;
@@ -1088,16 +1125,20 @@ static void parse_op(struct parsed_op *op, char words[16][256], int wordc)
   case OP_SAR:
   case OP_ROL:
   case OP_ROR:
+    op->regmask_src |= op->regmask_dst;
     if (op->operand[1].lmod == OPLM_UNSPEC)
       op->operand[1].lmod = OPLM_BYTE;
     break;
 
   case OP_SHRD:
+    op->regmask_src |= op->regmask_dst;
     if (op->operand[2].lmod == OPLM_UNSPEC)
       op->operand[2].lmod = OPLM_BYTE;
     break;
 
   case OP_PUSH:
+    op->regmask_src |= op->regmask_dst;
+    op->regmask_dst = 0;
     if (op->operand[0].lmod == OPLM_UNSPEC
         && (op->operand[0].type == OPT_CONST
          || op->operand[0].type == OPT_OFFSET
@@ -1111,7 +1152,7 @@ static void parse_op(struct parsed_op *op, char words[16][256], int wordc)
     if (op->operand[0].type == OPT_REG && op->operand[1].type == OPT_REG
      && op->operand[0].lmod == op->operand[1].lmod
      && op->operand[0].reg == op->operand[1].reg
-     && IS(op->operand[0].name, op->operand[1].name)) // ah, al..
+     && IS(op->operand[0].name, op->operand[1].name)) // ! ah, al..
     {
       op->flags |= OPF_RMD;
       op->regmask_src = op->regmask_dst = 0;
@@ -1132,6 +1173,11 @@ static void parse_op(struct parsed_op *op, char words[16][256], int wordc)
   case OP_CALL:
     // trashed regs must be explicitly detected later
     op->regmask_dst = 0;
+    break;
+
+  case OP_LEAVE:
+    op->regmask_dst = (1 << xBP) | (1 << xSP);
+    op->regmask_src =  1 << xBP;
     break;
 
   default:
@@ -2087,7 +2133,7 @@ static int scan_for_pop(int i, int opcnt, const char *reg,
 
     if (po->flags & OPF_TAIL) {
       if (po->op == OP_CALL) {
-        pp = proto_parse(g_fhdr, po->operand[0].name, 0);
+        pp = proto_parse(g_fhdr, po->operand[0].name, g_quiet_pp);
         if (pp != NULL && pp->is_noreturn)
           // no stack cleanup for noreturn
           return ret;
@@ -2327,6 +2373,10 @@ static int scan_for_mod_opr0(struct parsed_op *po_test,
   return -1;
 }
 
+#define check_i(po, i) \
+  if ((i) < 0) \
+    ferr(po, "bad " #i ": %d\n", i)
+
 static int scan_for_flag_set(int i, int magic, int *branched,
   int *setters, int *setter_cnt)
 {
@@ -2345,12 +2395,14 @@ static int scan_for_flag_set(int i, int magic, int *branched,
 
       lr = &g_label_refs[i];
       for (; lr->next; lr = lr->next) {
+        check_i(&ops[i], lr->i);
         ret = scan_for_flag_set(lr->i, magic,
                 branched, setters, setter_cnt);
         if (ret < 0)
           return ret;
       }
 
+      check_i(&ops[i], lr->i);
       if (i > 0 && LAST_OP(i - 1)) {
         i = lr->i;
         continue;
@@ -2564,7 +2616,7 @@ static const struct parsed_proto *try_recover_pp(
     p = strchr(opr->name + 1, '[');
     memcpy(buf, opr->name, p - opr->name);
     buf[p - opr->name] = 0;
-    pp = proto_parse(g_fhdr, buf, 0);
+    pp = proto_parse(g_fhdr, buf, g_quiet_pp);
   }
   else if (opr->type == OPT_OFFSET || opr->type == OPT_LABEL) {
     pp = proto_parse(g_fhdr, opr->name, 0);
@@ -2588,8 +2640,10 @@ static void scan_for_call_type(int i, const struct parsed_opr *opr,
   while (1) {
     if (g_labels[i][0] != 0) {
       lr = &g_label_refs[i];
-      for (; lr != NULL; lr = lr->next)
+      for (; lr != NULL; lr = lr->next) {
+        check_i(&ops[i], lr->i);
         scan_for_call_type(lr->i, opr, magic, pp_found, multi);
+      }
       if (i > 0 && LAST_OP(i - 1))
         return;
     }
@@ -2683,27 +2737,36 @@ static const struct parsed_proto *resolve_icall(int i, int opcnt,
 }
 
 // find an instruction that changed opr before i op
-// *op_i must be set to -1
+// *op_i must be set to -1 by caller
+// *entry is set to 1 if one source is determined to be the caller
+// returns 1 if found, *op_i is then set to origin
 static int resolve_origin(int i, const struct parsed_opr *opr,
-  int magic, int *op_i)
+  int magic, int *op_i, int *is_caller)
 {
   struct label_ref *lr;
   int ret = 0;
 
+  if (ops[i].cc_scratch == magic)
+    return 0;
   ops[i].cc_scratch = magic;
 
   while (1) {
     if (g_labels[i][0] != 0) {
       lr = &g_label_refs[i];
-      for (; lr != NULL; lr = lr->next)
-        ret |= resolve_origin(lr->i, opr, magic, op_i);
+      for (; lr != NULL; lr = lr->next) {
+        check_i(&ops[i], lr->i);
+        ret |= resolve_origin(lr->i, opr, magic, op_i, is_caller);
+      }
       if (i > 0 && LAST_OP(i - 1))
         return ret;
     }
 
     i--;
-    if (i < 0)
+    if (i < 0) {
+      if (is_caller != NULL)
+        *is_caller = 1;
       return -1;
+    }
 
     if (ops[i].cc_scratch == magic)
       return 0;
@@ -2730,9 +2793,9 @@ static int try_resolve_const(int i, const struct parsed_opr *opr,
   int magic, unsigned int *val)
 {
   int s_i = -1;
-  int ret = 0;
+  int ret;
 
-  ret = resolve_origin(i, opr, magic, &s_i);
+  ret = resolve_origin(i, opr, magic, &s_i, NULL);
   if (ret == 1) {
     i = s_i;
     if (ops[i].op != OP_MOV && ops[i].operand[1].type != OPT_CONST)
@@ -2786,6 +2849,7 @@ static int collect_call_args_r(struct parsed_op *po, int i,
       if (lr->next != NULL)
         need_op_saving = 1;
       for (; lr->next; lr = lr->next) {
+        check_i(&ops[j], lr->i);
         if ((ops[lr->i].flags & (OPF_JMP|OPF_CJMP)) != OPF_JMP)
           may_reuse = 1;
         ret = collect_call_args_r(po, lr->i, pp, regmask, save_arg_vars,
@@ -2794,6 +2858,7 @@ static int collect_call_args_r(struct parsed_op *po, int i,
           return ret;
       }
 
+      check_i(&ops[j], lr->i);
       if ((ops[lr->i].flags & (OPF_JMP|OPF_CJMP)) != OPF_JMP)
         may_reuse = 1;
       if (j > 0 && LAST_OP(j - 1)) {
@@ -2890,7 +2955,8 @@ static int collect_call_args_r(struct parsed_op *po, int i,
       // check for __VALIST
       if (!pp->is_unresolved && pp->arg[arg].type.is_va_list) {
         k = -1;
-        ret = resolve_origin(j, &ops[j].operand[0], magic + 1, &k);
+        ret = resolve_origin(j, &ops[j].operand[0],
+                magic + 1, &k, NULL);
         if (ret == 1 && k >= 0)
         {
           if (ops[k].op == OP_LEA) {
@@ -3020,6 +3086,48 @@ static void add_label_ref(struct label_ref *lr, int op_i)
   lr_new->i = op_i;
   lr_new->next = lr->next;
   lr->next = lr_new;
+}
+
+static struct parsed_data *try_resolve_jumptab(int i, int opcnt)
+{
+  struct parsed_op *po = &ops[i];
+  struct parsed_data *pd;
+  char label[NAMELEN], *p;
+  int len, j, l;
+
+  p = strchr(po->operand[0].name, '[');
+  if (p == NULL)
+    return NULL;
+
+  len = p - po->operand[0].name;
+  strncpy(label, po->operand[0].name, len);
+  label[len] = 0;
+
+  for (j = 0, pd = NULL; j < g_func_pd_cnt; j++) {
+    if (IS(g_func_pd[j].label, label)) {
+      pd = &g_func_pd[j];
+      break;
+    }
+  }
+  if (pd == NULL)
+    //ferr(po, "label '%s' not parsed?\n", label);
+    return NULL;
+
+  if (pd->type != OPT_OFFSET)
+    ferr(po, "label '%s' with non-offset data?\n", label);
+
+  // find all labels, link
+  for (j = 0; j < pd->count; j++) {
+    for (l = 0; l < opcnt; l++) {
+      if (g_labels[l][0] && IS(g_labels[l], pd->d[j].u.label)) {
+        add_label_ref(&g_label_refs[l], i);
+        pd->d[j].bt_i = l;
+        break;
+      }
+    }
+  }
+
+  return pd;
 }
 
 static void output_std_flags(FILE *fout, struct parsed_op *po,
@@ -3303,35 +3411,9 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
       continue;
 
     if (po->operand[0].type == OPT_REGMEM) {
-      char *p = strchr(po->operand[0].name, '[');
-      if (p == NULL)
-        goto tailcall;
-      ret = p - po->operand[0].name;
-      strncpy(buf1, po->operand[0].name, ret);
-      buf1[ret] = 0;
-
-      for (j = 0, pd = NULL; j < g_func_pd_cnt; j++) {
-        if (IS(g_func_pd[j].label, buf1)) {
-          pd = &g_func_pd[j];
-          break;
-        }
-      }
+      pd = try_resolve_jumptab(i, opcnt);
       if (pd == NULL)
-        //ferr(po, "label '%s' not parsed?\n", buf1);
         goto tailcall;
-      if (pd->type != OPT_OFFSET)
-        ferr(po, "label '%s' with non-offset data?\n", buf1);
-
-      // find all labels, link
-      for (j = 0; j < pd->count; j++) {
-        for (l = 0; l < opcnt; l++) {
-          if (g_labels[l][0] && IS(g_labels[l], pd->d[j].u.label)) {
-            add_label_ref(&g_label_refs[l], i);
-            pd->d[j].bt_i = l;
-            break;
-          }
-        }
-      }
 
       po->btj = pd;
       continue;
@@ -5019,6 +5101,392 @@ tailcall:
   g_func_pp = NULL;
 }
 
+struct func_proto_dep;
+
+struct func_prototype {
+  char name[NAMELEN];
+  int id;
+  int argc_stack;
+  int regmask_dep;
+  int has_ret:3;                // -1, 0, 1: unresolved, no, yes
+  unsigned int dep_resolved:1;
+  unsigned int is_stdcall:1;
+  struct func_proto_dep *dep_func;
+  int dep_func_cnt;
+};
+
+struct func_proto_dep {
+  char *name;
+  struct func_prototype *proto;
+  int regmask_live;             // .. at the time of call
+  unsigned int ret_dep:1;       // return from this is caller's return
+};
+
+static struct func_prototype *hg_fp;
+static int hg_fp_cnt;
+
+static struct func_proto_dep *hg_fp_find_dep(struct func_prototype *fp,
+  const char *name)
+{
+  int i;
+
+  for (i = 0; i < fp->dep_func_cnt; i++)
+    if (IS(fp->dep_func[i].name, name))
+      return &fp->dep_func[i];
+
+  return NULL;
+}
+
+static void hg_fp_add_dep(struct func_prototype *fp, const char *name)
+{
+  // is it a dupe?
+  if (hg_fp_find_dep(fp, name))
+    return;
+
+  if ((fp->dep_func_cnt & 0xff) == 0) {
+    fp->dep_func = realloc(fp->dep_func,
+      sizeof(fp->dep_func[0]) * (fp->dep_func_cnt + 0x100));
+    my_assert_not(fp->dep_func, NULL);
+    memset(&fp->dep_func[fp->dep_func_cnt], 0,
+      sizeof(fp->dep_func[0]) * 0x100);
+  }
+  fp->dep_func[fp->dep_func_cnt].name = strdup(name);
+  fp->dep_func_cnt++;
+}
+
+static int hg_fp_cmp_name(const void *p1_, const void *p2_)
+{
+  const struct func_prototype *p1 = p1_, *p2 = p2_;
+  return strcmp(p1->name, p2->name);
+}
+
+#if 0
+static int hg_fp_cmp_id(const void *p1_, const void *p2_)
+{
+  const struct func_prototype *p1 = p1_, *p2 = p2_;
+  return p1->id - p2->id;
+}
+#endif
+
+static void gen_hdr(const char *funcn, int opcnt)
+{
+  struct func_prototype *fp;
+  struct func_proto_dep *dep;
+  struct parsed_data *pd;
+  struct parsed_op *po;
+  int regmask_save = 0;
+  int regmask_dst = 0;
+  int regmask_dep = 0;
+  int max_bp_offset = 0;
+  int has_ret = -1;
+  int from_caller = 0;
+  int i, j, l, ret;
+  int depth, reg;
+
+  if ((hg_fp_cnt & 0xff) == 0) {
+    hg_fp = realloc(hg_fp, sizeof(hg_fp[0]) * (hg_fp_cnt + 0x100));
+    my_assert_not(hg_fp, NULL);
+    memset(hg_fp + hg_fp_cnt, 0, sizeof(hg_fp[0]) * 0x100);
+  }
+
+  fp = &hg_fp[hg_fp_cnt];
+  snprintf(fp->name, sizeof(fp->name), "%s", funcn);
+  fp->id = hg_fp_cnt;
+  hg_fp_cnt++;
+
+  // pass1:
+  // - collect calls
+  // - resolve all branches
+  for (i = 0; i < opcnt; i++)
+  {
+    po = &ops[i];
+    po->bt_i = -1;
+    po->btj = NULL;
+
+    if (po->flags & OPF_RMD)
+      continue;
+
+    if (po->op == OP_CALL) {
+      if (po->operand[0].type == OPT_LABEL)
+        hg_fp_add_dep(fp, opr_name(po, 0));
+
+      continue;
+    }
+
+    if (!(po->flags & OPF_JMP) || po->op == OP_RET)
+      continue;
+
+    if (po->operand[0].type == OPT_REGMEM) {
+      pd = try_resolve_jumptab(i, opcnt);
+      if (pd == NULL)
+        goto tailcall;
+
+      po->btj = pd;
+      continue;
+    }
+
+    for (l = 0; l < opcnt; l++) {
+      if (g_labels[l][0] && IS(po->operand[0].name, g_labels[l])) {
+        add_label_ref(&g_label_refs[l], i);
+        po->bt_i = l;
+        break;
+      }
+    }
+
+    if (po->bt_i != -1 || (po->flags & OPF_RMD))
+      continue;
+
+    if (po->operand[0].type == OPT_LABEL)
+      // assume tail call
+      goto tailcall;
+
+    ferr(po, "unhandled branch\n");
+
+tailcall:
+    po->op = OP_CALL;
+    po->flags |= OPF_TAIL;
+    if (i > 0 && ops[i - 1].op == OP_POP)
+      po->flags |= OPF_ATAIL;
+    i--; // reprocess
+  }
+
+  // pass2:
+  // - remove dead labels
+  for (i = 0; i < opcnt; i++)
+  {
+    if (g_labels[i][0] != 0 && g_label_refs[i].i == -1)
+      g_labels[i][0] = 0;
+  }
+
+  // pass3:
+  // - track saved regs
+  // - try to figure out arg-regs
+  for (i = 0; i < opcnt; i++)
+  {
+    po = &ops[i];
+    if (po->flags & OPF_RMD)
+      continue;
+
+    if (po->op == OP_PUSH && po->operand[0].type == OPT_REG)
+    {
+      reg = po->operand[0].reg;
+      if (reg < 0)
+        ferr(po, "reg not set for push?\n");
+
+      depth = 0;
+      ret = scan_for_pop(i + 1, opcnt,
+              po->operand[0].name, i + opcnt * 1, 0, &depth, 0);
+      if (ret == 1) {
+        regmask_save |= 1 << reg;
+        po->flags |= OPF_RMD;
+        scan_for_pop(i + 1, opcnt,
+          po->operand[0].name, i + opcnt * 2, 0, &depth, 1);
+        continue;
+      }
+      ret = scan_for_pop_ret(i + 1, opcnt, po->operand[0].name, 0);
+      if (ret == 0) {
+        regmask_save |= 1 << reg;
+        po->flags |= OPF_RMD;
+        scan_for_pop_ret(i + 1, opcnt, po->operand[0].name, OPF_RMD);
+        continue;
+      }
+    }
+    else if (po->op == OP_PUSH && po->operand[0].type == OPT_CONST) {
+      for (j = i + 1; j < opcnt; j++) {
+        if ((ops[j].flags & (OPF_JMP|OPF_TAIL|OPF_RSAVE))
+          || ops[j].op == OP_PUSH || g_labels[i][0] != 0)
+        {
+          break;
+        }
+
+        if (!(ops[j].flags & OPF_RMD) && ops[j].op == OP_POP)
+        {
+          po->flags |= OPF_RMD;
+          ops[j].datap = po;
+          break;
+        }
+      }
+      continue;
+    }
+    else if (po->op == OP_CALL) {
+      po->regmask_dst |= 1 << xAX;
+
+      dep = hg_fp_find_dep(fp, po->operand[0].name);
+      if (dep != NULL)
+        dep->regmask_live = regmask_save | regmask_dst;
+    }
+    else if (po->op == OP_RET) {
+      if (po->operand_cnt > 0)
+        fp->is_stdcall = 1;
+    }
+
+    if (has_ret != 0 && (po->flags & OPF_TAIL)) {
+      if (po->op == OP_CALL) {
+        j = i;
+        ret = 1;
+      }
+      else {
+        struct parsed_opr opr = { 0, };
+        opr.type = OPT_REG;
+        opr.reg = xAX;
+        j = -1;
+        from_caller = 0;
+        ret = resolve_origin(i, &opr, i + opcnt * 3, &j, &from_caller);
+      }
+
+      if (ret == -1 && from_caller) {
+        // unresolved eax - probably void func
+        has_ret = 0;
+      }
+      else {
+        if (ops[j].op == OP_CALL) {
+          dep = hg_fp_find_dep(fp, po->operand[0].name);
+          if (dep != NULL)
+            dep->ret_dep = 1;
+          else
+            has_ret = 1;
+        }
+        else
+          has_ret = 1;
+      }
+    }
+
+    l = po->regmask_src & ~(regmask_save | regmask_dst);
+#if 0
+    if (l)
+      fnote(po, "dep |= %04x, dst %04x, save %04x\n", l,
+        regmask_dst, regmask_save);
+#endif
+    regmask_dep |= l;
+    regmask_dst |= po->regmask_dst;
+  }
+
+  if (has_ret == -1 && (regmask_dep & (1 << xAX)))
+    has_ret = 1;
+
+  for (i = 0; i < g_eqcnt; i++)
+    if (g_eqs[i].offset > max_bp_offset && g_eqs[i].offset < 4*32)
+      max_bp_offset = g_eqs[i].offset;
+
+  if (max_bp_offset > 0) {
+    max_bp_offset = (max_bp_offset + 3) & ~3;
+    fp->argc_stack = max_bp_offset / 4 - 1;
+    if (!(g_ida_func_attr & IDAFA_BP_FRAME))
+      fp->argc_stack--;
+  }
+
+  fp->regmask_dep = regmask_dep & ~(1 << xSP);
+  fp->has_ret = has_ret;
+}
+
+static void hg_fp_resolve_deps(struct func_prototype *fp)
+{
+  struct func_prototype fp_s;
+  int i;
+
+  // this thing is recursive, so mark first..
+  fp->dep_resolved = 1;
+
+  for (i = 0; i < fp->dep_func_cnt; i++) {
+    strcpy(fp_s.name, fp->dep_func[i].name);
+    fp->dep_func[i].proto = bsearch(&fp_s, hg_fp, hg_fp_cnt,
+      sizeof(hg_fp[0]), hg_fp_cmp_name);
+    if (fp->dep_func[i].proto != NULL) {
+      if (!fp->dep_func[i].proto->dep_resolved)
+        hg_fp_resolve_deps(fp->dep_func[i].proto);
+
+      fp->regmask_dep |= ~fp->dep_func[i].regmask_live
+                       & fp->dep_func[i].proto->regmask_dep;
+
+      if (fp->has_ret == -1)
+        fp->has_ret = fp->dep_func[i].proto->has_ret;
+    }
+  }
+}
+
+static void output_hdr(FILE *fout)
+{
+  struct func_prototype *fp;
+  int had_usercall = 0;
+  int regmask_dep;
+  int argc_stack;
+  int i, j, arg;
+
+  // resolve deps
+  qsort(hg_fp, hg_fp_cnt, sizeof(hg_fp[0]), hg_fp_cmp_name);
+  for (i = 0; i < hg_fp_cnt; i++)
+    hg_fp_resolve_deps(&hg_fp[i]);
+
+  // note: messes up .proto ptr, don't use
+  //qsort(hg_fp, hg_fp_cnt, sizeof(hg_fp[0]), hg_fp_cmp_id);
+
+  for (i = 0; i < hg_fp_cnt; i++) {
+    fp = &hg_fp[i];
+    if (fp->has_ret == -1)
+      fprintf(fout, "// ret unresolved\n");
+#if 0
+    fprintf(fout, "// dep:");
+    for (j = 0; j < fp->dep_func_cnt; j++) {
+      fprintf(fout, " %s/", fp->dep_func[j].name);
+      if (fp->dep_func[j].proto != NULL)
+        fprintf(fout, "%04x/%d", fp->dep_func[j].proto->regmask_dep,
+          fp->dep_func[j].proto->has_ret);
+    }
+    fprintf(fout, "\n");
+#endif
+
+    regmask_dep = fp->regmask_dep;
+    argc_stack = fp->argc_stack;
+
+    fprintf(fout, fp->has_ret ? "int  " : "void ");
+    if (regmask_dep && (fp->is_stdcall || argc_stack == 0)
+      && (regmask_dep & ~((1 << xCX) | (1 << xDX))) == 0)
+    {
+      fprintf(fout, "__fastcall ");
+      if (had_usercall)
+        fprintf(fout, "     "); // align
+      if (!(regmask_dep & (1 << xDX)) && argc_stack == 0)
+        argc_stack = 1;
+      else
+        argc_stack += 2;
+      regmask_dep = 0;
+    }
+    else if (regmask_dep && !fp->is_stdcall) {
+      fprintf(fout, "/*__usercall*/  ");
+      had_usercall = 1;
+    }
+    else if (regmask_dep) {
+      fprintf(fout, "/*__userpurge*/ ");
+      had_usercall = 1;
+    }
+    else if (fp->is_stdcall)
+      fprintf(fout, "__stdcall  ");
+    else
+      fprintf(fout, "__cdecl ");
+
+    fprintf(fout, "%s(", fp->name);
+
+    arg = 0;
+    for (j = 0; j < xSP; j++) {
+      if (regmask_dep & (1 << j)) {
+        arg++;
+        if (arg != 1)
+          fprintf(fout, ", ");
+        fprintf(fout, "int a%d/*<%s>*/", arg, regs_r32[j]);
+      }
+    }
+
+    for (j = 0; j < argc_stack; j++) {
+      arg++;
+      if (arg != 1)
+        fprintf(fout, ", ");
+      fprintf(fout, "int a%d", arg);
+    }
+
+    fprintf(fout, ");\n");
+  }
+}
+
 static void set_label(int i, const char *name)
 {
   const char *p;
@@ -5175,6 +5643,7 @@ int main(int argc, char *argv[])
   int pending_endp = 0;
   int skip_func = 0;
   int skip_warned = 0;
+  int header_mode = 0;
   int eq_alloc;
   int verbose = 0;
   int multi_seg = 0;
@@ -5194,13 +5663,16 @@ int main(int argc, char *argv[])
       g_allow_regfunc = 1;
     else if (IS(argv[arg], "-m"))
       multi_seg = 1;
+    else if (IS(argv[arg], "-hdr"))
+      header_mode = g_quiet_pp = 1;
     else
       break;
   }
 
   if (argc < arg + 3) {
-    printf("usage:\n%s [-v] [-rf] [-m] <.c> <.asm> <hdrf> [rlist]*\n",
-      argv[0]);
+    printf("usage:\n%s [-v] [-rf] [-m] <.c> <.asm> <hdrf> [rlist]*\n"
+           "%s -hdr <.h> <.asm> <seed_hdrf> [rlist]*\n",
+      argv[0], argv[0]);
     return 1;
   }
 
@@ -5489,8 +5961,12 @@ do_pending_endp:
         continue;
       }
 
-      if (in_func && !skip_func)
-        gen_func(fout, g_fhdr, g_func, pi);
+      if (in_func && !skip_func) {
+        if (header_mode)
+          gen_hdr(g_func, pi);
+        else
+          gen_func(fout, g_fhdr, g_func, pi);
+      }
 
       pending_endp = 0;
       in_func = 0;
@@ -5666,6 +6142,9 @@ do_pending_endp:
     }
     pi++;
   }
+
+  if (header_mode)
+    output_hdr(fout);
 
   fclose(fout);
   fclose(fasm);
