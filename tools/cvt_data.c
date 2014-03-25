@@ -381,7 +381,7 @@ static int is_unwanted_sym(const char *sym)
 
 int main(int argc, char *argv[])
 {
-  FILE *fout, *fasm, *fhdr, *frlist;
+  FILE *fout, *fasm, *fhdr = NULL, *frlist;
   const struct parsed_proto *pp;
   int no_decorations = 0;
   char comment_char = '#';
@@ -399,6 +399,8 @@ int main(int argc, char *argv[])
   char **rlist;
   int rlist_cnt = 0;
   int rlist_alloc;
+  int header_mode = 0;
+  int is_ro = 0;
   int is_label;
   int is_bss;
   int wordc;
@@ -412,8 +414,9 @@ int main(int argc, char *argv[])
 
   if (argc < 4) {
     // -nd: no symbol decorations
-    printf("usage:\n%s [-nd] [-i] [-a] <.s> <.asm> <hdrf> [rlist]*\n",
-      argv[0]);
+    printf("usage:\n%s [-nd] [-i] [-a] <.s> <.asm> <hdrf> [rlist]*\n"
+           "%s -hdr <.h> <.asm>\n",
+      argv[0], argv[0]);
     return 1;
   }
 
@@ -426,6 +429,8 @@ int main(int argc, char *argv[])
       comment_char = '@';
       g_arm_mode = 1;
     }
+    else if (IS(argv[arg], "-hdr"))
+      header_mode = 1;
     else
       break;
   }
@@ -436,9 +441,11 @@ int main(int argc, char *argv[])
   fasm = fopen(asmfn, "r");
   my_assert_not(fasm, NULL);
 
-  hdrfn = argv[arg++];
-  fhdr = fopen(hdrfn, "r");
-  my_assert_not(fhdr, NULL);
+  if (!header_mode) {
+    hdrfn = argv[arg++];
+    fhdr = fopen(hdrfn, "r");
+    my_assert_not(fhdr, NULL);
+  }
 
   fout = fopen(argv[arg_out], "w");
   my_assert_not(fout, NULL);
@@ -491,14 +498,21 @@ int main(int argc, char *argv[])
     if (IS(line + 1, "text"))
       continue;
 
-    if (IS(line + 1, "rdata"))
-      fprintf(fout, "\n.section .rodata\n");
-    else if (IS(line + 1, "data"))
-      fprintf(fout, "\n.data\n");
+    if (IS(line + 1, "rdata")) {
+      is_ro = 1;
+      if (!header_mode)
+        fprintf(fout, "\n.section .rodata\n");
+    }
+    else if (IS(line + 1, "data")) {
+      is_ro = 0;
+      if (!header_mode)
+        fprintf(fout, "\n.data\n");
+    }
     else
       aerr("unhandled section: '%s'\n", line);
 
-    fprintf(fout, ".align %d\n", align_value(4));
+    if (!header_mode)
+      fprintf(fout, ".align %d\n", align_value(4));
 
     while (fgets(line, sizeof(line), fasm))
     {
@@ -513,7 +527,7 @@ int main(int argc, char *argv[])
         if (IS_START(p, ";org") && sscanf(p + 5, "%Xh", &i) == 1) {
           // ;org is only seen at section start, so assume . addr 0
           i &= 0xfff;
-          if (i != 0)
+          if (i != 0 && !header_mode)
             fprintf(fout, "\t\t  .skip 0x%x\n", i);
         }
         continue;
@@ -548,6 +562,9 @@ int main(int argc, char *argv[])
         continue;
 
       if (IS(words[0], "align")) {
+        if (header_mode)
+          continue;
+
         val = parse_number(words[1]);
         fprintf(fout, "\t\t  .align %d", align_value(val));
         goto fin;
@@ -563,7 +580,42 @@ int main(int argc, char *argv[])
       if (type == DXT_UNSPEC)
         aerr("unhandled decl: '%s %s'\n", words[0], words[1]);
 
-      if (sym != NULL) {
+      if (sym != NULL)
+      {
+        if (header_mode) {
+          int is_str = 0;
+
+          fprintf(fout, "extern ");
+          if (is_ro)
+            fprintf(fout, "const ");
+
+          switch (type) {
+          case DXT_BYTE:
+            for (i = w; i < wordc; i++)
+              if (words[i][0] == '\'')
+                is_str = 1;
+            if (is_str)
+              fprintf(fout, "char     %s[];\n", sym);
+            else
+              fprintf(fout, "uint8_t  %s;\n", sym);
+            break;
+
+          case DXT_WORD:
+            fprintf(fout, "uint16_t %s;\n", sym);
+            break;
+
+          case DXT_DWORD:
+            fprintf(fout, "uint32_t %s;\n", sym);
+            break;
+
+          default:
+            fprintf(fout, "_UNKNOWN %s;\n", sym);
+            break;
+          }
+
+          continue;
+        }
+
         snprintf(last_sym, sizeof(last_sym), "%s", sym);
 
         pp = proto_parse(fhdr, sym, 1);
@@ -593,6 +645,9 @@ int main(int argc, char *argv[])
           fprintf(fout, " ");
       }
       else {
+        if (header_mode)
+          continue;
+
         fprintf(fout, "\t\t  ");
       }
 
@@ -774,7 +829,8 @@ fin:
 
   fclose(fout);
   fclose(fasm);
-  fclose(fhdr);
+  if (fhdr != NULL)
+    fclose(fhdr);
 
   return 0;
 }
