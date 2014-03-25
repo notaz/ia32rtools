@@ -548,7 +548,9 @@ pass:
         }
       }
       else if (jmp_near) {
-        p = strchr(fw, 'j');
+        p = NULL;
+        if (fw != buf && fw[0] == 'j')
+          p = fw;
         while (p && *p != ' ')
           p++;
         while (p && *p == ' ')
@@ -556,6 +558,7 @@ pass:
         if (p != NULL) {
           memmove(p + 9, p, strlen(p) + 1);
           memcpy(p, "near ptr ", 9);
+          jmp_near = 0;
         }
       }
       if (word_imm) {
