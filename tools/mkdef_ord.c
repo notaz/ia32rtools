@@ -74,7 +74,7 @@ int main(int argc, char *argv[])
     if (*p == 0)
       continue;
 
-    if (IS(p, "//"))
+    if (IS_START(p, "//"))
       continue;
 
     ret = 0;
