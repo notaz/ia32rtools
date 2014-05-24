@@ -23,6 +23,9 @@
 #define IS_START(w, y) !strncmp(w, y, strlen(y))
 #define ARRAY_SIZE(x) (sizeof(x) / sizeof(x[0]))
 
+static char **name_cache;
+static size_t name_cache_size;
+
 // non-local branch targets
 static ea_t *nonlocal_bt;
 static int nonlocal_bt_alloc;
@@ -37,11 +40,21 @@ static int idaapi init(void)
 //--------------------------------------------------------------------------
 static void idaapi term(void)
 {
+  size_t i;
+
   if (nonlocal_bt != NULL) {
     free(nonlocal_bt);
     nonlocal_bt = NULL;
   }
   nonlocal_bt_alloc = 0;
+
+  if (name_cache != NULL) {
+    for (i = 0; i < name_cache_size; i++)
+      free(name_cache[i]);
+    free(name_cache);
+    name_cache = NULL;
+  }
+  name_cache_size = 0;
 }
 
 //--------------------------------------------------------------------------
@@ -54,6 +67,7 @@ static const char *reserved_names[] = {
   "text",
   "size",
   "c",
+  "align",
 };
 
 static int is_name_reserved(const char *name)
@@ -122,6 +136,63 @@ static void do_def_line(char *buf, size_t buf_size, const char *line,
   }
 }
 
+static int name_cache_cmp(const void *p1, const void *p2)
+{
+  // masm ignores case, so do we
+  return stricmp(*(char * const *)p1, *(char * const *)p2);
+}
+
+static void rebuild_name_cache(void)
+{
+  size_t i, newsize;
+  void *tmp;
+
+  // build a sorted name cache
+  newsize = get_nlist_size();
+  if (newsize > name_cache_size) {
+    tmp = realloc(name_cache, newsize * sizeof(name_cache[0]));
+    if (tmp == NULL) {
+      msg("OOM for name cache\n");
+      return;
+    }
+    name_cache = (char **)tmp;
+  }
+  for (i = 0; i < name_cache_size; i++)
+    free(name_cache[i]);
+  for (i = 0; i < newsize; i++)
+    name_cache[i] = strdup(get_nlist_name(i));
+
+  name_cache_size = newsize;
+  qsort(name_cache, name_cache_size, sizeof(name_cache[0]),
+    name_cache_cmp);
+}
+
+static void my_rename(ea_t ea, char *name)
+{
+  char buf[256];
+  char *p, **pp;
+  int n = 0;
+
+  qsnprintf(buf, sizeof(buf), "%s", name);
+  do {
+    p = buf;
+    pp = (char **)bsearch(&p, name_cache, name_cache_size,
+        sizeof(name_cache[0]), name_cache_cmp);
+    if (pp == NULL)
+      break;
+
+    qsnprintf(buf, sizeof(buf), "%s_g%d", name, n);
+    n++;
+  }
+  while (n < 100);
+
+  if (n == 100)
+    msg("rename failure? '%s'\n", name);
+
+  do_name_anyway(ea, buf);
+  rebuild_name_cache();
+}
+
 static void idaapi run(int /*arg*/)
 {
   // isEnabled(ea) // address belongs to disassembly
@@ -141,6 +212,7 @@ static void idaapi run(int /*arg*/)
   uval_t idx;
   int i, o, m, n;
   int ret;
+  char **pp;
   char *p;
 
   nonlocal_bt_cnt = 0;
@@ -158,8 +230,11 @@ static void idaapi run(int /*arg*/)
     idx = get_first_struc_idx();
   }
 
+  rebuild_name_cache();
+
   // 1st pass: walk through all funcs
-  func = get_func(inf.minEA);
+  ea = inf.minEA;
+  func = get_func(ea);
   while (func != NULL)
   {
     func_tail_iterator_t fti(func);
@@ -204,13 +279,16 @@ static void idaapi run(int /*arg*/)
           }
         }
 
-        tmp_ea = get_name_ea(ea, buf);
-        if (tmp_ea == 0 || tmp_ea == ~0)
+        p = buf;
+        pp = (char **)bsearch(&p, name_cache, name_cache_size,
+              sizeof(name_cache[0]), name_cache_cmp);
+        if (pp == NULL)
           continue;
 
-        msg("%x: from %x: renaming '%s'\n", tmp_ea, ea, buf);
-        qstrncat(buf, "_g", sizeof(buf));
-        set_name(tmp_ea, buf);
+        tmp_ea = get_name_ea(BADADDR, *pp);
+        msg("%x: renaming '%s' because of '%s' at %x\n",
+          tmp_ea, *pp, buf, ea);
+        my_rename(tmp_ea, *pp);
       }
     }
 
@@ -373,7 +451,7 @@ static void idaapi run(int /*arg*/)
 
     if (change_qat || is_name_reserved(name)) {
       msg("%x: renaming name '%s'\n", ea, name);
-      qsnprintf(buf, sizeof(buf), "%s_g", name);
+      qsnprintf(buf, sizeof(buf), "%s", name);
 
       if (change_qat) {
         for (p = buf; *p != 0; p++) {
@@ -385,7 +463,7 @@ static void idaapi run(int /*arg*/)
         }
       }
 
-      set_name(ea, buf);
+      my_rename(ea, buf);
     }
   }
 

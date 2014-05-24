@@ -3,9 +3,12 @@ CC = $(CROSS_COMPILE)gcc
 CXX = $(CROSS_COMPILE)g++
 IDASDK = $(wildcard idasdk*)
 
-CFLAGS += -Wall -Wno-sign-compare
+CFLAGS += -Wall -Wno-sign-compare -fno-strict-aliasing
 CFLAGS += -I$(IDASDK)/include/ -D__IDP__ -D__PLUGIN__ -D__NT__
 LDLIBS += $(IDASDK)/lib/x86_win_gcc_32/ida.a
+ifndef DEBUG
+CFLAGS += -O2
+endif
 
 all: saveasm.plw
 
