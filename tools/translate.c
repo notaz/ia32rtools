@@ -156,9 +156,10 @@ struct parsed_op {
   unsigned char pfo;
   unsigned char pfo_inv;
   unsigned char operand_cnt;
-  unsigned char p_argnum; // push: altered before call arg #
-  unsigned char p_argpass;// push: arg of host func
-  unsigned char pad[3];
+  unsigned char p_argnum; // arg push: altered before call arg #
+  unsigned char p_arggrp; // arg push: arg group # for above
+  unsigned char p_argpass;// arg push: arg of host func
+  short         p_argnext;// arg push: same arg pushed elsewhere or -1
   int regmask_src;        // all referensed regs
   int regmask_dst;
   int pfomask;            // flagop: parsed_flag_op that can't be delayed
@@ -210,7 +211,9 @@ enum ida_func_attr {
   IDAFA_FPD      = (1 << 5),
 };
 
-#define MAX_OPS 4096
+// note: limited to 32k due to p_argnext
+#define MAX_OPS     4096
+#define MAX_ARG_GRP 2
 
 static struct parsed_op ops[MAX_OPS];
 static struct parsed_equ *g_eqs;
@@ -2809,12 +2812,15 @@ static int try_resolve_const(int i, const struct parsed_opr *opr,
 }
 
 static int collect_call_args_r(struct parsed_op *po, int i,
-  struct parsed_proto *pp, int *regmask, int *save_arg_vars, int arg,
-  int magic, int need_op_saving, int may_reuse)
+  struct parsed_proto *pp, int *regmask, int *save_arg_vars,
+  int *arg_grp, int arg, int magic, int need_op_saving, int may_reuse)
 {
   struct parsed_proto *pp_tmp;
+  struct parsed_op *po_tmp;
   struct label_ref *lr;
   int need_to_save_current;
+  int arg_grp_current = 0;
+  int save_args_seen = 0;
   int save_args;
   int ret = 0;
   int reg;
@@ -2853,7 +2859,7 @@ static int collect_call_args_r(struct parsed_op *po, int i,
         if ((ops[lr->i].flags & (OPF_JMP|OPF_CJMP)) != OPF_JMP)
           may_reuse = 1;
         ret = collect_call_args_r(po, lr->i, pp, regmask, save_arg_vars,
-                arg, magic, need_op_saving, may_reuse);
+                arg_grp, arg, magic, need_op_saving, may_reuse);
         if (ret < 0)
           return ret;
       }
@@ -2868,7 +2874,7 @@ static int collect_call_args_r(struct parsed_op *po, int i,
       }
       need_op_saving = 1;
       ret = collect_call_args_r(po, lr->i, pp, regmask, save_arg_vars,
-               arg, magic, need_op_saving, may_reuse);
+               arg_grp, arg, magic, need_op_saving, may_reuse);
       if (ret < 0)
         return ret;
     }
@@ -2916,7 +2922,12 @@ static int collect_call_args_r(struct parsed_op *po, int i,
       if (pp->is_unresolved && (ops[j].flags & OPF_RMD))
         break;
 
+      ops[j].p_argnext = -1;
+      po_tmp = pp->arg[arg].datap;
+      if (po_tmp != NULL)
+        ops[j].p_argnext = po_tmp - ops;
       pp->arg[arg].datap = &ops[j];
+
       need_to_save_current = 0;
       save_args = 0;
       reg = -1;
@@ -2939,6 +2950,14 @@ static int collect_call_args_r(struct parsed_op *po, int i,
           //*save_arg_vars &= ~(1 << (ops[j].p_argnum - 1));
           ops[j].p_argnum = arg + 1;
           save_args |= 1 << arg;
+        }
+
+        if (save_args_seen & (1 << (ops[j].p_argnum - 1))) {
+          save_args_seen = 0;
+          arg_grp_current++;
+          if (arg_grp_current >= MAX_ARG_GRP)
+            ferr(&ops[j], "out of arg groups (arg%d), f %s\n",
+              ops[j].p_argnum, pp->name);
         }
       }
       else if (ops[j].p_argnum == 0)
@@ -3005,6 +3024,13 @@ static int collect_call_args_r(struct parsed_op *po, int i,
       }
       magic = (magic & 0xffffff) | (arg << 24);
     }
+
+    if (ops[j].p_arggrp > arg_grp_current) {
+      save_args_seen = 0;
+      arg_grp_current = ops[j].p_arggrp;
+    }
+    if (ops[j].p_argnum > 0)
+      save_args_seen |= 1 << (ops[j].p_argnum - 1);
   }
 
   if (arg < pp->argc) {
@@ -3013,6 +3039,9 @@ static int collect_call_args_r(struct parsed_op *po, int i,
     return -1;
   }
 
+  if (arg_grp_current > *arg_grp)
+    *arg_grp = arg_grp_current;
+
   return arg;
 }
 
@@ -3020,13 +3049,36 @@ static int collect_call_args(struct parsed_op *po, int i,
   struct parsed_proto *pp, int *regmask, int *save_arg_vars,
   int magic)
 {
+  // arg group is for cases when pushes for
+  // multiple funcs are going on
+  struct parsed_op *po_tmp;
+  int save_arg_vars_current = 0;
+  int arg_grp = 0;
   int ret;
   int a;
 
-  ret = collect_call_args_r(po, i, pp, regmask, save_arg_vars,
-          0, magic, 0, 0);
+  ret = collect_call_args_r(po, i, pp, regmask,
+          &save_arg_vars_current, &arg_grp, 0, magic, 0, 0);
   if (ret < 0)
     return ret;
+
+  if (arg_grp != 0) {
+    // propagate arg_grp
+    for (a = 0; a < pp->argc; a++) {
+      if (pp->arg[a].reg != NULL)
+        continue;
+
+      po_tmp = pp->arg[a].datap;
+      while (po_tmp != NULL) {
+        po_tmp->p_arggrp = arg_grp;
+        if (po_tmp->p_argnext > 0)
+          po_tmp = &ops[po_tmp->p_argnext];
+        else
+          po_tmp = NULL;
+      }
+    }
+  }
+  save_arg_vars[arg_grp] |= save_arg_vars_current;
 
   if (pp->is_unresolved) {
     pp->argc += ret;
@@ -3156,6 +3208,18 @@ static void output_pp_attrs(FILE *fout, const struct parsed_proto *pp,
     fprintf(fout, "noreturn ");
 }
 
+static char *saved_arg_name(char *buf, size_t buf_size, int grp, int num)
+{
+  char buf1[16];
+
+  buf1[0] = 0;
+  if (grp > 0)
+    snprintf(buf1, sizeof(buf1), "%d", grp);
+  snprintf(buf, buf_size, "s%s_a%d", buf1, num);
+
+  return buf;
+}
+
 static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
 {
   struct parsed_op *po, *delayed_flag_op = NULL, *tmp_op;
@@ -3166,7 +3230,7 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
   struct parsed_data *pd;
   const char *tmpname;
   unsigned int uval;
-  int save_arg_vars = 0;
+  int save_arg_vars[MAX_ARG_GRP] = { 0, };
   int cond_vars = 0;
   int need_tmp_var = 0;
   int need_tmp64 = 0;
@@ -3557,7 +3621,7 @@ tailcall:
 
       if (!pp->is_unresolved && !(po->flags & OPF_ATAIL)) {
         // since we know the args, collect them
-        collect_call_args(po, i, pp, &regmask, &save_arg_vars,
+        collect_call_args(po, i, pp, &regmask, save_arg_vars,
           i + opcnt * 2);
       }
 
@@ -3731,7 +3795,7 @@ tailcall:
 
       if (pp->is_unresolved) {
         int regmask_stack = 0;
-        collect_call_args(po, i, pp, &regmask, &save_arg_vars,
+        collect_call_args(po, i, pp, &regmask, save_arg_vars,
           i + opcnt * 2);
 
         // this is pretty rough guess:
@@ -4040,10 +4104,13 @@ tailcall:
     }
   }
 
-  if (save_arg_vars) {
+  for (i = 0; i < ARRAY_SIZE(save_arg_vars); i++) {
+    if (save_arg_vars[i] == 0)
+      continue;
     for (reg = 0; reg < 32; reg++) {
-      if (save_arg_vars & (1 << reg)) {
-        fprintf(fout, "  u32 s_a%d;\n", reg + 1);
+      if (save_arg_vars[i] & (1 << reg)) {
+        fprintf(fout, "  u32 %s;\n",
+          saved_arg_name(buf1, sizeof(buf1), i, reg + 1));
         had_decl = 1;
       }
     }
@@ -4887,7 +4954,9 @@ tailcall:
               fprintf(fout, "a%d", tmp_op->p_argpass);
             }
             else if (tmp_op->p_argnum != 0) {
-              fprintf(fout, "%ss_a%d", cast, tmp_op->p_argnum);
+              fprintf(fout, "%s%s", cast,
+                saved_arg_name(buf1, sizeof(buf1),
+                  tmp_op->p_arggrp, tmp_op->p_argnum));
             }
             else {
               fprintf(fout, "%s",
@@ -4977,7 +5046,9 @@ tailcall:
         out_src_opr_u32(buf1, sizeof(buf1), po, &po->operand[0]);
         if (po->p_argnum != 0) {
           // special case - saved func arg
-          fprintf(fout, "  s_a%d = %s;", po->p_argnum, buf1);
+          fprintf(fout, "  %s = %s;",
+            saved_arg_name(buf2, sizeof(buf2),
+              po->p_arggrp, po->p_argnum), buf1);
           break;
         }
         else if (po->flags & OPF_RSAVE) {
