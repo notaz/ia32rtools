@@ -237,6 +237,7 @@ void * __cdecl _onexit (int (__cdecl *)(void));
 
 void * __cdecl signal (int, void *);
 int __cdecl raise (int);
+int __cdecl __snprintf (char *, unsigned int, const char*, ...);
 
 void* __cdecl  	memcpy_0 (void*, const void*, size_t);
 

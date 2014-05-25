@@ -34,7 +34,6 @@ _strtoul
 _srand
 _rand
 _time
-_siglookup
 _signal
 _strtok
 __wcsicmp
@@ -90,6 +89,12 @@ _mbtowc
 _ungetc
 __strcmpi
 __splitpath
+_abort
+_raise
+__snprintf
+_atoi
+_abs
+_labs
 
 # float
 __control87
@@ -101,3 +106,4 @@ _ceil
 
 # not in mingw
 _memcpy_0
+_siglookup
