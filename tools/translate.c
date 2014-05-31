@@ -218,7 +218,7 @@ enum ida_func_attr {
 static struct parsed_op ops[MAX_OPS];
 static struct parsed_equ *g_eqs;
 static int g_eqcnt;
-static char g_labels[MAX_OPS][48];
+static char *g_labels[MAX_OPS];
 static struct label_ref g_label_refs[MAX_OPS];
 static const struct parsed_proto *g_func_pp;
 static struct parsed_data *g_func_pd;
@@ -2233,7 +2233,7 @@ static int scan_for_pop_ret(int i, int opcnt, const char *reg,
         break;
       }
 
-      if (g_labels[j][0] != 0)
+      if (g_labels[j] != NULL)
         return -1;
     }
   }
@@ -2393,7 +2393,7 @@ static int scan_for_flag_set(int i, int magic, int *branched,
     }
     ops[i].cc_scratch = magic;
 
-    if (g_labels[i][0] != 0) {
+    if (g_labels[i] != NULL) {
       *branched = 1;
 
       lr = &g_label_refs[i];
@@ -2434,7 +2434,7 @@ static int scan_for_flag_set(int i, int magic, int *branched,
 static int scan_for_cdq_edx(int i)
 {
   while (i >= 0) {
-    if (g_labels[i][0] != 0) {
+    if (g_labels[i] != NULL) {
       if (g_label_refs[i].next != NULL)
         return -1;
       if (i > 0 && LAST_OP(i - 1)) {
@@ -2458,7 +2458,7 @@ static int scan_for_cdq_edx(int i)
 static int scan_for_reg_clear(int i, int reg)
 {
   while (i >= 0) {
-    if (g_labels[i][0] != 0) {
+    if (g_labels[i] != NULL) {
       if (g_label_refs[i].next != NULL)
         return -1;
       if (i > 0 && LAST_OP(i - 1)) {
@@ -2494,7 +2494,7 @@ static int scan_for_esp_adjust(int i, int opcnt, int *adj,
   for (; i < opcnt; i++) {
     po = &ops[i];
 
-    if (g_labels[i][0] != 0)
+    if (g_labels[i] != NULL)
       *multipath = 1;
 
     if (po->op == OP_ADD && po->operand[0].reg == xSP) {
@@ -2641,7 +2641,7 @@ static void scan_for_call_type(int i, const struct parsed_opr *opr,
   ops[i].cc_scratch = magic;
 
   while (1) {
-    if (g_labels[i][0] != 0) {
+    if (g_labels[i] != NULL) {
       lr = &g_label_refs[i];
       for (; lr != NULL; lr = lr->next) {
         check_i(&ops[i], lr->i);
@@ -2754,7 +2754,7 @@ static int resolve_origin(int i, const struct parsed_opr *opr,
   ops[i].cc_scratch = magic;
 
   while (1) {
-    if (g_labels[i][0] != 0) {
+    if (g_labels[i] != NULL) {
       lr = &g_label_refs[i];
       for (; lr != NULL; lr = lr->next) {
         check_i(&ops[i], lr->i);
@@ -2850,7 +2850,7 @@ static int collect_call_args_r(struct parsed_op *po, int i,
     }
     ops[j].cc_scratch = magic;
 
-    if (g_labels[j][0] != 0 && g_label_refs[j].i != -1) {
+    if (g_labels[j] != NULL && g_label_refs[j].i != -1) {
       lr = &g_label_refs[j];
       if (lr->next != NULL)
         need_op_saving = 1;
@@ -3171,7 +3171,7 @@ static struct parsed_data *try_resolve_jumptab(int i, int opcnt)
   // find all labels, link
   for (j = 0; j < pd->count; j++) {
     for (l = 0; l < opcnt; l++) {
-      if (g_labels[l][0] && IS(g_labels[l], pd->d[j].u.label)) {
+      if (g_labels[l] != NULL && IS(g_labels[l], pd->d[j].u.label)) {
         add_label_ref(&g_label_refs[l], i);
         pd->d[j].bt_i = l;
         break;
@@ -3180,6 +3180,18 @@ static struct parsed_data *try_resolve_jumptab(int i, int opcnt)
   }
 
   return pd;
+}
+
+static void clear_labels(int count)
+{
+  int i;
+
+  for (i = 0; i < count; i++) {
+    if (g_labels[i] != NULL) {
+      free(g_labels[i]);
+      g_labels[i] = NULL;
+    }
+  }
 }
 
 static void output_std_flags(FILE *fout, struct parsed_op *po,
@@ -3484,7 +3496,9 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
     }
 
     for (l = 0; l < opcnt; l++) {
-      if (g_labels[l][0] && IS(po->operand[0].name, g_labels[l])) {
+      if (g_labels[l] != NULL
+          && IS(po->operand[0].name, g_labels[l]))
+      {
         if (l == i + 1 && po->op == OP_JMP) {
           // yet another alignment type..
           po->flags |= OPF_RMD;
@@ -3518,8 +3532,10 @@ tailcall:
   // - process calls
   for (i = 0; i < opcnt; i++)
   {
-    if (g_labels[i][0] != 0 && g_label_refs[i].i == -1)
-      g_labels[i][0] = 0;
+    if (g_labels[i] != NULL && g_label_refs[i].i == -1) {
+      free(g_labels[i]);
+      g_labels[i] = NULL;
+    }
 
     po = &ops[i];
     if (po->flags & OPF_RMD)
@@ -3688,7 +3704,7 @@ tailcall:
       else if (po->operand[0].type == OPT_CONST) {
         for (j = i + 1; j < opcnt; j++) {
           if ((ops[j].flags & (OPF_JMP|OPF_TAIL|OPF_RSAVE))
-            || ops[j].op == OP_PUSH || g_labels[i][0] != 0)
+            || ops[j].op == OP_PUSH || g_labels[i] != NULL)
           {
             break;
           }
@@ -4147,7 +4163,7 @@ tailcall:
   // output ops
   for (i = 0; i < opcnt; i++)
   {
-    if (g_labels[i][0] != 0) {
+    if (g_labels[i] != NULL) {
       fprintf(fout, "\n%s:\n", g_labels[i]);
       label_pending = 1;
 
@@ -5297,7 +5313,9 @@ static void gen_hdr(const char *funcn, int opcnt)
     }
 
     for (l = 0; l < opcnt; l++) {
-      if (g_labels[l][0] && IS(po->operand[0].name, g_labels[l])) {
+      if (g_labels[l] != NULL
+          && IS(po->operand[0].name, g_labels[l]))
+      {
         add_label_ref(&g_label_refs[l], i);
         po->bt_i = l;
         break;
@@ -5325,8 +5343,10 @@ tailcall:
   // - remove dead labels
   for (i = 0; i < opcnt; i++)
   {
-    if (g_labels[i][0] != 0 && g_label_refs[i].i == -1)
-      g_labels[i][0] = 0;
+    if (g_labels[i] != NULL && g_label_refs[i].i == -1) {
+      free(g_labels[i]);
+      g_labels[i] = NULL;
+    }
   }
 
   // pass3:
@@ -5365,7 +5385,7 @@ tailcall:
     else if (po->op == OP_PUSH && po->operand[0].type == OPT_CONST) {
       for (j = i + 1; j < opcnt; j++) {
         if ((ops[j].flags & (OPF_JMP|OPF_TAIL|OPF_RSAVE))
-          || ops[j].op == OP_PUSH || g_labels[i][0] != 0)
+          || ops[j].op == OP_PUSH || g_labels[i] != NULL)
         {
           break;
         }
@@ -5568,10 +5588,10 @@ static void set_label(int i, const char *name)
   if (p != NULL)
     len = p - name;
 
-  if (len > sizeof(g_labels[0]) - 1)
-    aerr("label '%s' too long: %d\n", name, len);
-  if (g_labels[i][0] != 0 && !IS_START(g_labels[i], "algn_"))
+  if (g_labels[i] != NULL && !IS_START(g_labels[i], "algn_"))
     aerr("dupe label '%s' vs '%s'?\n", name, g_labels[i]);
+  g_labels[i] = realloc(g_labels[i], len + 1);
+  my_assert_not(g_labels[i], NULL);
   memcpy(g_labels[i], name, len);
   g_labels[i][len] = 0;
 }
@@ -6049,7 +6069,7 @@ do_pending_endp:
       func_chunk_i = -1;
       if (pi != 0) {
         memset(&ops, 0, pi * sizeof(ops[0]));
-        memset(g_labels, 0, pi * sizeof(g_labels[0]));
+        clear_labels(pi);
         pi = 0;
       }
       g_eqcnt = 0;
@@ -6159,12 +6179,13 @@ do_pending_endp:
     }
 
     if (!in_func || skip_func) {
-      if (!skip_warned && !skip_func && g_labels[pi][0] != 0) {
+      if (!skip_warned && !skip_func && g_labels[pi] != NULL) {
         if (verbose)
           anote("skipping from '%s'\n", g_labels[pi]);
         skip_warned = 1;
       }
-      g_labels[pi][0] = 0;
+      free(g_labels[pi]);
+      g_labels[pi] = NULL;
       continue;
     }
 
