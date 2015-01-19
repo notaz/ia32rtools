@@ -193,10 +193,27 @@ static void my_rename(ea_t ea, char *name)
   rebuild_name_cache();
 }
 
+static void make_align(ea_t ea)
+{
+  ea_t tmp_ea;
+  int n;
+
+  tmp_ea = next_head(ea, inf.maxEA);
+  if ((tmp_ea & 0x03) == 0) {
+    n = calc_max_align(tmp_ea);
+    if (n > 4) // masm doesn't like more..
+      n = 4;
+    msg("%x: align %d\n", ea, 1 << n);
+    do_unknown(ea, DOUNK_SIMPLE);
+    doAlign(ea, tmp_ea - ea, n);
+  }
+}
+
 static void idaapi run(int /*arg*/)
 {
   // isEnabled(ea) // address belongs to disassembly
   // ea_t ea = get_screen_ea();
+  // extern foo;
   // foo = DecodeInstruction(ScreenEA());
   FILE *fout = NULL;
   int fout_line = 0;
@@ -344,15 +361,8 @@ static void idaapi run(int /*arg*/)
           && cmd.Operands[1].type == o_displ
           && cmd.Operands[1].addr == 0)
         {
-          tmp_ea = next_head(ea, inf.maxEA);
-          if ((tmp_ea & 0x03) == 0) {
-            n = calc_max_align(tmp_ea);
-            if (n > 4) // masm doesn't like more..
-              n = 4;
-            msg("%x: align %d\n", ea, 1 << n);
-            do_unknown(ea, DOUNK_SIMPLE);
-            doAlign(ea, tmp_ea - ea, n);
-          }
+          // lea eax, [eax+0]
+          make_align(ea);
         }
         else if (!isDefArg1(ea_flags)
           && cmd.Operands[1].type == o_mem // why o_mem?
@@ -372,6 +382,15 @@ static void idaapi run(int /*arg*/)
             op_hex(ea, 1);
           }
         }
+      }
+      else if (cmd.itype == NN_mov && cmd.segpref == 0x1e // 2e?
+        && cmd.Operands[0].type == o_reg
+        && cmd.Operands[1].type == o_reg
+        && cmd.Operands[0].dtyp == cmd.Operands[1].dtyp
+        && cmd.Operands[0].reg == cmd.Operands[1].reg)
+      {
+        // db 2Eh; mov eax, eax
+        make_align(ea);
       }
 
       // find non-local branches
