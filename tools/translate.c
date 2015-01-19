@@ -1,6 +1,6 @@
 /*
  * ia32rtools
- * (C) notaz, 2013,2014
+ * (C) notaz, 2013-2015
  *
  * This work is licensed under the terms of 3-clause BSD license.
  * See COPYING file in the top-level directory.
@@ -111,6 +111,8 @@ enum op_op {
 	// x87
 	// mmx
 	OP_EMMS,
+	// mmx
+	OP_UD2,
 };
 
 enum opr_type {
@@ -173,8 +175,8 @@ struct parsed_op {
 
 // datap:
 // OP_CALL - parser proto hint (str)
-// (OPF_CC) - point to one of (OPF_FLAGS) that affects cc op
-// OP_POP - point to OP_PUSH in push/pop pair
+// (OPF_CC) - points to one of (OPF_FLAGS) that affects cc op
+// OP_POP - points to OP_PUSH in push/pop pair
 
 struct parsed_equ {
   char name[64];
@@ -939,6 +941,8 @@ static const struct {
   // mmx
   { "emms",   OP_EMMS, 0, 0, OPF_DATA },
   { "movq",   OP_MOV,  2, 2, OPF_DATA },
+  // must be last
+  { "ud2",    OP_UD2 },
 };
 
 static void parse_op(struct parsed_op *op, char words[16][256], int wordc)
@@ -971,8 +975,10 @@ static void parse_op(struct parsed_op *op, char words[16][256], int wordc)
       break;
   }
 
-  if (i == ARRAY_SIZE(op_table))
-    aerr("unhandled op: '%s'\n", words[0]);
+  if (i == ARRAY_SIZE(op_table)) {
+    anote("unhandled op: '%s'\n", words[0]);
+    i--; // OP_UD2
+  }
   w++;
 
   op->op = op_table[i].op;
@@ -981,6 +987,9 @@ static void parse_op(struct parsed_op *op, char words[16][256], int wordc)
   op->pfo_inv = op_table[i].pfo_inv;
   op->regmask_src = op->regmask_dst = 0;
   op->asmln = asmln;
+
+  if (op->op == OP_UD2)
+    return;
 
   for (opr = 0; opr < op_table[i].maxopr; opr++) {
     if (opr >= op_table[i].minopr && w >= wordc)
