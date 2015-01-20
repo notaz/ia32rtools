@@ -5328,6 +5328,13 @@ struct func_proto_dep {
 static struct func_prototype *hg_fp;
 static int hg_fp_cnt;
 
+static struct scanned_var {
+  char name[NAMELEN];
+  enum opr_lenmod lmod;
+  unsigned int is_seeded:1;
+} *hg_vars;
+static int hg_var_cnt;
+
 static void output_hdr_fp(FILE *fout, const struct func_prototype *fp,
   int count);
 
@@ -5755,6 +5762,14 @@ static void output_hdr_fp(FILE *fout, const struct func_prototype *fp,
 
 static void output_hdr(FILE *fout)
 {
+  static const char *lmod_c_names[] = {
+    [OPLM_UNSPEC] = "???",
+    [OPLM_BYTE]  = "uint8_t",
+    [OPLM_WORD]  = "uint16_t",
+    [OPLM_DWORD] = "uint32_t",
+    [OPLM_QWORD] = "uint64_t",
+  };
+  const struct scanned_var *var;
   int i;
 
   // resolve deps
@@ -5765,25 +5780,46 @@ static void output_hdr(FILE *fout)
   // note: messes up .proto ptr, don't use
   //qsort(hg_fp, hg_fp_cnt, sizeof(hg_fp[0]), hg_fp_cmp_id);
 
+  // output variables
+  for (i = 0; i < hg_var_cnt; i++) {
+    var = &hg_vars[i];
+
+    fprintf(fout, "extern %-8s %s;",
+      lmod_c_names[var->lmod], var->name);
+
+    if (var->is_seeded)
+      fprintf(fout, " // seeded");
+    fprintf(fout, "\n");
+  }
+
+  fprintf(fout, "\n");
+
+  // output function prototypes
   output_hdr_fp(fout, hg_fp, hg_fp_cnt);
 }
 
-static void set_label(int i, const char *name)
+// read a line, truncating it if it doesn't fit
+static char *my_fgets(char *s, size_t size, FILE *stream)
 {
-  const char *p;
-  int len;
+  char *ret, *ret2;
+  char buf[64];
+  int p;
 
-  len = strlen(name);
-  p = strchr(name, ':');
-  if (p != NULL)
-    len = p - name;
+  p = size - 2;
+  if (p >= 0)
+    s[p] = 0;
 
-  if (g_labels[i] != NULL && !IS_START(g_labels[i], "algn_"))
-    aerr("dupe label '%s' vs '%s'?\n", name, g_labels[i]);
-  g_labels[i] = realloc(g_labels[i], len + 1);
-  my_assert_not(g_labels[i], NULL);
-  memcpy(g_labels[i], name, len);
-  g_labels[i][len] = 0;
+  ret = fgets(s, size, stream);
+  if (ret != NULL && p >= 0 && s[p] != 0 && s[p] != '\n') {
+    p = sizeof(buf) - 2;
+    do {
+      buf[p] = 0;
+      ret2 = fgets(buf, sizeof(buf), stream);
+    }
+    while (ret2 != NULL && buf[p] != 0 && buf[p] != '\n');
+  }
+
+  return ret;
 }
 
 // '=' needs special treatment..
@@ -5804,6 +5840,131 @@ static char *next_word_s(char *w, size_t wsize, char *s)
 		printf("warning: '%s' truncated\n", w);
 
 	return s + i;
+}
+
+static void scan_variables(FILE *fasm)
+{
+  const struct parsed_proto *pp_c;
+  struct scanned_var *var;
+  char line[256] = { 0, };
+  char words[2][256];
+  char *p = NULL;
+  int wordc;
+
+  while (!feof(fasm))
+  {
+    // skip to next data section
+    while (my_fgets(line, sizeof(line), fasm))
+    {
+      asmln++;
+
+      p = sskip(line);
+      if (*p == 0 || *p == ';')
+        continue;
+
+      p = sskip(next_word_s(words[0], sizeof(words[0]), p));
+      if (*p == 0 || *p == ';')
+        continue;
+
+      if (*p != 's' || !IS_START(p, "segment para public"))
+        continue;
+
+      break;
+    }
+
+    if (p == NULL || !IS_START(p, "segment para public"))
+      break;
+    p = sskip(p + 19);
+
+    if (!IS_START(p, "'DATA'"))
+      continue;
+
+    // now process it
+    while (my_fgets(line, sizeof(line), fasm))
+    {
+      asmln++;
+
+      p = line;
+      if (my_isblank(*p))
+        continue;
+
+      p = sskip(p);
+      if (*p == 0 || *p == ';')
+        continue;
+
+      for (wordc = 0; wordc < ARRAY_SIZE(words); wordc++) {
+        words[wordc][0] = 0;
+        p = sskip(next_word_s(words[wordc], sizeof(words[0]), p));
+        if (*p == 0 || *p == ';') {
+          wordc++;
+          break;
+        }
+      }
+
+      if (wordc == 2 && IS(words[1], "ends"))
+        break;
+
+      if ((hg_var_cnt & 0xff) == 0) {
+        hg_vars = realloc(hg_vars, sizeof(hg_vars[0])
+                   * (hg_var_cnt + 0x100));
+        my_assert_not(hg_vars, NULL);
+        memset(hg_vars + hg_var_cnt, 0, sizeof(hg_vars[0]) * 0x100);
+      }
+
+      var = &hg_vars[hg_var_cnt++];
+      snprintf(var->name, sizeof(var->name), "%s", words[0]);
+
+      // maybe already in seed header?
+      pp_c = proto_parse(g_fhdr, var->name, 1);
+      if (pp_c != NULL) {
+        if (pp_c->is_func)
+          aerr("func?\n");
+        else if (pp_c->is_fptr) {
+          var->lmod = OPLM_DWORD;
+          //var->is_ptr = 1;
+        }
+        else if (!guess_lmod_from_c_type(&var->lmod, &pp_c->type))
+          aerr("unhandled C type '%s' for '%s'\n",
+            pp_c->type.name, var->name);
+
+        var->is_seeded = 1;
+        continue;
+      }
+
+      if      (IS(words[1], "dd"))
+        var->lmod = OPLM_DWORD;
+      else if (IS(words[1], "dw"))
+        var->lmod = OPLM_WORD;
+      else if (IS(words[1], "db"))
+        var->lmod = OPLM_BYTE;
+      else if (IS(words[1], "dq"))
+        var->lmod = OPLM_QWORD;
+      //else if (IS(words[1], "dt"))
+      else
+        aerr("type '%s' not known\n", words[1]);
+    }
+  }
+
+  rewind(fasm);
+  asmln = 0;
+}
+
+static void set_label(int i, const char *name)
+{
+  const char *p;
+  int len;
+
+  len = strlen(name);
+  p = strchr(name, ':');
+  if (p != NULL)
+    len = p - name;
+
+  if (g_labels[i] != NULL && !IS_START(g_labels[i], "algn_"))
+    aerr("dupe label '%s' vs '%s'?\n", name, g_labels[i]);
+  g_labels[i] = realloc(g_labels[i], len + 1);
+  my_assert_not(g_labels[i], NULL);
+  memcpy(g_labels[i], name, len);
+  g_labels[i][len] = 0;
 }
 
 struct chunk_item {
@@ -5854,7 +6015,7 @@ static void scan_ahead(FILE *fasm)
   oldpos = ftell(fasm);
   oldasmln = asmln;
 
-  while (fgets(line, sizeof(line), fasm))
+  while (my_fgets(line, sizeof(line), fasm))
   {
     wordc = 0;
     asmln++;
@@ -5982,7 +6143,7 @@ int main(int argc, char *argv[])
     frlist = fopen(argv[arg], "r");
     my_assert_not(frlist, NULL);
 
-    while (fgets(line, sizeof(line), frlist)) {
+    while (my_fgets(line, sizeof(line), frlist)) {
       p = sskip(line);
       if (*p == 0 || *p == ';')
         continue;
@@ -6031,7 +6192,10 @@ int main(int argc, char *argv[])
     g_label_refs[i].next = NULL;
   }
 
-  while (fgets(line, sizeof(line), fasm))
+  if (g_header_mode)
+    scan_variables(fasm);
+
+  while (my_fgets(line, sizeof(line), fasm))
   {
     wordc = 0;
     asmln++;
@@ -6348,7 +6512,7 @@ do_pending_endp:
       }
 
       // scan for next text segment
-      while (fgets(line, sizeof(line), fasm)) {
+      while (my_fgets(line, sizeof(line), fasm)) {
         asmln++;
         p = sskip(line);
         if (*p == 0 || *p == ';')
