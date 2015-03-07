@@ -56,6 +56,7 @@ enum op_flags {
   OPF_32BIT  = (1 << 16), /* 32bit division */
   OPF_LOCK   = (1 << 17), /* op has lock prefix */
   OPF_VAPUSH = (1 << 18), /* vararg ptr push (as call arg) */
+  OPF_DONE   = (1 << 19), /* already fully handled by analysis */
 };
 
 enum op_op {
@@ -246,6 +247,11 @@ static int g_header_mode;
 #define fnote(op_, fmt, ...) \
   printf("%s:%d: note: [%s] '%s': " fmt, asmfn, (op_)->asmln, g_func, \
     dump_op(op_), ##__VA_ARGS__)
+
+#define ferr_assert(op_, cond) do { \
+  if (!(cond)) ferr(op_, "assertion '%s' failed on ln :%d\n", #cond, \
+                    __LINE__); \
+} while (0)
 
 const char *regs_r32[] = {
   "eax", "ebx", "ecx", "edx", "esi", "edi", "ebp", "esp",
@@ -2543,6 +2549,8 @@ static int scan_for_esp_adjust(int i, int opcnt,
       *adj -= lmod_bytes(po, po->operand[0].lmod);
     }
     else if (po->op == OP_POP && !(po->flags & OPF_RMD)) {
+      if (po->datap != NULL) // in push/pop pair?
+        break;
       // seems like msvc only uses 'pop ecx' for stack realignment..
       if (po->operand[0].type != OPT_REG || po->operand[0].reg != xCX)
         break;
@@ -3067,13 +3075,45 @@ static int try_resolve_const(int i, const struct parsed_opr *opr,
   return -1;
 }
 
+static struct parsed_proto *process_call_early(int i, int opcnt,
+  int *adj_i)
+{
+  struct parsed_op *po = &ops[i];
+  struct parsed_proto *pp;
+  int multipath = 0;
+  int adj = 0;
+  int ret;
+
+  pp = po->pp;
+  if (pp == NULL || pp->is_vararg || pp->argc_reg != 0)
+    // leave for later
+    return NULL;
+
+  // look for and make use of esp adjust
+  *adj_i = ret = -1;
+  if (!pp->is_stdcall && pp->argc_stack > 0)
+    ret = scan_for_esp_adjust(i + 1, opcnt,
+            pp->argc_stack * 4, &adj, &multipath);
+  if (ret >= 0) {
+    if (pp->argc_stack > adj / 4)
+      return NULL;
+    if (multipath)
+      return NULL;
+    if (ops[ret].op == OP_POP && adj != 4)
+      return NULL;
+  }
+
+  *adj_i = ret;
+  return pp;
+}
+
 static struct parsed_proto *process_call(int i, int opcnt)
 {
   struct parsed_op *po = &ops[i];
   const struct parsed_proto *pp_c;
   struct parsed_proto *pp;
   const char *tmpname;
-  int j = 0, l = 0;
+  int adj = 0, multipath = 0;
   int ret, arg;
 
   tmpname = opr_name(po, 0);
@@ -3081,13 +3121,13 @@ static struct parsed_proto *process_call(int i, int opcnt)
   if (pp == NULL)
   {
     // indirect call
-    pp_c = resolve_icall(i, opcnt, &l);
+    pp_c = resolve_icall(i, opcnt, &multipath);
     if (pp_c != NULL) {
       if (!pp_c->is_func && !pp_c->is_fptr)
         ferr(po, "call to non-func: %s\n", pp_c->name);
       pp = proto_clone(pp_c);
       my_assert_not(pp, NULL);
-      if (l)
+      if (multipath)
         // not resolved just to single func
         pp->is_fptr = 1;
 
@@ -3108,18 +3148,18 @@ static struct parsed_proto *process_call(int i, int opcnt)
       my_assert_not(pp, NULL);
 
       pp->is_fptr = 1;
-      ret = scan_for_esp_adjust(i + 1, opcnt, ~0, &j, &l);
-      if (ret < 0 || j < 0) {
+      ret = scan_for_esp_adjust(i + 1, opcnt, ~0, &adj, &multipath);
+      if (ret < 0 || adj < 0) {
         if (!g_allow_regfunc)
           ferr(po, "non-__cdecl indirect call unhandled yet\n");
         pp->is_unresolved = 1;
-        j = 0;
+        adj = 0;
       }
-      j /= 4;
-      if (j > ARRAY_SIZE(pp->arg))
-        ferr(po, "esp adjust too large: %d\n", j);
+      adj /= 4;
+      if (adj > ARRAY_SIZE(pp->arg))
+        ferr(po, "esp adjust too large: %d\n", adj);
       pp->ret_type.name = strdup("int");
-      pp->argc = pp->argc_stack = j;
+      pp->argc = pp->argc_stack = adj;
       for (arg = 0; arg < pp->argc; arg++)
         pp->arg[arg].type.name = strdup("int");
     }
@@ -3130,15 +3170,17 @@ static struct parsed_proto *process_call(int i, int opcnt)
   ret = -1;
   if (!pp->is_stdcall && pp->argc_stack > 0)
     ret = scan_for_esp_adjust(i + 1, opcnt,
-            pp->argc_stack * 4, &j, &l);
+            pp->argc_stack * 4, &adj, &multipath);
   if (ret >= 0) {
     if (pp->is_vararg) {
-      if (j / 4 < pp->argc_stack)
-        ferr(po, "esp adjust is too small: %x < %x\n",
-          j, pp->argc_stack * 4);
+      if (adj / 4 < pp->argc_stack) {
+        fnote(po, "(this call)\n");
+        ferr(&ops[ret], "esp adjust is too small: %x < %x\n",
+          adj, pp->argc_stack * 4);
+      }
       // modify pp to make it have varargs as normal args
       arg = pp->argc;
-      pp->argc += j / 4 - pp->argc_stack;
+      pp->argc += adj / 4 - pp->argc_stack;
       for (; arg < pp->argc; arg++) {
         pp->arg[arg].type.name = strdup("int");
         pp->argc_stack++;
@@ -3146,28 +3188,28 @@ static struct parsed_proto *process_call(int i, int opcnt)
       if (pp->argc > ARRAY_SIZE(pp->arg))
         ferr(po, "too many args for '%s'\n", tmpname);
     }
-    if (pp->argc_stack > j / 4) {
+    if (pp->argc_stack > adj / 4) {
       fnote(po, "(this call)\n");
       ferr(&ops[ret], "stack tracking failed for '%s': %x %x\n",
-        tmpname, pp->argc_stack * 4, j);
+        tmpname, pp->argc_stack * 4, adj);
     }
 
     ops[ret].flags |= OPF_RMD;
     if (ops[ret].op == OP_POP) {
-      if (j > 4) {
+      if (adj > 4) {
         // deal with multi-pop stack adjust
-        j = pp->argc_stack;
-        while (ops[ret].op == OP_POP && j > 0 && ret < opcnt) {
+        adj = pp->argc_stack;
+        while (ops[ret].op == OP_POP && adj > 0 && ret < opcnt) {
           ops[ret].flags |= OPF_RMD;
-          j--;
+          adj--;
           ret++;
         }
       }
     }
-    else if (!l) {
+    else if (!multipath) {
       // a bit of a hack, but deals with use of
       // single adj for multiple calls
-      ops[ret].operand[1].val -= j;
+      ops[ret].operand[1].val -= pp->argc_stack * 4;
     }
   }
   else if (pp->is_vararg)
@@ -3175,6 +3217,82 @@ static struct parsed_proto *process_call(int i, int opcnt)
       pp->name);
 
   return pp;
+}
+
+static int collect_call_args_early(struct parsed_op *po, int i,
+  struct parsed_proto *pp, int *regmask)
+{
+  int arg, ret;
+  int j;
+
+  for (arg = 0; arg < pp->argc; arg++)
+    if (pp->arg[arg].reg == NULL)
+      break;
+
+  // first see if it can be easily done
+  for (j = i; j > 0 && arg < pp->argc; )
+  {
+    if (g_labels[j] != NULL)
+      return -1;
+    j--;
+
+    if (ops[j].op == OP_CALL)
+      return -1;
+    else if (ops[j].op == OP_ADD && ops[j].operand[0].reg == xSP)
+      return -1;
+    else if (ops[j].op == OP_POP)
+      return -1;
+    else if (ops[j].flags & OPF_CJMP)
+      return -1;
+    else if (ops[j].op == OP_PUSH) {
+      if (ops[j].flags & (OPF_FARG|OPF_FARGNR))
+        return -1;
+      ret = scan_for_mod(&ops[j], j + 1, i, 1);
+      if (ret >= 0)
+        return -1;
+
+      if (pp->arg[arg].type.is_va_list)
+        return -1;
+
+      // next arg
+      for (arg++; arg < pp->argc; arg++)
+        if (pp->arg[arg].reg == NULL)
+          break;
+    }
+  }
+
+  if (arg < pp->argc)
+    return -1;
+
+  // now do it
+  for (arg = 0; arg < pp->argc; arg++)
+    if (pp->arg[arg].reg == NULL)
+      break;
+
+  for (j = i; j > 0 && arg < pp->argc; )
+  {
+    j--;
+
+    if (ops[j].op == OP_PUSH)
+    {
+      ops[j].p_argnext = -1;
+      ferr_assert(&ops[j], pp->arg[arg].datap == NULL);
+      pp->arg[arg].datap = &ops[j];
+
+      if (ops[j].operand[0].type == OPT_REG)
+        *regmask |= 1 << ops[j].operand[0].reg;
+
+      ops[j].flags |= OPF_RMD | OPF_FARGNR | OPF_FARG;
+      ops[j].flags &= ~OPF_RSAVE;
+
+      // next arg
+      for (arg++; arg < pp->argc; arg++)
+        if (pp->arg[arg].reg == NULL)
+          break;
+    }
+  }
+
+  return 0;
 }
 
 static int collect_call_args_r(struct parsed_op *po, int i,
@@ -3742,7 +3860,7 @@ tailcall:
 
   // pass3:
   // - remove dead labels
-  // - process calls
+  // - process trivial calls
   for (i = 0; i < opcnt; i++)
   {
     if (g_labels[i] != NULL && g_label_refs[i].i == -1) {
@@ -3755,6 +3873,42 @@ tailcall:
       continue;
 
     if (po->op == OP_CALL)
+    {
+      pp = process_call_early(i, opcnt, &j);
+      if (pp != NULL) {
+        if (!(po->flags & OPF_ATAIL))
+          // since we know the args, try to collect them
+          if (collect_call_args_early(po, i, pp, &regmask) != 0)
+            pp = NULL;
+      }
+
+      if (pp != NULL) {
+        if (j >= 0) {
+          // commit esp adjust
+          ops[j].flags |= OPF_RMD;
+          if (ops[j].op != OP_POP) {
+            ferr_assert(&ops[j], ops[j].op == OP_ADD);
+            ops[j].operand[1].val -= pp->argc_stack * 4;
+          }
+        }
+
+        if (strstr(pp->ret_type.name, "int64"))
+          need_tmp64 = 1;
+
+        po->flags |= OPF_DONE;
+      }
+    }
+  }
+
+  // pass4:
+  // - process calls
+  for (i = 0; i < opcnt; i++)
+  {
+    po = &ops[i];
+    if (po->flags & OPF_RMD)
+      continue;
+
+    if (po->op == OP_CALL && !(po->flags & OPF_DONE))
     {
       pp = process_call(i, opcnt);
 
@@ -3769,14 +3923,15 @@ tailcall:
     }
   }
 
-  // pass4:
+  // pass5:
   // - find POPs for PUSHes, rm both
   // - scan for STD/CLD, propagate DF
   // - scan for all used registers
   // - find flag set ops for their users
   // - do unreselved calls
   // - declare indirect functions
-  for (i = 0; i < opcnt; i++) {
+  for (i = 0; i < opcnt; i++)
+  {
     po = &ops[i];
     if (po->flags & OPF_RMD)
       continue;
@@ -3915,6 +4070,7 @@ tailcall:
         need_tmp64 = 1;
     }
     else if (po->op == OP_CALL) {
+      // note: resolved non-reg calls are OPF_DONE already
       pp = po->pp;
       if (pp == NULL)
         ferr(po, "NULL pp\n");
@@ -4015,7 +4171,7 @@ tailcall:
     }
   }
 
-  // pass4:
+  // pass6:
   // - confirm regmask_save, it might have been reduced
   if (regmask_save != 0)
   {
@@ -5383,6 +5539,7 @@ static int hg_fp_cmp_id(const void *p1_, const void *p2_)
 
 static void gen_hdr(const char *funcn, int opcnt)
 {
+  int save_arg_vars[MAX_ARG_GRP] = { 0, };
   const struct parsed_proto *pp_c;
   struct parsed_proto *pp;
   struct func_prototype *fp;
@@ -5390,6 +5547,7 @@ static void gen_hdr(const char *funcn, int opcnt)
   struct parsed_data *pd;
   struct parsed_op *po;
   const char *tmpname;
+  int regmask_dummy = 0;
   int regmask_save = 0;
   int regmask_dst = 0;
   int regmask_dep = 0;
@@ -5508,7 +5666,7 @@ tailcall:
 
   // pass3:
   // - remove dead labels
-  // - process calls
+  // - process trivial calls
   // - handle push <const>/pop pairs
   for (i = 0; i < opcnt; i++)
   {
@@ -5521,14 +5679,27 @@ tailcall:
     if (po->flags & OPF_RMD)
       continue;
 
-    if (po->op == OP_CALL) {
-      pp = process_call(i, opcnt);
+    if (po->op == OP_CALL)
+    {
+      pp = process_call_early(i, opcnt, &j);
+      if (pp != NULL) {
+        if (!(po->flags & OPF_ATAIL))
+          // since we know the args, try to collect them
+          if (collect_call_args_early(po, i, pp, &regmask_dummy) != 0)
+            pp = NULL;
+      }
 
-      if (!pp->is_unresolved && !(po->flags & OPF_ATAIL)) {
-        int regmask_dummy = 0, save_arg_vars[MAX_ARG_GRP] = { 0, };
-        // since we know the args, collect them
-        collect_call_args(po, i, pp, &regmask_dummy, save_arg_vars,
-          i + opcnt * 2);
+      if (pp != NULL) {
+        if (j >= 0) {
+          // commit esp adjust
+          ops[j].flags |= OPF_RMD;
+          if (ops[j].op != OP_POP) {
+            ferr_assert(&ops[j], ops[j].op == OP_ADD);
+            ops[j].operand[1].val -= pp->argc_stack * 4;
+          }
+        }
+
+        po->flags |= OPF_DONE;
       }
     }
     else if (po->op == OP_PUSH && po->operand[0].type == OPT_CONST) {
@@ -5537,6 +5708,26 @@ tailcall:
   }
 
   // pass4:
+  // - process calls
+  for (i = 0; i < opcnt; i++)
+  {
+    po = &ops[i];
+    if (po->flags & OPF_RMD)
+      continue;
+
+    if (po->op == OP_CALL && !(po->flags & OPF_DONE))
+    {
+      pp = process_call(i, opcnt);
+
+      if (!pp->is_unresolved && !(po->flags & OPF_ATAIL)) {
+        // since we know the args, collect them
+        collect_call_args(po, i, pp, &regmask_dummy, save_arg_vars,
+          i + opcnt * 2);
+      }
+    }
+  }
+
+  // pass5:
   // - track saved regs
   // - try to figure out arg-regs
   for (i = 0; i < opcnt; i++)
@@ -5650,6 +5841,7 @@ tailcall:
 
   fp->regmask_dep = regmask_dep & ~(1 << xSP);
   fp->has_ret = has_ret;
+  // output_hdr_fp(stdout, fp, 1);
 
   gen_x_cleanup(opcnt);
 }
