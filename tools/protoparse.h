@@ -42,7 +42,8 @@ struct parsed_proto {
 	unsigned int is_noreturn:1;
 	unsigned int is_unresolved:1;
 	unsigned int is_userstack:1;
-	unsigned int is_oslib:1;      // OS/system library func
+	unsigned int is_include:1;    // not from top-level header
+	unsigned int is_osinc:1;      // OS/system library func
 	unsigned int is_arg:1;        // declared in some func arg
 	unsigned int has_structarg:1;
 	unsigned int has_retreg:1;
@@ -54,16 +55,17 @@ static int hdrfline = 0;
 static void pp_copy_arg(struct parsed_proto_arg *d,
 	const struct parsed_proto_arg *s);
 
-static int b_pp_c_handler(char *proto, const char *fname, int is_oslib);
+static int b_pp_c_handler(char *proto, const char *fname,
+	int is_include, int is_osinc);
 
-static int do_protostrs(FILE *fhdr, const char *fname)
+static int do_protostrs(FILE *fhdr, const char *fname, int is_include)
 {
 	const char *finc_name;
 	const char *hdrfn_saved;
 	char protostr[256];
 	char path[256];
 	char fname_inc[256];
-	int is_oslib;
+	int is_osinc;
 	FILE *finc;
 	int line = 0;
 	int ret;
@@ -72,7 +74,7 @@ static int do_protostrs(FILE *fhdr, const char *fname)
 	hdrfn_saved = hdrfn;
 	hdrfn = fname;
 
-	is_oslib = strstr(fname, "stdc.hlist")
+	is_osinc = strstr(fname, "stdc.hlist")
 		 || strstr(fname, "win32.hlist");
 
 	while (fgets(protostr, sizeof(protostr), fhdr))
@@ -99,7 +101,7 @@ static int do_protostrs(FILE *fhdr, const char *fname)
 					fname_inc, line, finc_name);
 				continue;
 			}
-			ret = do_protostrs(finc, finc_name);
+			ret = do_protostrs(finc, finc_name, 1);
 			fclose(finc);
 			if (ret < 0)
 				break;
@@ -116,7 +118,8 @@ static int do_protostrs(FILE *fhdr, const char *fname)
 
 		hdrfline = line;
 
-		ret = b_pp_c_handler(protostr, hdrfn, is_oslib);
+		ret = b_pp_c_handler(protostr, hdrfn, is_include,
+			is_osinc);
 		if (ret < 0)
 			break;
 	}
@@ -661,7 +664,8 @@ static struct parsed_proto *pp_cache;
 static int pp_cache_size;
 static int pp_cache_alloc;
 
-static int b_pp_c_handler(char *proto, const char *fname, int is_oslib)
+static int b_pp_c_handler(char *proto, const char *fname,
+	int is_include, int is_osinc)
 {
 	int ret;
 
@@ -679,7 +683,8 @@ static int b_pp_c_handler(char *proto, const char *fname, int is_oslib)
 	if (ret < 0)
 		return -1;
 
-	pp_cache[pp_cache_size].is_oslib = is_oslib;
+	pp_cache[pp_cache_size].is_include = is_include;
+	pp_cache[pp_cache_size].is_osinc = is_osinc;
 	pp_cache_size++;
 	return 0;
 }
@@ -692,7 +697,7 @@ static void build_pp_cache(FILE *fhdr)
 	pos = ftell(fhdr);
 	rewind(fhdr);
 
-	ret = do_protostrs(fhdr, hdrfn);
+	ret = do_protostrs(fhdr, hdrfn, 0);
 	if (ret < 0)
 		exit(1);
 

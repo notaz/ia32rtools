@@ -1720,7 +1720,7 @@ static void check_func_pp(struct parsed_op *po,
   // fptrs must use 32bit args, callsite might have no information and
   // lack a cast to smaller types, which results in incorrectly masked
   // args passed (callee may assume masked args, it does on ARM)
-  if (!pp->is_oslib) {
+  if (!pp->is_osinc) {
     for (i = 0; i < pp->argc; i++) {
       ret = guess_lmod_from_c_type(&tmp_lmod, &pp->arg[i].type);
       if (ret && tmp_lmod != OPLM_DWORD)
@@ -5488,6 +5488,7 @@ static struct scanned_var {
   char name[NAMELEN];
   enum opr_lenmod lmod;
   unsigned int is_seeded:1;
+  unsigned int is_c_str:1;
 } *hg_vars;
 static int hg_var_cnt;
 
@@ -5874,8 +5875,9 @@ static void hg_fp_resolve_deps(struct func_prototype *fp)
 static void output_hdr_fp(FILE *fout, const struct func_prototype *fp,
   int count)
 {
-  char *p, buf[NAMELEN];
-  const char *cp;
+  const struct parsed_proto *pp;
+  char *p, namebuf[NAMELEN];
+  const char *name;
   int regmask_dep;
   int argc_stack;
   int j, arg;
@@ -5893,6 +5895,21 @@ static void output_hdr_fp(FILE *fout, const struct func_prototype *fp,
     }
     fprintf(fout, "\n");
 #endif
+
+    p = strchr(fp->name, '@');
+    if (p != NULL) {
+      memcpy(namebuf, fp->name, p - fp->name);
+      namebuf[p - fp->name] = 0;
+      name = namebuf;
+    }
+    else
+      name = fp->name;
+    if (name[0] == '_')
+      name++;
+
+    pp = proto_parse(g_fhdr, name, 1);
+    if (pp != NULL && pp->is_include)
+      continue;
 
     regmask_dep = fp->regmask_dep;
     argc_stack = fp->argc_stack;
@@ -5919,17 +5936,7 @@ static void output_hdr_fp(FILE *fout, const struct func_prototype *fp,
     else
       fprintf(fout, "  __cdecl       ");
 
-    p = strchr(fp->name, '@');
-    if (p != NULL) {
-      memcpy(buf, fp->name, p - fp->name);
-      buf[p - fp->name] = 0;
-      cp = buf;
-    }
-    else
-      cp = fp->name;
-    if (cp[0] == '_')
-      cp++;
-    fprintf(fout, "%s(", cp);
+    fprintf(fout, "%s(", name);
 
     arg = 0;
     for (j = 0; j < xSP; j++) {
@@ -5976,8 +5983,11 @@ static void output_hdr(FILE *fout)
   for (i = 0; i < hg_var_cnt; i++) {
     var = &hg_vars[i];
 
-    fprintf(fout, "extern %-8s %s;",
-      lmod_c_names[var->lmod], var->name);
+    if (var->is_c_str)
+      fprintf(fout, "extern %-8s %s[];", "char", var->name);
+    else
+      fprintf(fout, "extern %-8s %s;",
+        lmod_c_names[var->lmod], var->name);
 
     if (var->is_seeded)
       fprintf(fout, " // seeded");
@@ -6014,24 +6024,39 @@ static char *my_fgets(char *s, size_t size, FILE *stream)
   return ret;
 }
 
-// '=' needs special treatment..
+// '=' needs special treatment
+// also ' quote
 static char *next_word_s(char *w, size_t wsize, char *s)
 {
-	size_t i;
+  size_t i;
 
-	s = sskip(s);
+  s = sskip(s);
 
-	for (i = 0; i < wsize - 1; i++) {
-		if (s[i] == 0 || my_isblank(s[i]) || (s[i] == '=' && i > 0))
-			break;
-		w[i] = s[i];
-	}
-	w[i] = 0;
+  i = 0;
+  if (*s == '\'') {
+    w[0] = s[0];
+    for (i = 1; i < wsize - 1; i++) {
+      if (s[i] == 0) {
+        printf("warning: missing closing quote: \"%s\"\n", s);
+        break;
+      }
+      if (s[i] == '\'')
+        break;
+      w[i] = s[i];
+    }
+  }
 
-	if (s[i] != 0 && !my_isblank(s[i]) && s[i] != '=')
-		printf("warning: '%s' truncated\n", w);
+  for (; i < wsize - 1; i++) {
+    if (s[i] == 0 || my_isblank(s[i]) || (s[i] == '=' && i > 0))
+      break;
+    w[i] = s[i];
+  }
+  w[i] = 0;
 
-	return s + i;
+  if (s[i] != 0 && !my_isblank(s[i]) && s[i] != '=')
+    printf("warning: '%s' truncated\n", w);
+
+  return s + i;
 }
 
 static void scan_variables(FILE *fasm)
@@ -6039,9 +6064,10 @@ static void scan_variables(FILE *fasm)
   const struct parsed_proto *pp_c;
   struct scanned_var *var;
   char line[256] = { 0, };
-  char words[2][256];
+  char words[3][256];
   char *p = NULL;
   int wordc;
+  int l;
 
   while (!feof(fasm))
   {
@@ -6095,6 +6121,8 @@ static void scan_variables(FILE *fasm)
 
       if (wordc == 2 && IS(words[1], "ends"))
         break;
+      if (wordc < 2)
+        continue;
 
       if ((hg_var_cnt & 0xff) == 0) {
         hg_vars = realloc(hg_vars, sizeof(hg_vars[0])
@@ -6127,8 +6155,13 @@ static void scan_variables(FILE *fasm)
         var->lmod = OPLM_DWORD;
       else if (IS(words[1], "dw"))
         var->lmod = OPLM_WORD;
-      else if (IS(words[1], "db"))
+      else if (IS(words[1], "db")) {
         var->lmod = OPLM_BYTE;
+        if (wordc >= 3 && (l = strlen(words[2])) > 4) {
+          if (words[2][0] == '\'' && IS(words[2] + l - 2, ",0"))
+            var->is_c_str = 1;
+        }
+      }
       else if (IS(words[1], "dq"))
         var->lmod = OPLM_QWORD;
       //else if (IS(words[1], "dt"))
