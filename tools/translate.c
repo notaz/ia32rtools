@@ -37,7 +37,7 @@ static FILE *g_fhdr;
 #include "masm_tools.h"
 
 enum op_flags {
-  OPF_RMD    = (1 << 0), /* removed or optimized out */
+  OPF_RMD    = (1 << 0), /* removed from code generation */
   OPF_DATA   = (1 << 1), /* data processing - writes to dst opr */
   OPF_FLAGS  = (1 << 2), /* sets flags */
   OPF_JMP    = (1 << 3), /* branch, call */
@@ -1174,7 +1174,7 @@ static void parse_op(struct parsed_op *op, char words[16][256], int wordc)
      && op->operand[0].reg == op->operand[1].reg
      && IS(op->operand[0].name, op->operand[1].name)) // ! ah, al..
     {
-      op->flags |= OPF_RMD;
+      op->flags |= OPF_RMD | OPF_DONE;
       op->regmask_src = op->regmask_dst = 0;
     }
     break;
@@ -1186,7 +1186,7 @@ static void parse_op(struct parsed_op *op, char words[16][256], int wordc)
       char buf[16];
       snprintf(buf, sizeof(buf), "%s+0", op->operand[0].name);
       if (IS(buf, op->operand[1].name))
-        op->flags |= OPF_RMD;
+        op->flags |= OPF_RMD | OPF_DONE;
     }
     break;
 
@@ -2161,7 +2161,7 @@ static int scan_for_pop(int i, int opcnt, const char *reg,
       return -1; // deadend
     }
 
-    if ((po->flags & OPF_RMD)
+    if ((po->flags & (OPF_RMD|OPF_DONE))
         || (po->op == OP_PUSH && po->p_argnum != 0)) // arg push
       continue;
 
@@ -2237,12 +2237,13 @@ static int scan_for_pop_ret(int i, int opcnt, const char *reg,
       continue;
 
     for (j = i - 1; j >= 0; j--) {
-      if (ops[j].flags & OPF_RMD)
+      if (ops[j].flags & (OPF_RMD|OPF_DONE))
         continue;
       if (ops[j].flags & OPF_JMP)
         return -1;
 
-      if (ops[j].op == OP_POP && ops[j].operand[0].type == OPT_REG
+      if (ops[j].op == OP_POP && ops[j].datap == NULL
+          && ops[j].operand[0].type == OPT_REG
           && IS(ops[j].operand[0].name, reg))
       {
         found = 1;
@@ -2258,7 +2259,6 @@ static int scan_for_pop_ret(int i, int opcnt, const char *reg,
   return found ? 0 : -1;
 }
 
-// XXX: merge with scan_for_pop?
 static void scan_for_pop_const(int i, int opcnt)
 {
   int j;
@@ -2270,9 +2270,10 @@ static void scan_for_pop_const(int i, int opcnt)
       break;
     }
 
-    if (!(ops[j].flags & OPF_RMD) && ops[j].op == OP_POP)
+    if (ops[j].op == OP_POP && !(ops[j].flags & (OPF_RMD|OPF_DONE)))
     {
-      ops[i].flags |= OPF_RMD;
+      ops[i].flags |= OPF_RMD | OPF_DONE;
+      ops[j].flags |= OPF_DONE;
       ops[j].datap = &ops[i];
       break;
     }
@@ -2317,7 +2318,7 @@ static void scan_propagate_df(int i, int opcnt)
       break;
 
     if (po->op == OP_CLD) {
-      po->flags |= OPF_RMD;
+      po->flags |= OPF_RMD | OPF_DONE;
       return;
     }
   }
@@ -2530,10 +2531,12 @@ static int scan_for_esp_adjust(int i, int opcnt,
   *adj = *multipath = 0;
 
   for (; i < opcnt && *adj < adj_expect; i++) {
-    po = &ops[i];
-
     if (g_labels[i] != NULL)
       *multipath = 1;
+
+    po = &ops[i];
+    if (po->flags & OPF_DONE)
+      continue;
 
     if (po->op == OP_ADD && po->operand[0].reg == xSP) {
       if (po->operand[1].type != OPT_CONST)
@@ -2543,14 +2546,12 @@ static int scan_for_esp_adjust(int i, int opcnt,
         ferr(&ops[i], "unaligned esp adjust: %x\n", *adj);
       return i;
     }
-    else if (po->op == OP_PUSH && !(po->flags & OPF_RMD)) {
+    else if (po->op == OP_PUSH) {
       //if (first_pop == -1)
       //  first_pop = -2; // none
       *adj -= lmod_bytes(po, po->operand[0].lmod);
     }
-    else if (po->op == OP_POP && !(po->flags & OPF_RMD)) {
-      if (po->datap != NULL) // in push/pop pair?
-        break;
+    else if (po->op == OP_POP) {
       // seems like msvc only uses 'pop ecx' for stack realignment..
       if (po->operand[0].type != OPT_REG || po->operand[0].reg != xCX)
         break;
@@ -2560,6 +2561,8 @@ static int scan_for_esp_adjust(int i, int opcnt,
     }
     else if (po->flags & (OPF_JMP|OPF_TAIL)) {
       if (po->op == OP_JMP && po->btj == NULL) {
+        if (po->bt_i <= i)
+          break;
         i = po->bt_i - 1;
         continue;
       }
@@ -2567,7 +2570,7 @@ static int scan_for_esp_adjust(int i, int opcnt,
         break;
       if (po->operand[0].type != OPT_LABEL)
         break;
-      if (po->pp != NULL && po->pp->is_stdcall)
+      if (po->pp == NULL || po->pp->is_stdcall)
         break;
     }
   }
@@ -2788,13 +2791,13 @@ static void scan_prologue_epilogue(int opcnt)
       && IS(opr_name(&ops[1], 1), "esp"))
   {
     g_bp_frame = 1;
-    ops[0].flags |= OPF_RMD;
-    ops[1].flags |= OPF_RMD;
+    ops[0].flags |= OPF_RMD | OPF_DONE;
+    ops[1].flags |= OPF_RMD | OPF_DONE;
     i = 2;
 
     if (ops[2].op == OP_SUB && IS(opr_name(&ops[2], 0), "esp")) {
       g_stack_fsz = opr_const(&ops[2], 1);
-      ops[2].flags |= OPF_RMD;
+      ops[2].flags |= OPF_RMD | OPF_DONE;
       i++;
     }
     else {
@@ -2802,7 +2805,7 @@ static void scan_prologue_epilogue(int opcnt)
       i = 2;
       while (ops[i].op == OP_PUSH && IS(opr_name(&ops[i], 0), "ecx")) {
         g_stack_fsz += 4;
-        ops[i].flags |= OPF_RMD;
+        ops[i].flags |= OPF_RMD | OPF_DONE;
         ecx_push++;
         i++;
       }
@@ -2813,9 +2816,9 @@ static void scan_prologue_epilogue(int opcnt)
           && IS(opr_name(&ops[i + 1], 0), "__alloca_probe"))
       {
         g_stack_fsz += ops[i].operand[1].val;
-        ops[i].flags |= OPF_RMD;
+        ops[i].flags |= OPF_RMD | OPF_DONE;
         i++;
-        ops[i].flags |= OPF_RMD;
+        ops[i].flags |= OPF_RMD | OPF_DONE;
         i++;
       }
     }
@@ -2835,7 +2838,7 @@ static void scan_prologue_epilogue(int opcnt)
       if ((ops[j].op == OP_POP && IS(opr_name(&ops[j], 0), "ebp"))
           || ops[j].op == OP_LEAVE)
       {
-        ops[j].flags |= OPF_RMD;
+        ops[j].flags |= OPF_RMD | OPF_DONE;
       }
       else if (!(g_ida_func_attr & IDAFA_NORETURN))
         ferr(&ops[j], "'pop ebp' expected\n");
@@ -2845,7 +2848,7 @@ static void scan_prologue_epilogue(int opcnt)
             && IS(opr_name(&ops[j - 1], 0), "esp")
             && IS(opr_name(&ops[j - 1], 1), "ebp"))
         {
-          ops[j - 1].flags |= OPF_RMD;
+          ops[j - 1].flags |= OPF_RMD | OPF_DONE;
         }
         else if (ops[j].op != OP_LEAVE
           && !(g_ida_func_attr & IDAFA_NORETURN))
@@ -2870,7 +2873,7 @@ static void scan_prologue_epilogue(int opcnt)
   // non-bp frame
   i = 0;
   while (ops[i].op == OP_PUSH && IS(opr_name(&ops[i], 0), "ecx")) {
-    ops[i].flags |= OPF_RMD;
+    ops[i].flags |= OPF_RMD | OPF_DONE;
     g_stack_fsz += 4;
     ecx_push++;
     i++;
@@ -2883,7 +2886,7 @@ static void scan_prologue_epilogue(int opcnt)
       && ops[i].operand[1].type == OPT_CONST)
     {
       g_stack_fsz = ops[i].operand[1].val;
-      ops[i].flags |= OPF_RMD;
+      ops[i].flags |= OPF_RMD | OPF_DONE;
       esp_sub = 1;
       break;
     }
@@ -2902,7 +2905,7 @@ static void scan_prologue_epilogue(int opcnt)
       while (i > 0 && j > 0) {
         i--;
         if (ops[i].op == OP_PUSH) {
-          ops[i].flags &= ~OPF_RMD;
+          ops[i].flags &= ~(OPF_RMD | OPF_DONE);
           j--;
         }
       }
@@ -2947,12 +2950,12 @@ static void scan_prologue_epilogue(int opcnt)
                    && ops[j].operand[1].type == OPT_CONST)
           {
             /* add esp, N */
-            ecx_push -= ops[j].operand[1].val / 4 - 1;
+            l += ops[j].operand[1].val / 4 - 1;
           }
           else
             ferr(&ops[j], "'pop ecx' expected\n");
 
-          ops[j].flags |= OPF_RMD;
+          ops[j].flags |= OPF_RMD | OPF_DONE;
           j--;
         }
         if (l != ecx_push)
@@ -2968,7 +2971,7 @@ static void scan_prologue_epilogue(int opcnt)
             || ops[j].operand[1].val != g_stack_fsz)
           ferr(&ops[j], "'add esp' expected\n");
 
-        ops[j].flags |= OPF_RMD;
+        ops[j].flags |= OPF_RMD | OPF_DONE;
         ops[j].operand[1].val = 0; // hack for stack arg scanner
         found = 1;
       }
@@ -3107,6 +3110,21 @@ static struct parsed_proto *process_call_early(int i, int opcnt,
   return pp;
 }
 
+static void patch_esp_adjust(struct parsed_op *po, int adj)
+{
+  ferr_assert(po, po->op == OP_ADD);
+  ferr_assert(po, IS(opr_name(po, 0), "esp"));
+  ferr_assert(po, po->operand[1].type == OPT_CONST);
+
+  // this is a bit of a hack, but deals with use of
+  // single adj for multiple calls
+  po->operand[1].val -= adj;
+  po->flags |= OPF_RMD;
+  if (po->operand[1].val == 0)
+    po->flags |= OPF_DONE;
+  ferr_assert(po, (int)po->operand[1].val >= 0);
+}
+
 static struct parsed_proto *process_call(int i, int opcnt)
 {
   struct parsed_op *po = &ops[i];
@@ -3200,17 +3218,14 @@ static struct parsed_proto *process_call(int i, int opcnt)
         // deal with multi-pop stack adjust
         adj = pp->argc_stack;
         while (ops[ret].op == OP_POP && adj > 0 && ret < opcnt) {
-          ops[ret].flags |= OPF_RMD;
+          ops[ret].flags |= OPF_RMD | OPF_DONE;
           adj--;
           ret++;
         }
       }
     }
-    else if (!multipath) {
-      // a bit of a hack, but deals with use of
-      // single adj for multiple calls
-      ops[ret].operand[1].val -= pp->argc_stack * 4;
-    }
+    else if (!multipath)
+      patch_esp_adjust(&ops[ret], pp->argc_stack * 4);
   }
   else if (pp->is_vararg)
     ferr(po, "missing esp_adjust for vararg func '%s'\n",
@@ -3282,7 +3297,7 @@ static int collect_call_args_early(struct parsed_op *po, int i,
       if (ops[j].operand[0].type == OPT_REG)
         *regmask |= 1 << ops[j].operand[0].reg;
 
-      ops[j].flags |= OPF_RMD | OPF_FARGNR | OPF_FARG;
+      ops[j].flags |= OPF_RMD | OPF_DONE | OPF_FARGNR | OPF_FARG;
       ops[j].flags &= ~OPF_RSAVE;
 
       // next arg
@@ -3388,8 +3403,7 @@ static int collect_call_args_r(struct parsed_op *po, int i,
       ferr(po, "arg collect %d/%d hit esp adjust of %d\n",
         arg, pp->argc, ops[j].operand[1].val);
     }
-    else if (ops[j].op == OP_POP && !(ops[j].flags & OPF_RMD)
-      && ops[j].datap == NULL)
+    else if (ops[j].op == OP_POP && !(ops[j].flags & OPF_DONE))
     {
       if (pp->is_unresolved)
         break;
@@ -3471,7 +3485,7 @@ static int collect_call_args_r(struct parsed_op *po, int i,
             if (!g_func_pp->is_vararg
               || strstr(ops[k].operand[1].name, buf))
             {
-              ops[k].flags |= OPF_RMD;
+              ops[k].flags |= OPF_RMD | OPF_DONE;
               ops[j].flags |= OPF_RMD | OPF_VAPUSH;
               save_args &= ~(1 << arg);
               reg = -1;
@@ -3486,7 +3500,7 @@ static int collect_call_args_r(struct parsed_op *po, int i,
             ret = stack_frame_access(&ops[k], &ops[k].operand[1],
               buf, sizeof(buf), ops[k].operand[1].name, "", 1, 0);
             if (ret >= 0) {
-              ops[k].flags |= OPF_RMD;
+              ops[k].flags |= OPF_RMD | OPF_DONE;
               ops[j].flags |= OPF_RMD;
               ops[j].p_argpass = ret + 1;
               save_args &= ~(1 << arg);
@@ -3776,7 +3790,7 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
     po->bt_i = -1;
     po->btj = NULL;
 
-    if (po->flags & OPF_RMD)
+    if (po->flags & (OPF_RMD|OPF_DONE))
       continue;
 
     if (po->op == OP_CALL) {
@@ -3832,7 +3846,7 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
       {
         if (l == i + 1 && po->op == OP_JMP) {
           // yet another alignment type..
-          po->flags |= OPF_RMD;
+          po->flags |= OPF_RMD|OPF_DONE;
           break;
         }
         add_label_ref(&g_label_refs[l], i);
@@ -3869,7 +3883,7 @@ tailcall:
     }
 
     po = &ops[i];
-    if (po->flags & OPF_RMD)
+    if (po->flags & (OPF_RMD|OPF_DONE))
       continue;
 
     if (po->op == OP_CALL)
@@ -3886,10 +3900,10 @@ tailcall:
         if (j >= 0) {
           // commit esp adjust
           ops[j].flags |= OPF_RMD;
-          if (ops[j].op != OP_POP) {
-            ferr_assert(&ops[j], ops[j].op == OP_ADD);
-            ops[j].operand[1].val -= pp->argc_stack * 4;
-          }
+          if (ops[j].op != OP_POP)
+            patch_esp_adjust(&ops[j], pp->argc_stack * 4);
+          else
+            ops[j].flags |= OPF_DONE;
         }
 
         if (strstr(pp->ret_type.name, "int64"))
@@ -3905,7 +3919,7 @@ tailcall:
   for (i = 0; i < opcnt; i++)
   {
     po = &ops[i];
-    if (po->flags & OPF_RMD)
+    if (po->flags & (OPF_RMD|OPF_DONE))
       continue;
 
     if (po->op == OP_CALL && !(po->flags & OPF_DONE))
@@ -3933,7 +3947,7 @@ tailcall:
   for (i = 0; i < opcnt; i++)
   {
     po = &ops[i];
-    if (po->flags & OPF_RMD)
+    if (po->flags & (OPF_RMD|OPF_DONE))
       continue;
 
     if (po->op == OP_PUSH && (po->flags & OPF_RSAVE)) {
@@ -3985,7 +3999,7 @@ tailcall:
     }
 
     if (po->op == OP_STD) {
-      po->flags |= OPF_DF | OPF_RMD;
+      po->flags |= OPF_DF | OPF_RMD | OPF_DONE;
       scan_propagate_df(i + 1, opcnt);
     }
 
@@ -4164,7 +4178,7 @@ tailcall:
         need_tmp64 = 1;
     }
     else if (po->op == OP_CLD)
-      po->flags |= OPF_RMD;
+      po->flags |= OPF_RMD | OPF_DONE;
 
     if (po->op == OP_RCL || po->op == OP_RCR || po->op == OP_XCHG) {
       need_tmp_var = 1;
@@ -5595,7 +5609,7 @@ static void gen_hdr(const char *funcn, int opcnt)
     po->bt_i = -1;
     po->btj = NULL;
 
-    if (po->flags & OPF_RMD)
+    if (po->flags & (OPF_RMD|OPF_DONE))
       continue;
 
     if (po->op == OP_CALL) {
@@ -5677,7 +5691,7 @@ tailcall:
     }
 
     po = &ops[i];
-    if (po->flags & OPF_RMD)
+    if (po->flags & (OPF_RMD|OPF_DONE))
       continue;
 
     if (po->op == OP_CALL)
@@ -5694,10 +5708,10 @@ tailcall:
         if (j >= 0) {
           // commit esp adjust
           ops[j].flags |= OPF_RMD;
-          if (ops[j].op != OP_POP) {
-            ferr_assert(&ops[j], ops[j].op == OP_ADD);
-            ops[j].operand[1].val -= pp->argc_stack * 4;
-          }
+          if (ops[j].op != OP_POP)
+            patch_esp_adjust(&ops[j], pp->argc_stack * 4);
+          else
+            ops[j].flags |= OPF_DONE;
         }
 
         po->flags |= OPF_DONE;
@@ -5709,28 +5723,39 @@ tailcall:
   }
 
   // pass4:
+  // - track saved regs (simple)
   // - process calls
   for (i = 0; i < opcnt; i++)
   {
     po = &ops[i];
-    if (po->flags & OPF_RMD)
+    if (po->flags & (OPF_RMD|OPF_DONE))
       continue;
 
-    if (po->op == OP_CALL && !(po->flags & OPF_DONE))
+    if (po->op == OP_PUSH && po->operand[0].type == OPT_REG)
+    {
+      ret = scan_for_pop_ret(i + 1, opcnt, po->operand[0].name, 0);
+      if (ret == 0) {
+        regmask_save |= 1 << po->operand[0].reg;
+        po->flags |= OPF_RMD;
+        scan_for_pop_ret(i + 1, opcnt, po->operand[0].name, OPF_RMD);
+      }
+    }
+    else if (po->op == OP_CALL && !(po->flags & OPF_DONE))
     {
       pp = process_call(i, opcnt);
 
       if (!pp->is_unresolved && !(po->flags & OPF_ATAIL)) {
         // since we know the args, collect them
         collect_call_args(po, i, pp, &regmask_dummy, save_arg_vars,
-          i + opcnt * 2);
+          i + opcnt * 1);
       }
     }
   }
 
   // pass5:
-  // - track saved regs
+  // - track saved regs (part 2)
   // - try to figure out arg-regs
+  // - calculate reg deps
   for (i = 0; i < opcnt; i++)
   {
     po = &ops[i];
@@ -5739,7 +5764,8 @@ tailcall:
       /* (just calculate register deps) */;
     else if (po->flags & OPF_RMD)
       continue;
-    else if (po->op == OP_PUSH && po->operand[0].type == OPT_REG)
+    else if (po->op == OP_PUSH && po->operand[0].type == OPT_REG
+      && !(po->flags & OPF_DONE))
     {
       reg = po->operand[0].reg;
       if (reg < 0)
@@ -5747,19 +5773,12 @@ tailcall:
 
       depth = 0;
       ret = scan_for_pop(i + 1, opcnt,
-              po->operand[0].name, i + opcnt * 1, 0, &depth, 0);
+              po->operand[0].name, i + opcnt * 2, 0, &depth, 0);
       if (ret == 1) {
         regmask_save |= 1 << reg;
         po->flags |= OPF_RMD;
         scan_for_pop(i + 1, opcnt,
-          po->operand[0].name, i + opcnt * 2, 0, &depth, 1);
-        continue;
-      }
-      ret = scan_for_pop_ret(i + 1, opcnt, po->operand[0].name, 0);
-      if (ret == 0) {
-        regmask_save |= 1 << reg;
-        po->flags |= OPF_RMD;
-        scan_for_pop_ret(i + 1, opcnt, po->operand[0].name, OPF_RMD);
+          po->operand[0].name, i + opcnt * 3, 0, &depth, 1);
         continue;
       }
     }
@@ -5791,7 +5810,7 @@ tailcall:
         opr.reg = xAX;
         j = -1;
         from_caller = 0;
-        ret = resolve_origin(i, &opr, i + opcnt * 3, &j, &from_caller);
+        ret = resolve_origin(i, &opr, i + opcnt * 4, &j, &from_caller);
       }
 
       if (ret == -1 && from_caller) {
