@@ -6455,8 +6455,14 @@ int main(int argc, char *argv[])
   }
 
   if (argc < arg + 3) {
-    printf("usage:\n%s [-v] [-rf] [-m] <.c> <.asm> <hdrf> [rlist]*\n"
-           "%s -hdr <out.h> <.asm> <seed.h> [rlist]*\n",
+    printf("usage:\n%s [-v] [-rf] [-m] <.c> <.asm> <hdr.h> [rlist]*\n"
+           "%s -hdr <out.h> <.asm> <seed.h> [rlist]*\n"
+           "options:\n"
+           "  -hdr - header generation mode\n"
+           "  -rf  - allow unannotated indirect calls\n"
+           "  -m   - allow multiple .text sections\n"
+           "[rlist] is a file with function names to skip,"
+           " one per line\n",
       argv[0], argv[0]);
     return 1;
   }
