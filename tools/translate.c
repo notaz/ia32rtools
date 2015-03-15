@@ -113,7 +113,7 @@ enum op_op {
 	// x87
 	// mmx
 	OP_EMMS,
-	// mmx
+	// undefined
 	OP_UD2,
 };
 
@@ -234,6 +234,7 @@ static int g_sp_frame;
 static int g_stack_frame_used;
 static int g_stack_fsz;
 static int g_ida_func_attr;
+static int g_skip_func;
 static int g_allow_regfunc;
 static int g_quiet_pp;
 static int g_header_mode;
@@ -984,7 +985,8 @@ static void parse_op(struct parsed_op *op, char words[16][256], int wordc)
   }
 
   if (i == ARRAY_SIZE(op_table)) {
-    anote("unhandled op: '%s'\n", words[0]);
+    if (!g_skip_func)
+      aerr("unhandled op: '%s'\n", words[0]);
     i--; // OP_UD2
   }
   w++;
@@ -6741,7 +6743,7 @@ parse_words:
 do_pending_endp:
     // do delayed endp processing to collect switch jumptables
     if (pending_endp) {
-      if (in_func && !skip_func && !end && wordc >= 2
+      if (in_func && !g_skip_func && !end && wordc >= 2
           && ((words[0][0] == 'd' && words[0][2] == 0)
               || (words[1][0] == 'd' && words[1][2] == 0)))
       {
@@ -6796,7 +6798,7 @@ do_pending_endp:
         continue;
       }
 
-      if (in_func && !skip_func) {
+      if (in_func && !g_skip_func) {
         if (g_header_mode)
           gen_hdr(g_func, pi);
         else
@@ -6807,7 +6809,7 @@ do_pending_endp:
       in_func = 0;
       g_ida_func_attr = 0;
       skip_warned = 0;
-      skip_func = 0;
+      g_skip_func = 0;
       g_func[0] = 0;
       func_chunks_used = 0;
       func_chunk_i = -1;
@@ -6841,7 +6843,7 @@ do_pending_endp:
           words[0], g_func);
       p = words[0];
       if (bsearch(&p, rlist, rlist_len, sizeof(rlist[0]), cmpstringp))
-        skip_func = 1;
+        g_skip_func = 1;
       strcpy(g_func, words[0]);
       set_label(0, words[0]);
       in_func = 1;
@@ -6860,10 +6862,10 @@ do_pending_endp:
         && ops[0].op == OP_JMP && ops[0].operand[0].had_ds)
       {
         // import jump
-        skip_func = 1;
+        g_skip_func = 1;
       }
 
-      if (!skip_func && func_chunks_used) {
+      if (!g_skip_func && func_chunks_used) {
         // start processing chunks
         struct chunk_item *ci, key = { g_func, 0 };
 
@@ -6922,8 +6924,8 @@ do_pending_endp:
       continue;
     }
 
-    if (!in_func || skip_func) {
-      if (!skip_warned && !skip_func && g_labels[pi] != NULL) {
+    if (!in_func || g_skip_func) {
+      if (!skip_warned && !g_skip_func && g_labels[pi] != NULL) {
         if (verbose)
           anote("skipping from '%s'\n", g_labels[pi]);
         skip_warned = 1;
