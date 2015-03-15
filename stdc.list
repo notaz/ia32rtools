@@ -59,6 +59,8 @@ _fseek
 _fgetc
 __filbuf
 __mbsicmp
+__beginthread
+__endthread
 __beginthreadex
 __endthreadex
 __onexit
@@ -76,6 +78,7 @@ _wcslen
 _wcstombs
 _setlocale
 __setmbcp
+__getmbcp
 __lseek
 __write
 __isatty

@@ -181,6 +181,22 @@ int __cdecl vfprintf (FILE*, const char*, __VALIST);
 int __cdecl vprintf (const char*, __VALIST);
 int __cdecl vsprintf (char*, const char*, __VALIST);
 
+int __cdecl _setmbcp (int);
+int __cdecl _getmbcp (void);
+int __cdecl _ismbbalpha (unsigned int);
+int __cdecl _ismbbalnum (unsigned int);
+int __cdecl _ismbbgraph (unsigned int);
+int __cdecl _ismbbprint (unsigned int);
+int __cdecl _ismbbpunct (unsigned int);
+int __cdecl _ismbbkana (unsigned int);
+int __cdecl _ismbbkalnum (unsigned int);
+int __cdecl _ismbbkprint (unsigned int);
+int __cdecl _ismbbkpunct (unsigned int);
+int __cdecl _ismbblead (unsigned int);
+int __cdecl _ismbbtrail (unsigned int);
+int __cdecl _ismbslead (const unsigned char*, const unsigned char*);
+int __cdecl _ismbstrail (const unsigned char*, const unsigned char*);
+
 int __cdecl _ismbcalnum (unsigned int);
 int __cdecl _ismbcalpha (unsigned int);
 int __cdecl _ismbcdigit (unsigned int);
@@ -240,4 +256,11 @@ int __cdecl raise (int);
 int __cdecl __snprintf (char *, unsigned int, const char*, ...);
 
 void* __cdecl  	memcpy_0 (void*, const void*, size_t);
+
+// msvcrt
+unsigned long __cdecl _beginthread (void (__cdecl *)(void *), unsigned, void*);
+void __cdecl _endthread	(void);
+unsigned long __cdecl _beginthreadex (void *, unsigned int, unsigned int (__stdcall *) (void *), void*, unsigned int, unsigned int*);
+// DECLSPEC_NORETURN
+void __cdecl _endthreadex (unsigned int);
 

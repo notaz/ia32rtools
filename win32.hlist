@@ -1822,10 +1822,6 @@ DWORD WINAPI lineUnhold(HCALL);
 DWORD WINAPI lineUnparkA(HLINE,DWORD,LPHCALL,LPCSTR);
 
 
-unsigned long __cdecl _beginthreadex (void *, unsigned int, unsigned int (__stdcall *) (void *), void*, unsigned int, unsigned int*);
-// DECLSPEC_NORETURN
-void __cdecl _endthreadex (unsigned int);
-
 //    sctproto: int (__stdcall *Direct*Create)(void *, void *, void *)
 // 08 sctproto: int (WINAPI *dx_Release)(void *iface)
 // IDirectDraw
