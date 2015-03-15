@@ -57,6 +57,7 @@ enum op_flags {
   OPF_LOCK   = (1 << 17), /* op has lock prefix */
   OPF_VAPUSH = (1 << 18), /* vararg ptr push (as call arg) */
   OPF_DONE   = (1 << 19), /* already fully handled by analysis */
+  OPF_PPUSH  = (1 << 20), /* part of complex push-pop graph */
 };
 
 enum op_op {
@@ -176,9 +177,10 @@ struct parsed_op {
 };
 
 // datap:
-// OP_CALL - parser proto hint (str)
+// OP_CALL  - parser proto hint (str)
 // (OPF_CC) - points to one of (OPF_FLAGS) that affects cc op
-// OP_POP - points to OP_PUSH in push/pop pair
+// OP_PUSH  - points to OP_POP in complex push/pop graph
+// OP_POP   - points to OP_PUSH in simple push/pop pair
 
 struct parsed_equ {
   char name[64];
@@ -2261,22 +2263,44 @@ static int scan_for_pop_ret(int i, int opcnt, const char *reg,
   return found ? 0 : -1;
 }
 
-static void scan_for_pop_const(int i, int opcnt)
+static void scan_for_pop_const(int i, int opcnt, int *regmask_pp)
 {
+  struct parsed_op *po;
+  int is_multipath = 0;
   int j;
 
   for (j = i + 1; j < opcnt; j++) {
-    if ((ops[j].flags & (OPF_JMP|OPF_TAIL|OPF_RSAVE))
-      || ops[j].op == OP_PUSH || g_labels[i] != NULL)
+    po = &ops[j];
+
+    if (po->op == OP_JMP && po->btj == NULL) {
+      ferr_assert(po, po->bt_i >= 0);
+      j = po->bt_i - 1;
+      continue;
+    }
+
+    if ((po->flags & (OPF_JMP|OPF_TAIL|OPF_RSAVE))
+      || po->op == OP_PUSH)
     {
       break;
     }
 
-    if (ops[j].op == OP_POP && !(ops[j].flags & (OPF_RMD|OPF_DONE)))
+    if (g_labels[j] != NULL)
+      is_multipath = 1;
+
+    if (po->op == OP_POP && !(po->flags & OPF_RMD))
     {
-      ops[i].flags |= OPF_RMD | OPF_DONE;
-      ops[j].flags |= OPF_DONE;
-      ops[j].datap = &ops[i];
+      is_multipath |= !!(po->flags & OPF_PPUSH);
+      if (is_multipath) {
+        ops[i].flags |= OPF_PPUSH | OPF_DONE;
+        ops[i].datap = po;
+        po->flags |= OPF_PPUSH | OPF_DONE;
+        *regmask_pp |= 1 << po->operand[0].reg;
+      }
+      else {
+        ops[i].flags |= OPF_RMD | OPF_DONE;
+        po->flags |= OPF_DONE;
+        po->datap = &ops[i];
+      }
       break;
     }
   }
@@ -3815,11 +3839,12 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
   int need_tmp64 = 0;
   int had_decl = 0;
   int label_pending = 0;
-  int regmask_save = 0;
-  int regmask_arg = 0;
-  int regmask_now = 0;
-  int regmask_init = 0;
-  int regmask = 0;
+  int regmask_save = 0; // regs saved/restored in this func
+  int regmask_arg = 0;  // regs carrying function args (fastcall, etc)
+  int regmask_now;      // temp
+  int regmask_init = 0; // regs that need zero initialization
+  int regmask_pp = 0;   // regs used in complex push-pop graph
+  int regmask = 0;      // used regs
   int pfomask = 0;
   int found = 0;
   int depth = 0;
@@ -3999,7 +4024,7 @@ tailcall:
     }
     else if (po->op == OP_PUSH && !(po->flags & OPF_FARG)
       && !(po->flags & OPF_RSAVE) && po->operand[0].type == OPT_CONST)
-        scan_for_pop_const(i, opcnt);
+        scan_for_pop_const(i, opcnt, &regmask_pp);
   }
 
   // pass5:
@@ -4385,6 +4410,7 @@ tailcall:
     }
   }
 
+  // declare normal registers
   regmask_now = regmask & ~regmask_arg;
   regmask_now &= ~(1 << xSP);
   if (regmask_now & 0x00ff) {
@@ -4426,6 +4452,16 @@ tailcall:
       if (save_arg_vars[i] & (1 << reg)) {
         fprintf(fout, "  u32 %s;\n",
           saved_arg_name(buf1, sizeof(buf1), i, reg + 1));
+        had_decl = 1;
+      }
+    }
+  }
+
+  // declare push-pop temporaries
+  if (regmask_pp) {
+    for (reg = 0; reg < 8; reg++) {
+      if (regmask_pp & (1 << reg)) {
+        fprintf(fout, "  u32 pp_%s;\n", regs_r32[reg]);
         had_decl = 1;
       }
     }
@@ -5370,6 +5406,13 @@ tailcall:
           fprintf(fout, "  s_%s = %s;", buf1, buf1);
           break;
         }
+        else if (po->flags & OPF_PPUSH) {
+          tmp_op = po->datap;
+          ferr_assert(po, tmp_op != NULL);
+          out_dst_opr(buf2, sizeof(buf2), po, &tmp_op->operand[0]);
+          fprintf(fout, "  pp_%s = %s;", buf2, buf1);
+          break;
+        }
         else if (g_func_pp->is_userstack) {
           fprintf(fout, "  *(--esp) = %s;", buf1);
           break;
@@ -5380,15 +5423,20 @@ tailcall:
         break;
 
       case OP_POP:
+        out_dst_opr(buf1, sizeof(buf1), po, &po->operand[0]);
         if (po->flags & OPF_RSAVE) {
-          out_dst_opr(buf1, sizeof(buf1), po, &po->operand[0]);
           fprintf(fout, "  %s = s_%s;", buf1, buf1);
+          break;
+        }
+        else if (po->flags & OPF_PPUSH) {
+          // push/pop graph
+          ferr_assert(po, po->datap == NULL);
+          fprintf(fout, "  %s = pp_%s;", buf1, buf1);
           break;
         }
         else if (po->datap != NULL) {
           // push/pop pair
           tmp_op = po->datap;
-          out_dst_opr(buf1, sizeof(buf1), po, &po->operand[0]);
           fprintf(fout, "  %s = %s;", buf1,
             out_src_opr(buf2, sizeof(buf2),
               tmp_op, &tmp_op->operand[0],
@@ -5396,8 +5444,7 @@ tailcall:
           break;
         }
         else if (g_func_pp->is_userstack) {
-          fprintf(fout, "  %s = *esp++;",
-            out_dst_opr(buf1, sizeof(buf1), po, &po->operand[0]));
+          fprintf(fout, "  %s = *esp++;", buf1);
           break;
         }
         else
@@ -5855,7 +5902,7 @@ tailcall:
       continue;
 
     if (po->op == OP_PUSH && po->operand[0].type == OPT_CONST)
-      scan_for_pop_const(i, opcnt);
+      scan_for_pop_const(i, opcnt, &regmask_dummy);
   }
 
   // pass4:
