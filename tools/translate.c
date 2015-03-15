@@ -528,7 +528,7 @@ static int guess_lmod_from_c_type(enum opr_lenmod *lmod,
   const struct parsed_type *c_type)
 {
   static const char *dword_types[] = {
-    "int", "_DWORD", "UINT_PTR", "DWORD",
+    "uint32_t", "int", "_DWORD", "UINT_PTR", "DWORD",
     "WPARAM", "LPARAM", "UINT", "__int32",
     "LONG", "HIMC", "BOOL", "size_t",
     "float",
@@ -3701,15 +3701,67 @@ static void output_std_flags(FILE *fout, struct parsed_op *po,
   }
 }
 
+enum {
+  OPP_FORCE_NORETURN = (1 << 0),
+  OPP_SIMPLE_ARGS    = (1 << 1),
+  OPP_ALIGN          = (1 << 2),
+};
+
 static void output_pp_attrs(FILE *fout, const struct parsed_proto *pp,
-  int is_noreturn)
+  int flags)
 {
+  const char *cconv = "";
+
   if (pp->is_fastcall)
-    fprintf(fout, "__fastcall ");
+    cconv = "__fastcall ";
   else if (pp->is_stdcall && pp->argc_reg == 0)
-    fprintf(fout, "__stdcall ");
-  if (pp->is_noreturn || is_noreturn)
+    cconv = "__stdcall ";
+
+  fprintf(fout, (flags & OPP_ALIGN) ? "%-16s" : "%s", cconv);
+
+  if (pp->is_noreturn || (flags & OPP_FORCE_NORETURN))
     fprintf(fout, "noreturn ");
+}
+
+static void output_pp(FILE *fout, const struct parsed_proto *pp,
+  int flags)
+{
+  int i;
+
+  fprintf(fout, (flags & OPP_ALIGN) ? "%-5s" : "%s ",
+    pp->ret_type.name);
+  if (pp->is_fptr)
+    fprintf(fout, "(");
+  output_pp_attrs(fout, pp, flags);
+  if (pp->is_fptr)
+    fprintf(fout, "*");
+  fprintf(fout, "%s", pp->name);
+  if (pp->is_fptr)
+    fprintf(fout, ")");
+
+  fprintf(fout, "(");
+  for (i = 0; i < pp->argc; i++) {
+    if (i > 0)
+      fprintf(fout, ", ");
+    if (pp->arg[i].fptr != NULL && !(flags & OPP_SIMPLE_ARGS)) {
+      // func pointer
+      output_pp(fout, pp->arg[i].fptr, 0);
+    }
+    else if (pp->arg[i].type.is_retreg) {
+      fprintf(fout, "u32 *r_%s", pp->arg[i].reg);
+    }
+    else {
+      fprintf(fout, "%s", pp->arg[i].type.name);
+      if (!pp->is_fptr)
+        fprintf(fout, " a%d", i + 1);
+    }
+  }
+  if (pp->is_vararg) {
+    if (i > 0)
+      fprintf(fout, ", ");
+    fprintf(fout, "...");
+  }
+  fprintf(fout, ")");
 }
 
 static int get_pp_arg_regmask(const struct parsed_proto *pp)
@@ -4218,47 +4270,10 @@ tailcall:
   }
 
   // the function itself
-  fprintf(fout, "%s ", g_func_pp->ret_type.name);
-  output_pp_attrs(fout, g_func_pp, g_ida_func_attr & IDAFA_NORETURN);
-  fprintf(fout, "%s(", g_func_pp->name);
-
-  for (i = 0; i < g_func_pp->argc; i++) {
-    if (i > 0)
-      fprintf(fout, ", ");
-    if (g_func_pp->arg[i].fptr != NULL) {
-      // func pointer..
-      pp = g_func_pp->arg[i].fptr;
-      fprintf(fout, "%s (", pp->ret_type.name);
-      output_pp_attrs(fout, pp, 0);
-      fprintf(fout, "*a%d)(", i + 1);
-      for (j = 0; j < pp->argc; j++) {
-        if (j > 0)
-          fprintf(fout, ", ");
-        if (pp->arg[j].fptr)
-          ferr(ops, "nested fptr\n");
-        fprintf(fout, "%s", pp->arg[j].type.name);
-      }
-      if (pp->is_vararg) {
-        if (j > 0)
-          fprintf(fout, ", ");
-        fprintf(fout, "...");
-      }
-      fprintf(fout, ")");
-    }
-    else if (g_func_pp->arg[i].type.is_retreg) {
-      fprintf(fout, "u32 *r_%s", g_func_pp->arg[i].reg);
-    }
-    else {
-      fprintf(fout, "%s a%d", g_func_pp->arg[i].type.name, i + 1);
-    }
-  }
-  if (g_func_pp->is_vararg) {
-    if (i > 0)
-      fprintf(fout, ", ");
-    fprintf(fout, "...");
-  }
-
-  fprintf(fout, ")\n{\n");
+  ferr_assert(ops, !g_func_pp->is_fptr);
+  output_pp(fout, g_func_pp,
+    (g_ida_func_attr & IDAFA_NORETURN) ? OPP_FORCE_NORETURN : 0);
+  fprintf(fout, "\n{\n");
 
   // declare indirect functions
   for (i = 0; i < opcnt; i++) {
@@ -4292,15 +4307,9 @@ tailcall:
         else
           snprintf(pp->name, sizeof(pp->name), "icall%d", i);
 
-        fprintf(fout, "  %s (", pp->ret_type.name);
-        output_pp_attrs(fout, pp, 0);
-        fprintf(fout, "*%s)(", pp->name);
-        for (j = 0; j < pp->argc; j++) {
-          if (j > 0)
-            fprintf(fout, ", ");
-          fprintf(fout, "%s a%d", pp->arg[j].type.name, j + 1);
-        }
-        fprintf(fout, ");\n");
+        fprintf(fout, "  ");
+        output_pp(fout, pp, OPP_SIMPLE_ARGS);
+        fprintf(fout, ";\n");
       }
     }
   }
@@ -5512,6 +5521,7 @@ static struct scanned_var {
   enum opr_lenmod lmod;
   unsigned int is_seeded:1;
   unsigned int is_c_str:1;
+  const struct parsed_proto *pp; // seed pp, if any
 } *hg_vars;
 static int hg_var_cnt;
 
@@ -6021,6 +6031,20 @@ static void output_hdr_fp(FILE *fout, const struct func_prototype *fp,
     if (pp != NULL && pp->is_include)
       continue;
 
+    if (fp->pp != NULL) {
+      // prefer fp for common style,
+      // only use output_pp if args are complex
+      for (j = 0; j < fp->pp->argc; j++) {
+        if (fp->pp->arg[j].fptr != NULL)
+          break;
+      }
+      if (j != fp->pp->argc) {
+        output_pp(fout, fp->pp, OPP_ALIGN);
+        fprintf(fout, ";\n");
+        continue;
+      }
+    }
+
     regmask_dep = fp->regmask_dep;
     argc_stack = fp->argc_stack;
 
@@ -6091,6 +6115,7 @@ static void output_hdr(FILE *fout)
     [OPLM_QWORD] = "uint64_t",
   };
   const struct scanned_var *var;
+  char line[256] = { 0, };
   int i;
 
   // resolve deps
@@ -6105,7 +6130,12 @@ static void output_hdr(FILE *fout)
   for (i = 0; i < hg_var_cnt; i++) {
     var = &hg_vars[i];
 
-    if (var->is_c_str)
+    if (var->pp != NULL && var->pp->is_fptr) {
+      fprintf(fout, "extern ");
+      output_pp(fout, var->pp, 0);
+      fprintf(fout, ";");
+    }
+    else if (var->is_c_str)
       fprintf(fout, "extern %-8s %s[];", "char", var->name);
     else
       fprintf(fout, "extern %-8s %s;",
@@ -6120,6 +6150,15 @@ static void output_hdr(FILE *fout)
 
   // output function prototypes
   output_hdr_fp(fout, hg_fp, hg_fp_cnt);
+
+  // include passthrough
+  fprintf(fout, "\n// for translate\n");
+
+  rewind(g_fhdr);
+  while (fgets(line, sizeof(line), g_fhdr)) {
+    if (IS_START(line, "//#"))
+      fwrite(line, 1, strlen(line), fout);
+  }
 }
 
 // read a line, truncating it if it doesn't fit
@@ -6183,7 +6222,6 @@ static char *next_word_s(char *w, size_t wsize, char *s)
 
 static void scan_variables(FILE *fasm)
 {
-  const struct parsed_proto *pp_c;
   struct scanned_var *var;
   char line[256] = { 0, };
   char words[3][256];
@@ -6257,17 +6295,17 @@ static void scan_variables(FILE *fasm)
       snprintf(var->name, sizeof(var->name), "%s", words[0]);
 
       // maybe already in seed header?
-      pp_c = proto_parse(g_fhdr, var->name, 1);
-      if (pp_c != NULL) {
-        if (pp_c->is_func)
-          aerr("func?\n");
-        else if (pp_c->is_fptr) {
+      var->pp = proto_parse(g_fhdr, var->name, 1);
+      if (var->pp != NULL) {
+        if (var->pp->is_fptr) {
           var->lmod = OPLM_DWORD;
           //var->is_ptr = 1;
         }
-        else if (!guess_lmod_from_c_type(&var->lmod, &pp_c->type))
+        else if (var->pp->is_func)
+          aerr("func?\n");
+        else if (!guess_lmod_from_c_type(&var->lmod, &var->pp->type))
           aerr("unhandled C type '%s' for '%s'\n",
-            pp_c->type.name, var->name);
+            var->pp->type.name, var->name);
 
         var->is_seeded = 1;
         continue;
