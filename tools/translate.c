@@ -6034,17 +6034,8 @@ static void output_hdr_fp(FILE *fout, const struct func_prototype *fp,
       continue;
 
     if (fp->pp != NULL) {
-      // prefer fp for common style,
-      // only use output_pp if args are complex
-      for (j = 0; j < fp->pp->argc; j++) {
-        if (fp->pp->arg[j].fptr != NULL)
-          break;
-      }
-      if (j != fp->pp->argc) {
-        output_pp(fout, fp->pp, OPP_ALIGN);
-        fprintf(fout, ";\n");
-        continue;
-      }
+      // part of seed, output later
+      continue;
     }
 
     regmask_dep = fp->regmask_dep;
@@ -6132,11 +6123,9 @@ static void output_hdr(FILE *fout)
   for (i = 0; i < hg_var_cnt; i++) {
     var = &hg_vars[i];
 
-    if (var->pp != NULL && var->pp->is_fptr) {
-      fprintf(fout, "extern ");
-      output_pp(fout, var->pp, 0);
-      fprintf(fout, ";");
-    }
+    if (var->pp != NULL)
+      // part of seed
+      continue;
     else if (var->is_c_str)
       fprintf(fout, "extern %-8s %s[];", "char", var->name);
     else
@@ -6153,14 +6142,12 @@ static void output_hdr(FILE *fout)
   // output function prototypes
   output_hdr_fp(fout, hg_fp, hg_fp_cnt);
 
-  // include passthrough
-  fprintf(fout, "\n// for translate\n");
+  // seed passthrough
+  fprintf(fout, "\n// - seed -\n");
 
   rewind(g_fhdr);
-  while (fgets(line, sizeof(line), g_fhdr)) {
-    if (IS_START(line, "//#"))
-      fwrite(line, 1, strlen(line), fout);
-  }
+  while (fgets(line, sizeof(line), g_fhdr))
+    fwrite(line, 1, strlen(line), fout);
 }
 
 // read a line, truncating it if it doesn't fit
