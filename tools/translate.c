@@ -2521,18 +2521,34 @@ static int scan_for_reg_clear(int i, int reg)
   return -1;
 }
 
+static void patch_esp_adjust(struct parsed_op *po, int adj)
+{
+  ferr_assert(po, po->op == OP_ADD);
+  ferr_assert(po, IS(opr_name(po, 0), "esp"));
+  ferr_assert(po, po->operand[1].type == OPT_CONST);
+
+  // this is a bit of a hack, but deals with use of
+  // single adj for multiple calls
+  po->operand[1].val -= adj;
+  po->flags |= OPF_RMD;
+  if (po->operand[1].val == 0)
+    po->flags |= OPF_DONE;
+  ferr_assert(po, (int)po->operand[1].val >= 0);
+}
+
 // scan for positive, constant esp adjust
+// multipath case is preliminary
 static int scan_for_esp_adjust(int i, int opcnt,
-  int adj_expect, int *adj, int *multipath)
+  int adj_expect, int *adj, int *is_multipath, int do_update)
 {
   struct parsed_op *po;
   int first_pop = -1;
 
-  *adj = *multipath = 0;
+  *adj = *is_multipath = 0;
 
   for (; i < opcnt && *adj < adj_expect; i++) {
     if (g_labels[i] != NULL)
-      *multipath = 1;
+      *is_multipath = 1;
 
     po = &ops[i];
     if (po->flags & OPF_DONE)
@@ -2544,6 +2560,12 @@ static int scan_for_esp_adjust(int i, int opcnt,
       *adj += po->operand[1].val;
       if (*adj & 3)
         ferr(&ops[i], "unaligned esp adjust: %x\n", *adj);
+      if (do_update) {
+        if (!*is_multipath)
+          patch_esp_adjust(po, adj_expect);
+        else
+          po->flags |= OPF_RMD;
+      }
       return i;
     }
     else if (po->op == OP_PUSH) {
@@ -2559,6 +2581,12 @@ static int scan_for_esp_adjust(int i, int opcnt,
         if (first_pop == -1 && *adj >= 0)
           first_pop = i;
       }
+      if (do_update && *adj >= 0) {
+        po->flags |= OPF_RMD;
+        if (!*is_multipath)
+          po->flags |= OPF_DONE;
+      }
+
       *adj += lmod_bytes(po, po->operand[0].lmod);
     }
     else if (po->flags & (OPF_JMP|OPF_TAIL)) {
@@ -3099,7 +3127,7 @@ static struct parsed_proto *process_call_early(int i, int opcnt,
   *adj_i = ret = -1;
   if (!pp->is_stdcall && pp->argc_stack > 0)
     ret = scan_for_esp_adjust(i + 1, opcnt,
-            pp->argc_stack * 4, &adj, &multipath);
+            pp->argc_stack * 4, &adj, &multipath, 0);
   if (ret >= 0) {
     if (pp->argc_stack > adj / 4)
       return NULL;
@@ -3111,21 +3139,6 @@ static struct parsed_proto *process_call_early(int i, int opcnt,
 
   *adj_i = ret;
   return pp;
-}
-
-static void patch_esp_adjust(struct parsed_op *po, int adj)
-{
-  ferr_assert(po, po->op == OP_ADD);
-  ferr_assert(po, IS(opr_name(po, 0), "esp"));
-  ferr_assert(po, po->operand[1].type == OPT_CONST);
-
-  // this is a bit of a hack, but deals with use of
-  // single adj for multiple calls
-  po->operand[1].val -= adj;
-  po->flags |= OPF_RMD;
-  if (po->operand[1].val == 0)
-    po->flags |= OPF_DONE;
-  ferr_assert(po, (int)po->operand[1].val >= 0);
 }
 
 static struct parsed_proto *process_call(int i, int opcnt)
@@ -3169,7 +3182,8 @@ static struct parsed_proto *process_call(int i, int opcnt)
       my_assert_not(pp, NULL);
 
       pp->is_fptr = 1;
-      ret = scan_for_esp_adjust(i + 1, opcnt, 32*4, &adj, &multipath);
+      ret = scan_for_esp_adjust(i + 1, opcnt,
+              32*4, &adj, &multipath, 0);
       if (ret < 0 || adj < 0) {
         if (!g_allow_regfunc)
           ferr(po, "non-__cdecl indirect call unhandled yet\n");
@@ -3192,7 +3206,7 @@ static struct parsed_proto *process_call(int i, int opcnt)
   ret = -1;
   if (!pp->is_stdcall && pp->argc_stack > 0)
     ret = scan_for_esp_adjust(i + 1, opcnt,
-            pp->argc_stack * 4, &adj, &multipath);
+            pp->argc_stack * 4, &adj, &multipath, 0);
   if (ret >= 0) {
     if (pp->is_vararg) {
       if (adj / 4 < pp->argc_stack) {
@@ -3216,20 +3230,8 @@ static struct parsed_proto *process_call(int i, int opcnt)
         tmpname, pp->argc_stack * 4, adj);
     }
 
-    ops[ret].flags |= OPF_RMD;
-    if (ops[ret].op == OP_POP) {
-      if (adj > 4) {
-        // deal with multi-pop stack adjust
-        adj = pp->argc_stack;
-        while (ops[ret].op == OP_POP && adj > 0 && ret < opcnt) {
-          ops[ret].flags |= OPF_RMD | OPF_DONE;
-          adj--;
-          ret++;
-        }
-      }
-    }
-    else if (!multipath)
-      patch_esp_adjust(&ops[ret], pp->argc_stack * 4);
+    scan_for_esp_adjust(i + 1, opcnt,
+      pp->argc_stack * 4, &adj, &multipath, 1);
   }
   else if (pp->is_vararg)
     ferr(po, "missing esp_adjust for vararg func '%s'\n",
@@ -3921,6 +3923,7 @@ tailcall:
 
   // pass4:
   // - process calls
+  // - handle push <const>/pop pairs
   for (i = 0; i < opcnt; i++)
   {
     po = &ops[i];
@@ -3940,6 +3943,9 @@ tailcall:
       if (strstr(pp->ret_type.name, "int64"))
         need_tmp64 = 1;
     }
+    else if (po->op == OP_PUSH && !(po->flags & OPF_FARG)
+      && !(po->flags & OPF_RSAVE) && po->operand[0].type == OPT_CONST)
+        scan_for_pop_const(i, opcnt);
   }
 
   // pass5:
@@ -3997,9 +4003,6 @@ tailcall:
           scan_for_pop_ret(i + 1, opcnt, po->operand[0].name, arg);
           continue;
         }
-      }
-      else if (po->operand[0].type == OPT_CONST) {
-        scan_for_pop_const(i, opcnt);
       }
     }
 
