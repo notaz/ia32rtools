@@ -2141,6 +2141,10 @@ static void op_set_clear_flag(struct parsed_op *po,
   || ((ops[_i].flags & (OPF_JMP|OPF_CJMP|OPF_RMD)) == OPF_JMP \
       && ops[_i].op != OP_CALL))
 
+#define check_i(po, i) \
+  if ((i) < 0) \
+    ferr(po, "bad " #i ": %d\n", i)
+
 static int scan_for_pop(int i, int opcnt, const char *reg,
   int magic, int depth, int *maxdepth, int do_flags)
 {
@@ -2173,6 +2177,7 @@ static int scan_for_pop(int i, int opcnt, const char *reg,
       if (po->btj != NULL) {
         // jumptable
         for (j = 0; j < po->btj->count; j++) {
+          check_i(po, po->btj->d[j].bt_i);
           ret |= scan_for_pop(po->btj->d[j].bt_i, opcnt, reg, magic,
                    depth, maxdepth, do_flags);
           if (ret < 0)
@@ -2181,11 +2186,7 @@ static int scan_for_pop(int i, int opcnt, const char *reg,
         return ret;
       }
 
-      if (po->bt_i < 0) {
-        ferr(po, "dead branch\n");
-        return -1;
-      }
-
+      check_i(po, po->bt_i);
       if (po->flags & OPF_CJMP) {
         ret |= scan_for_pop(po->bt_i, opcnt, reg, magic,
                  depth, maxdepth, do_flags);
@@ -2323,16 +2324,14 @@ static void scan_propagate_df(int i, int opcnt)
     if (po->flags & OPF_JMP) {
       if (po->btj != NULL) {
         // jumptable
-        for (j = 0; j < po->btj->count; j++)
+        for (j = 0; j < po->btj->count; j++) {
+          check_i(po, po->btj->d[j].bt_i);
           scan_propagate_df(po->btj->d[j].bt_i, opcnt);
+        }
         return;
       }
 
-      if (po->bt_i < 0) {
-        ferr(po, "dead branch\n");
-        return;
-      }
-
+      check_i(po, po->bt_i);
       if (po->flags & OPF_CJMP)
         scan_propagate_df(po->bt_i, opcnt);
       else
@@ -2352,13 +2351,57 @@ static void scan_propagate_df(int i, int opcnt)
   ferr(po, "missing DF clear?\n");
 }
 
+// is operand 'opr' referenced by parsed_op 'po'?
+static int is_opr_referenced(const struct parsed_opr *opr,
+  const struct parsed_op *po)
+{
+  int i, mask;
+
+  if (opr->type == OPT_REG) {
+    mask = po->regmask_dst | po->regmask_src;
+    if (po->op == OP_CALL)
+      mask |= (1 << xAX) | (1 << xCX) | (1 << xDX);
+    if ((1 << opr->reg) & mask)
+      return 1;
+    else
+      return 0;
+  }
+
+  for (i = 0; i < po->operand_cnt; i++)
+    if (IS(po->operand[0].name, opr->name))
+      return 1;
+
+  return 0;
+}
+
+// is operand 'opr' read by parsed_op 'po'?
+static int is_opr_read(const struct parsed_opr *opr,
+  const struct parsed_op *po)
+{
+  int mask;
+
+  if (opr->type == OPT_REG) {
+    mask = po->regmask_src;
+    if (po->op == OP_CALL)
+      // assume worst case
+      mask |= (1 << xAX) | (1 << xCX) | (1 << xDX);
+    if ((1 << opr->reg) & mask)
+      return 1;
+    else
+      return 0;
+  }
+
+  // yes I'm lazy
+  return 0;
+}
+
 // is operand 'opr' modified by parsed_op 'po'?
 static int is_opr_modified(const struct parsed_opr *opr,
   const struct parsed_op *po)
 {
   int mask;
 
-  if ((po->flags & OPF_RMD) || !(po->flags & OPF_DATA))
+  if (!(po->flags & OPF_DATA))
     return 0;
 
   if (opr->type == OPT_REG) {
@@ -2440,10 +2483,6 @@ static int scan_for_mod_opr0(struct parsed_op *po_test,
 
   return -1;
 }
-
-#define check_i(po, i) \
-  if ((i) < 0) \
-    ferr(po, "bad " #i ": %d\n", i)
 
 static int scan_for_flag_set(int i, int magic, int *branched,
   int *setters, int *setter_cnt)
@@ -2738,7 +2777,8 @@ static const struct parsed_proto *try_recover_pp(
 }
 
 static void scan_for_call_type(int i, const struct parsed_opr *opr,
-  int magic, const struct parsed_proto **pp_found, int *multi)
+  int magic, const struct parsed_proto **pp_found, int *pp_i,
+  int *multi)
 {
   const struct parsed_proto *pp = NULL;
   struct parsed_op *po;
@@ -2751,7 +2791,7 @@ static void scan_for_call_type(int i, const struct parsed_opr *opr,
       lr = &g_label_refs[i];
       for (; lr != NULL; lr = lr->next) {
         check_i(&ops[i], lr->i);
-        scan_for_call_type(lr->i, opr, magic, pp_found, multi);
+        scan_for_call_type(lr->i, opr, magic, pp_found, pp_i, multi);
       }
       if (i > 0 && LAST_OP(i - 1))
         return;
@@ -2816,8 +2856,10 @@ static void scan_for_call_type(int i, const struct parsed_opr *opr,
     }
     *multi = 1;
   }
-  if (pp != NULL)
+  if (pp != NULL) {
     *pp_found = pp;
+    *pp_i = po - ops;
+  }
 }
 
 // early check for tail call or branch back
@@ -3039,12 +3081,13 @@ static void scan_prologue_epilogue(int opcnt)
 }
 
 static const struct parsed_proto *resolve_icall(int i, int opcnt,
-  int *multi_src)
+  int *pp_i, int *multi_src)
 {
   const struct parsed_proto *pp = NULL;
   int search_advice = 0;
 
   *multi_src = 0;
+  *pp_i = -1;
 
   switch (ops[i].operand[0].type) {
   case OPT_REGMEM:
@@ -3056,7 +3099,7 @@ static const struct parsed_proto *resolve_icall(int i, int opcnt,
     // fallthrough
   default:
     scan_for_call_type(i, &ops[i].operand[0], i + opcnt * 9, &pp,
-      multi_src);
+      pp_i, multi_src);
     break;
   }
 
@@ -3064,7 +3107,7 @@ static const struct parsed_proto *resolve_icall(int i, int opcnt,
 }
 
 // find an instruction that changed opr before i op
-// *op_i must be set to -1 by caller
+// *op_i must be set to -1 by the caller
 // *entry is set to 1 if one source is determined to be the caller
 // returns 1 if found, *op_i is then set to origin
 static int resolve_origin(int i, const struct parsed_opr *opr,
@@ -3114,6 +3157,110 @@ static int resolve_origin(int i, const struct parsed_opr *opr,
     *op_i = i;
     return 1;
   }
+}
+
+// find an instruction that previously referenced opr
+// if multiple results are found - fail
+// *op_i must be set to -1 by the caller
+// returns 1 if found, *op_i is then set to referencer insn
+static int resolve_last_ref(int i, const struct parsed_opr *opr,
+  int magic, int *op_i)
+{
+  struct label_ref *lr;
+  int ret = 0;
+
+  if (ops[i].cc_scratch == magic)
+    return 0;
+  ops[i].cc_scratch = magic;
+
+  while (1) {
+    if (g_labels[i] != NULL) {
+      lr = &g_label_refs[i];
+      for (; lr != NULL; lr = lr->next) {
+        check_i(&ops[i], lr->i);
+        ret |= resolve_last_ref(lr->i, opr, magic, op_i);
+      }
+      if (i > 0 && LAST_OP(i - 1))
+        return ret;
+    }
+
+    i--;
+    if (i < 0)
+      return -1;
+
+    if (ops[i].cc_scratch == magic)
+      return 0;
+    ops[i].cc_scratch = magic;
+
+    if (!is_opr_referenced(opr, &ops[i]))
+      continue;
+
+    if (*op_i >= 0)
+      return -1;
+
+    *op_i = i;
+    return 1;
+  }
+}
+
+// find next instruction that reads opr
+// if multiple results are found - fail
+// *op_i must be set to -1 by the caller
+// returns 1 if found, *op_i is then set to referencer insn
+static int find_next_read(int i, int opcnt,
+  const struct parsed_opr *opr, int magic, int *op_i)
+{
+  struct parsed_op *po;
+  int j, ret = 0;
+
+  for (; i < opcnt; i++)
+  {
+    if (ops[i].cc_scratch == magic)
+      return 0;
+    ops[i].cc_scratch = magic;
+
+    po = &ops[i];
+    if ((po->flags & OPF_JMP) && po->op != OP_CALL) {
+      if (po->btj != NULL) {
+        // jumptable
+        for (j = 0; j < po->btj->count; j++) {
+          check_i(po, po->btj->d[j].bt_i);
+          ret |= find_next_read(po->btj->d[j].bt_i, opcnt, opr,
+                   magic, op_i);
+        }
+        return ret;
+      }
+
+      if (po->flags & OPF_RMD)
+        continue;
+      check_i(po, po->bt_i);
+      if (po->flags & OPF_CJMP) {
+        ret = find_next_read(po->bt_i, opcnt, opr, magic, op_i);
+        if (ret < 0)
+          return ret;
+      }
+
+      i = po->bt_i - 1;
+      continue;
+    }
+
+    if (!is_opr_read(opr, po)) {
+      if (is_opr_modified(opr, po))
+        // it's overwritten
+        return 0;
+      if (po->flags & OPF_TAIL)
+        return 0;
+      continue;
+    }
+
+    if (*op_i >= 0)
+      return -1;
+
+    *op_i = i;
+    return 1;
+  }
+
+  return 0;
 }
 
 static int try_resolve_const(int i, const struct parsed_opr *opr,
@@ -3173,6 +3320,7 @@ static struct parsed_proto *process_call(int i, int opcnt)
   const struct parsed_proto *pp_c;
   struct parsed_proto *pp;
   const char *tmpname;
+  int call_i = -1, ref_i = -1;
   int adj = 0, multipath = 0;
   int ret, arg;
 
@@ -3181,7 +3329,7 @@ static struct parsed_proto *process_call(int i, int opcnt)
   if (pp == NULL)
   {
     // indirect call
-    pp_c = resolve_icall(i, opcnt, &multipath);
+    pp_c = resolve_icall(i, opcnt, &call_i, &multipath);
     if (pp_c != NULL) {
       if (!pp_c->is_func && !pp_c->is_fptr)
         ferr(po, "call to non-func: %s\n", pp_c->name);
@@ -3195,6 +3343,23 @@ static struct parsed_proto *process_call(int i, int opcnt)
       case OPT_REG:
         // we resolved this call and no longer need the register
         po->regmask_src &= ~(1 << po->operand[0].reg);
+
+        if (!multipath && i != call_i && ops[call_i].op == OP_MOV
+          && ops[call_i].operand[1].type == OPT_LABEL)
+        {
+          // no other source users?
+          ret = resolve_last_ref(i, &po->operand[0], opcnt * 10,
+                  &ref_i);
+          if (ret == 1 && call_i == ref_i) {
+            // and nothing uses it after us?
+            ref_i = -1;
+            ret = find_next_read(i + 1, opcnt, &po->operand[0],
+                    opcnt * 11, &ref_i);
+            if (ret != 1)
+              // then also don't need the source mov
+              ops[call_i].flags |= OPF_RMD;
+          }
+        }
         break;
       case OPT_REGMEM:
         pp->is_fptr = 1;
@@ -5648,17 +5813,14 @@ static void gen_hdr_dep_pass(int i, int opcnt, unsigned char *cbits,
       if (po->btj != NULL) {
         // jumptable
         for (j = 0; j < po->btj->count; j++) {
+          check_i(po, po->btj->d[j].bt_i);
           gen_hdr_dep_pass(po->btj->d[j].bt_i, opcnt, cbits, fp,
             regmask_save, regmask_dst, regmask_dep, has_ret);
         }
         return;
       }
 
-      if (po->bt_i < 0) {
-        ferr(po, "dead branch\n");
-        return;
-      }
-
+      check_i(po, po->bt_i);
       if (po->flags & OPF_CJMP) {
         gen_hdr_dep_pass(po->bt_i, opcnt, cbits, fp,
           regmask_save, regmask_dst, regmask_dep, has_ret);
