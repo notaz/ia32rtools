@@ -13,6 +13,7 @@
 
 #include "my_assert.h"
 #include "my_str.h"
+#include "common.h"
 
 #define ARRAY_SIZE(x) (sizeof(x) / sizeof(x[0]))
 #define IS(w, y) !strcmp(w, y)
@@ -87,7 +88,7 @@ static void next_section(FILE *fasm, char *name)
 
   name[0] = 0;
 
-  while (fgets(line, sizeof(line), fasm))
+  while (my_fgets(line, sizeof(line), fasm))
   {
     wordc = 0;
     asmln++;
@@ -96,14 +97,8 @@ static void next_section(FILE *fasm, char *name)
     if (*p == 0)
       continue;
 
-    if (*p == ';') {
-      while (strlen(line) == sizeof(line) - 1) {
-        // one of those long comment lines..
-        if (!fgets(line, sizeof(line), fasm))
-          break;
-      }
+    if (*p == ';')
       continue;
-    }
 
     for (wordc = 0; wordc < ARRAY_SIZE(words); wordc++) {
       p = sskip(next_word(words[wordc], sizeof(words[0]), p));
@@ -462,7 +457,7 @@ int main(int argc, char *argv[])
     frlist = fopen(argv[arg], "r");
     my_assert_not(frlist, NULL);
 
-    while (fgets(line, sizeof(line), frlist)) {
+    while (my_fgets(line, sizeof(line), frlist)) {
       p = sskip(line);
       if (*p == 0 || *p == ';')
         continue;
@@ -514,7 +509,7 @@ int main(int argc, char *argv[])
     if (!header_mode)
       fprintf(fout, ".align %d\n", align_value(4));
 
-    while (fgets(line, sizeof(line), fasm))
+    while (my_fgets(line, sizeof(line), fasm))
     {
       sym = NULL;
       asmln++;
