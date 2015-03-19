@@ -264,3 +264,6 @@ unsigned long __cdecl _beginthreadex (void *, unsigned int, unsigned int (__stdc
 // DECLSPEC_NORETURN
 void __cdecl _endthreadex (unsigned int);
 
+void __cdecl _lock(int locknum);
+void __cdecl _unlock(int locknum);
+size_t __cdecl strncnt(const char*, size_t);

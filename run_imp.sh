@@ -1,5 +1,7 @@
 #!/bin/sh
 
+mingwb=i686-w64-mingw32
+
 target_s=$1
 src_asm=$2
 implist=${target_s}_implist
@@ -23,9 +25,9 @@ cat $implist | while read i; do
     ;;
   esac
 
-  grep "\<_$si\>" /usr/i586-mingw32msvc/lib/lib* "$@" | awk '{print $3}' | \
+  grep "\<_\?_$si\>" /usr/$mingwb/lib/lib* "$@" | awk '{print $3}' | \
     while read f; do
-      sym=`i586-mingw32msvc-nm $f | grep "\<_$si\>" | grep ' T ' | awk '{print $3}'`
+      sym=`${mingwb}-nm $f | grep "\<_\?_$si\>" | grep ' T ' | awk '{print $3}'`
       if test -n "$sym"; then
         echo $sym > $tmpsym
         break

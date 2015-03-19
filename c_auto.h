@@ -43,3 +43,9 @@ typedef struct {
 #define PCVOID LPCVOID
 #define __VALIST __ms_va_list
 #endif
+
+static inline BOOL PtInRect_sa(LPCRECT r, int x, int y)
+{
+  POINT p = { x, y };
+  return PtInRect(r, p);
+}
