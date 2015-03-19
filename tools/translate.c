@@ -2862,20 +2862,170 @@ static void scan_for_call_type(int i, const struct parsed_opr *opr,
   }
 }
 
-// early check for tail call or branch back
-static int is_like_tailjmp(int j)
+static void add_label_ref(struct label_ref *lr, int op_i)
 {
-  if (!(ops[j].flags & OPF_JMP))
-    return 0;
+  struct label_ref *lr_new;
 
-  if (ops[j].op == OP_JMP && !ops[j].operand[0].had_ds)
-    // probably local branch back..
-    return 1;
-  if (ops[j].op == OP_CALL)
-    // probably noreturn call..
-    return 1;
+  if (lr->i == -1) {
+    lr->i = op_i;
+    return;
+  }
 
-  return 0;
+  lr_new = calloc(1, sizeof(*lr_new));
+  lr_new->i = op_i;
+  lr_new->next = lr->next;
+  lr->next = lr_new;
+}
+
+static struct parsed_data *try_resolve_jumptab(int i, int opcnt)
+{
+  struct parsed_op *po = &ops[i];
+  struct parsed_data *pd;
+  char label[NAMELEN], *p;
+  int len, j, l;
+
+  p = strchr(po->operand[0].name, '[');
+  if (p == NULL)
+    return NULL;
+
+  len = p - po->operand[0].name;
+  strncpy(label, po->operand[0].name, len);
+  label[len] = 0;
+
+  for (j = 0, pd = NULL; j < g_func_pd_cnt; j++) {
+    if (IS(g_func_pd[j].label, label)) {
+      pd = &g_func_pd[j];
+      break;
+    }
+  }
+  if (pd == NULL)
+    //ferr(po, "label '%s' not parsed?\n", label);
+    return NULL;
+
+  if (pd->type != OPT_OFFSET)
+    ferr(po, "label '%s' with non-offset data?\n", label);
+
+  // find all labels, link
+  for (j = 0; j < pd->count; j++) {
+    for (l = 0; l < opcnt; l++) {
+      if (g_labels[l] != NULL && IS(g_labels[l], pd->d[j].u.label)) {
+        add_label_ref(&g_label_refs[l], i);
+        pd->d[j].bt_i = l;
+        break;
+      }
+    }
+  }
+
+  return pd;
+}
+
+static void clear_labels(int count)
+{
+  int i;
+
+  for (i = 0; i < count; i++) {
+    if (g_labels[i] != NULL) {
+      free(g_labels[i]);
+      g_labels[i] = NULL;
+    }
+  }
+}
+
+static void resolve_branches_parse_calls(int opcnt)
+{
+  const struct parsed_proto *pp_c;
+  struct parsed_proto *pp;
+  struct parsed_data *pd;
+  struct parsed_op *po;
+  const char *tmpname;
+  int i, l, ret;
+
+  for (i = 0; i < opcnt; i++)
+  {
+    po = &ops[i];
+    po->bt_i = -1;
+    po->btj = NULL;
+
+    if (po->op == OP_CALL) {
+      pp = NULL;
+
+      if (po->operand[0].type == OPT_LABEL) {
+        tmpname = opr_name(po, 0);
+        if (IS_START(tmpname, "loc_"))
+          ferr(po, "call to loc_*\n");
+        pp_c = proto_parse(g_fhdr, tmpname, g_header_mode);
+        if (!g_header_mode && pp_c == NULL)
+          ferr(po, "proto_parse failed for call '%s'\n", tmpname);
+
+        if (pp_c != NULL) {
+          pp = proto_clone(pp_c);
+          my_assert_not(pp, NULL);
+        }
+      }
+      else if (po->datap != NULL) {
+        pp = calloc(1, sizeof(*pp));
+        my_assert_not(pp, NULL);
+
+        ret = parse_protostr(po->datap, pp);
+        if (ret < 0)
+          ferr(po, "bad protostr supplied: %s\n", (char *)po->datap);
+        free(po->datap);
+        po->datap = NULL;
+      }
+
+      if (pp != NULL) {
+        if (pp->is_fptr)
+          check_func_pp(po, pp, "fptr var call");
+        if (pp->is_noreturn)
+          po->flags |= OPF_TAIL;
+      }
+      po->pp = pp;
+      continue;
+    }
+
+    if (!(po->flags & OPF_JMP) || po->op == OP_RET)
+      continue;
+
+    if (po->operand[0].type == OPT_REGMEM) {
+      pd = try_resolve_jumptab(i, opcnt);
+      if (pd == NULL)
+        goto tailcall;
+
+      po->btj = pd;
+      continue;
+    }
+
+    for (l = 0; l < opcnt; l++) {
+      if (g_labels[l] != NULL
+          && IS(po->operand[0].name, g_labels[l]))
+      {
+        if (l == i + 1 && po->op == OP_JMP) {
+          // yet another alignment type..
+          po->flags |= OPF_RMD|OPF_DONE;
+          break;
+        }
+        add_label_ref(&g_label_refs[l], i);
+        po->bt_i = l;
+        break;
+      }
+    }
+
+    if (po->bt_i != -1 || (po->flags & OPF_RMD))
+      continue;
+
+    if (po->operand[0].type == OPT_LABEL)
+      // assume tail call
+      goto tailcall;
+
+    ferr(po, "unhandled branch\n");
+
+tailcall:
+    po->op = OP_CALL;
+    po->flags |= OPF_TAIL;
+    if (i > 0 && ops[i - 1].op == OP_POP)
+      po->flags |= OPF_ATAIL;
+    i--; // reprocess
+  }
 }
 
 static void scan_prologue_epilogue(int opcnt)
@@ -2925,12 +3075,13 @@ static void scan_prologue_epilogue(int opcnt)
     found = 0;
     do {
       for (; i < opcnt; i++)
-        if (ops[i].op == OP_RET)
+        if (ops[i].flags & OPF_TAIL)
           break;
       j = i - 1;
       if (i == opcnt && (ops[j].flags & OPF_JMP)) {
-        if (found && is_like_tailjmp(j))
-            break;
+        if (ops[j].bt_i != -1 || ops[j].btj != NULL)
+          break;
+        i--;
         j--;
       }
 
@@ -2938,6 +3089,14 @@ static void scan_prologue_epilogue(int opcnt)
           || ops[j].op == OP_LEAVE)
       {
         ops[j].flags |= OPF_RMD | OPF_DONE;
+      }
+      else if (ops[i].op == OP_CALL && ops[i].pp != NULL
+        && ops[i].pp->is_noreturn)
+      {
+        // on noreturn, msvc sometimes cleans stack, sometimes not
+        i++;
+        found = 1;
+        continue;
       }
       else if (!(g_ida_func_attr & IDAFA_NORETURN))
         ferr(&ops[j], "'pop ebp' expected\n");
@@ -2966,6 +3125,8 @@ static void scan_prologue_epilogue(int opcnt)
       i++;
     } while (i < opcnt);
 
+    if (!found)
+      ferr(ops, "missing ebp epilogue\n");
     return;
   }
 
@@ -3031,12 +3192,13 @@ static void scan_prologue_epilogue(int opcnt)
     i++;
     do {
       for (; i < opcnt; i++)
-        if (ops[i].op == OP_RET)
+        if (ops[i].flags & OPF_TAIL)
           break;
       j = i - 1;
       if (i == opcnt && (ops[j].flags & OPF_JMP)) {
-        if (found && is_like_tailjmp(j))
-            break;
+        if (ops[j].bt_i != -1 || ops[j].btj != NULL)
+          break;
+        i--;
         j--;
       }
 
@@ -3077,6 +3239,9 @@ static void scan_prologue_epilogue(int opcnt)
 
       i++;
     } while (i < opcnt);
+
+    if (!found)
+      ferr(ops, "missing esp epilogue\n");
   }
 }
 
@@ -3808,75 +3973,6 @@ static void pp_insert_reg_arg(struct parsed_proto *pp, const char *reg)
   pp->argc_reg++;
 }
 
-static void add_label_ref(struct label_ref *lr, int op_i)
-{
-  struct label_ref *lr_new;
-
-  if (lr->i == -1) {
-    lr->i = op_i;
-    return;
-  }
-
-  lr_new = calloc(1, sizeof(*lr_new));
-  lr_new->i = op_i;
-  lr_new->next = lr->next;
-  lr->next = lr_new;
-}
-
-static struct parsed_data *try_resolve_jumptab(int i, int opcnt)
-{
-  struct parsed_op *po = &ops[i];
-  struct parsed_data *pd;
-  char label[NAMELEN], *p;
-  int len, j, l;
-
-  p = strchr(po->operand[0].name, '[');
-  if (p == NULL)
-    return NULL;
-
-  len = p - po->operand[0].name;
-  strncpy(label, po->operand[0].name, len);
-  label[len] = 0;
-
-  for (j = 0, pd = NULL; j < g_func_pd_cnt; j++) {
-    if (IS(g_func_pd[j].label, label)) {
-      pd = &g_func_pd[j];
-      break;
-    }
-  }
-  if (pd == NULL)
-    //ferr(po, "label '%s' not parsed?\n", label);
-    return NULL;
-
-  if (pd->type != OPT_OFFSET)
-    ferr(po, "label '%s' with non-offset data?\n", label);
-
-  // find all labels, link
-  for (j = 0; j < pd->count; j++) {
-    for (l = 0; l < opcnt; l++) {
-      if (g_labels[l] != NULL && IS(g_labels[l], pd->d[j].u.label)) {
-        add_label_ref(&g_label_refs[l], i);
-        pd->d[j].bt_i = l;
-        break;
-      }
-    }
-  }
-
-  return pd;
-}
-
-static void clear_labels(int count)
-{
-  int i;
-
-  for (i = 0; i < count; i++) {
-    if (g_labels[i] != NULL) {
-      free(g_labels[i]);
-      g_labels[i] = NULL;
-    }
-  }
-}
-
 static void output_std_flags(FILE *fout, struct parsed_op *po,
   int *pfomask, const char *dst_opr_text)
 {
@@ -3993,10 +4089,8 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
   struct parsed_op *po, *delayed_flag_op = NULL, *tmp_op;
   struct parsed_opr *last_arith_dst = NULL;
   char buf1[256], buf2[256], buf3[256], cast[64];
-  const struct parsed_proto *pp_c;
   struct parsed_proto *pp, *pp_tmp;
   struct parsed_data *pd;
-  const char *tmpname;
   unsigned int uval;
   int save_arg_vars[MAX_ARG_GRP] = { 0, };
   int cond_vars = 0;
@@ -4029,110 +4123,28 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
   regmask_arg = get_pp_arg_regmask(g_func_pp);
 
   // pass1:
+  // - resolve all branches
+  // - parse calls with labels
+  resolve_branches_parse_calls(opcnt);
+
+  // pass2:
   // - handle ebp/esp frame, remove ops related to it
   scan_prologue_epilogue(opcnt);
 
-  // pass2:
-  // - parse calls with labels
-  // - resolve all branches
-  for (i = 0; i < opcnt; i++)
-  {
-    po = &ops[i];
-    po->bt_i = -1;
-    po->btj = NULL;
-
-    if (po->flags & (OPF_RMD|OPF_DONE))
-      continue;
-
-    if (po->op == OP_CALL) {
-      pp = NULL;
-
-      if (po->operand[0].type == OPT_LABEL) {
-        tmpname = opr_name(po, 0);
-        if (IS_START(tmpname, "loc_"))
-          ferr(po, "call to loc_*\n");
-        pp_c = proto_parse(fhdr, tmpname, 0);
-        if (pp_c == NULL)
-          ferr(po, "proto_parse failed for call '%s'\n", tmpname);
-
-        pp = proto_clone(pp_c);
-        my_assert_not(pp, NULL);
-      }
-      else if (po->datap != NULL) {
-        pp = calloc(1, sizeof(*pp));
-        my_assert_not(pp, NULL);
-
-        ret = parse_protostr(po->datap, pp);
-        if (ret < 0)
-          ferr(po, "bad protostr supplied: %s\n", (char *)po->datap);
-        free(po->datap);
-        po->datap = NULL;
-      }
-
-      if (pp != NULL) {
-        if (pp->is_fptr)
-          check_func_pp(po, pp, "fptr var call");
-        if (pp->is_noreturn)
-          po->flags |= OPF_TAIL;
-      }
-      po->pp = pp;
-      continue;
-    }
-
-    if (!(po->flags & OPF_JMP) || po->op == OP_RET)
-      continue;
-
-    if (po->operand[0].type == OPT_REGMEM) {
-      pd = try_resolve_jumptab(i, opcnt);
-      if (pd == NULL)
-        goto tailcall;
-
-      po->btj = pd;
-      continue;
-    }
-
-    for (l = 0; l < opcnt; l++) {
-      if (g_labels[l] != NULL
-          && IS(po->operand[0].name, g_labels[l]))
-      {
-        if (l == i + 1 && po->op == OP_JMP) {
-          // yet another alignment type..
-          po->flags |= OPF_RMD|OPF_DONE;
-          break;
-        }
-        add_label_ref(&g_label_refs[l], i);
-        po->bt_i = l;
-        break;
-      }
-    }
-
-    if (po->bt_i != -1 || (po->flags & OPF_RMD))
-      continue;
-
-    if (po->operand[0].type == OPT_LABEL)
-      // assume tail call
-      goto tailcall;
-
-    ferr(po, "unhandled branch\n");
-
-tailcall:
-    po->op = OP_CALL;
-    po->flags |= OPF_TAIL;
-    if (i > 0 && ops[i - 1].op == OP_POP)
-      po->flags |= OPF_ATAIL;
-    i--; // reprocess
-  }
-
   // pass3:
   // - remove dead labels
-  // - process trivial calls
   for (i = 0; i < opcnt; i++)
   {
     if (g_labels[i] != NULL && g_label_refs[i].i == -1) {
       free(g_labels[i]);
       g_labels[i] = NULL;
     }
+  }
 
+  // pass4:
+  // - process trivial calls
+  for (i = 0; i < opcnt; i++)
+  {
     po = &ops[i];
     if (po->flags & (OPF_RMD|OPF_DONE))
       continue;
@@ -4165,7 +4177,7 @@ tailcall:
     }
   }
 
-  // pass4:
+  // pass5:
   // - process calls
   // - handle push <const>/pop pairs
   for (i = 0; i < opcnt; i++)
@@ -4192,7 +4204,7 @@ tailcall:
         scan_for_pop_const(i, opcnt, &regmask_pp);
   }
 
-  // pass5:
+  // pass6:
   // - find POPs for PUSHes, rm both
   // - scan for STD/CLD, propagate DF
   // - scan for all used registers
@@ -4437,7 +4449,7 @@ tailcall:
     }
   }
 
-  // pass6:
+  // pass7:
   // - confirm regmask_save, it might have been reduced
   if (regmask_save != 0)
   {
@@ -4969,6 +4981,19 @@ tailcall:
 
       // arithmetic w/flags
       case OP_AND:
+        if (po->operand[1].type == OPT_CONST && !po->operand[1].val) {
+          // deal with complex dst clear
+          assert_operand_cnt(2);
+          fprintf(fout, "  %s = %s;",
+            out_dst_opr(buf1, sizeof(buf1), po, &po->operand[0]),
+            out_src_opr(buf2, sizeof(buf2), po, &po->operand[1],
+             default_cast_to(buf3, sizeof(buf3), &po->operand[0]), 0));
+          output_std_flags(fout, po, &pfomask, buf1);
+          last_arith_dst = &po->operand[0];
+          delayed_flag_op = NULL;
+          break;
+        }
+        // fallthrough
       case OP_OR:
         propagate_lmod(po, &po->operand[0], &po->operand[1]);
         // fallthrough
@@ -5929,17 +5954,14 @@ static void gen_hdr(const char *funcn, int opcnt)
 {
   int save_arg_vars[MAX_ARG_GRP] = { 0, };
   unsigned char cbits[MAX_OPS / 8];
-  const struct parsed_proto *pp_c;
   struct parsed_proto *pp;
   struct func_prototype *fp;
-  struct parsed_data *pd;
   struct parsed_op *po;
-  const char *tmpname;
   int regmask_dummy = 0;
   int regmask_dep;
   int max_bp_offset = 0;
   int has_ret;
-  int i, j, l, ret;
+  int i, j, ret;
 
   if ((hg_fp_cnt & 0xff) == 0) {
     hg_fp = realloc(hg_fp, sizeof(hg_fp[0]) * (hg_fp_cnt + 0x100));
@@ -5967,89 +5989,37 @@ static void gen_hdr(const char *funcn, int opcnt)
   g_stack_frame_used = 0;
 
   // pass1:
+  // - resolve all branches
+  // - parse calls with labels
+  resolve_branches_parse_calls(opcnt);
+
+  // pass2:
   // - handle ebp/esp frame, remove ops related to it
   scan_prologue_epilogue(opcnt);
 
-  // pass2:
+  // pass3:
+  // - remove dead labels
   // - collect calls
-  // - resolve all branches
   for (i = 0; i < opcnt; i++)
   {
-    po = &ops[i];
-    po->bt_i = -1;
-    po->btj = NULL;
+    if (g_labels[i] != NULL && g_label_refs[i].i == -1) {
+      free(g_labels[i]);
+      g_labels[i] = NULL;
+    }
 
+    po = &ops[i];
     if (po->flags & (OPF_RMD|OPF_DONE))
       continue;
 
     if (po->op == OP_CALL) {
-      tmpname = opr_name(po, 0);
-      pp = NULL;
-      if (po->operand[0].type == OPT_LABEL) {
-        hg_fp_add_dep(fp, tmpname);
-
-        // perhaps a call to already known func?
-        pp_c = proto_parse(g_fhdr, tmpname, 1);
-        if (pp_c != NULL)
-          pp = proto_clone(pp_c);
-      }
-      else if (po->datap != NULL) {
-        pp = calloc(1, sizeof(*pp));
-        my_assert_not(pp, NULL);
-
-        ret = parse_protostr(po->datap, pp);
-        if (ret < 0)
-          ferr(po, "bad protostr supplied: %s\n", (char *)po->datap);
-        free(po->datap);
-        po->datap = NULL;
-      }
-      if (pp != NULL && pp->is_noreturn)
-        po->flags |= OPF_TAIL;
-
-      po->pp = pp;
-      continue;
+      if (po->operand[0].type == OPT_LABEL)
+        hg_fp_add_dep(fp, opr_name(po, 0));
+      else if (po->pp != NULL)
+        hg_fp_add_dep(fp, po->pp->name);
     }
-
-    if (!(po->flags & OPF_JMP) || po->op == OP_RET)
-      continue;
-
-    if (po->operand[0].type == OPT_REGMEM) {
-      pd = try_resolve_jumptab(i, opcnt);
-      if (pd == NULL)
-        goto tailcall;
-
-      po->btj = pd;
-      continue;
-    }
-
-    for (l = 0; l < opcnt; l++) {
-      if (g_labels[l] != NULL
-          && IS(po->operand[0].name, g_labels[l]))
-      {
-        add_label_ref(&g_label_refs[l], i);
-        po->bt_i = l;
-        break;
-      }
-    }
-
-    if (po->bt_i != -1 || (po->flags & OPF_RMD))
-      continue;
-
-    if (po->operand[0].type == OPT_LABEL)
-      // assume tail call
-      goto tailcall;
-
-    ferr(po, "unhandled branch\n");
-
-tailcall:
-    po->op = OP_CALL;
-    po->flags |= OPF_TAIL;
-    if (i > 0 && ops[i - 1].op == OP_POP)
-      po->flags |= OPF_ATAIL;
-    i--; // reprocess
   }
 
-  // pass3:
+  // pass4:
   // - remove dead labels
   // - handle push <const>/pop pairs
   for (i = 0; i < opcnt; i++)
@@ -6067,7 +6037,7 @@ tailcall:
       scan_for_pop_const(i, opcnt, &regmask_dummy);
   }
 
-  // pass4:
+  // pass5:
   // - process trivial calls
   for (i = 0; i < opcnt; i++)
   {
@@ -6100,7 +6070,7 @@ tailcall:
     }
   }
 
-  // pass5:
+  // pass6:
   // - track saved regs (simple)
   // - process calls
   for (i = 0; i < opcnt; i++)
@@ -6130,7 +6100,7 @@ tailcall:
     }
   }
 
-  // pass6
+  // pass7
   memset(cbits, 0, sizeof(cbits));
   regmask_dep = 0;
   has_ret = -1;
