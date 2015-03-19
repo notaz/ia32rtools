@@ -3304,7 +3304,7 @@ static int resolve_origin(int i, const struct parsed_opr *opr,
     }
 
     if (ops[i].cc_scratch == magic)
-      return 0;
+      return ret;
     ops[i].cc_scratch = magic;
 
     if (!(ops[i].flags & OPF_DATA))
@@ -3314,13 +3314,14 @@ static int resolve_origin(int i, const struct parsed_opr *opr,
 
     if (*op_i >= 0) {
       if (*op_i == i)
-        return 1;
+        return ret | 1;
+
       // XXX: could check if the other op does the same
       return -1;
     }
 
     *op_i = i;
-    return 1;
+    return ret | 1;
   }
 }
 
@@ -5767,6 +5768,25 @@ static int hg_var_cnt;
 static void output_hdr_fp(FILE *fout, const struct func_prototype *fp,
   int count);
 
+struct func_prototype *hg_fp_add(const char *funcn)
+{
+  struct func_prototype *fp;
+
+  if ((hg_fp_cnt & 0xff) == 0) {
+    hg_fp = realloc(hg_fp, sizeof(hg_fp[0]) * (hg_fp_cnt + 0x100));
+    my_assert_not(hg_fp, NULL);
+    memset(hg_fp + hg_fp_cnt, 0, sizeof(hg_fp[0]) * 0x100);
+  }
+
+  fp = &hg_fp[hg_fp_cnt];
+  snprintf(fp->name, sizeof(fp->name), "%s", funcn);
+  fp->id = hg_fp_cnt;
+  fp->argc_stack = -1;
+  hg_fp_cnt++;
+
+  return fp;
+}
+
 static struct func_proto_dep *hg_fp_find_dep(struct func_prototype *fp,
   const char *name)
 {
@@ -5901,6 +5921,8 @@ static void gen_hdr_dep_pass(int i, int opcnt, unsigned char *cbits,
       }
     }
 
+    // if has_ret is 0, there is uninitialized eax path,
+    // which means it's most likely void func
     if (*has_ret != 0 && (po->flags & OPF_TAIL)) {
       if (po->op == OP_CALL) {
         j = i;
@@ -5915,13 +5937,13 @@ static void gen_hdr_dep_pass(int i, int opcnt, unsigned char *cbits,
         ret = resolve_origin(i, &opr, i + opcnt * 4, &j, &from_caller);
       }
 
-      if (ret == -1 && from_caller) {
+      if (ret != 1 && from_caller) {
         // unresolved eax - probably void func
         *has_ret = 0;
       }
       else {
-        if (ops[j].op == OP_CALL) {
-          dep = hg_fp_find_dep(fp, po->operand[0].name);
+        if (j >= 0 && ops[j].op == OP_CALL) {
+          dep = hg_fp_find_dep(fp, ops[j].operand[0].name);
           if (dep != NULL)
             dep->ret_dep = 1;
           else
@@ -5954,6 +5976,7 @@ static void gen_hdr(const char *funcn, int opcnt)
 {
   int save_arg_vars[MAX_ARG_GRP] = { 0, };
   unsigned char cbits[MAX_OPS / 8];
+  const struct parsed_proto *pp_c;
   struct parsed_proto *pp;
   struct func_prototype *fp;
   struct parsed_op *po;
@@ -5963,27 +5986,12 @@ static void gen_hdr(const char *funcn, int opcnt)
   int has_ret;
   int i, j, ret;
 
-  if ((hg_fp_cnt & 0xff) == 0) {
-    hg_fp = realloc(hg_fp, sizeof(hg_fp[0]) * (hg_fp_cnt + 0x100));
-    my_assert_not(hg_fp, NULL);
-    memset(hg_fp + hg_fp_cnt, 0, sizeof(hg_fp[0]) * 0x100);
-  }
-
-  fp = &hg_fp[hg_fp_cnt];
-  snprintf(fp->name, sizeof(fp->name), "%s", funcn);
-  fp->id = hg_fp_cnt;
-  fp->argc_stack = -1;
-  hg_fp_cnt++;
-
-  // perhaps already in seed header?
-  fp->pp = proto_parse(g_fhdr, funcn, 1);
-  if (fp->pp != NULL) {
-    fp->argc_stack = fp->pp->argc_stack;
-    fp->is_stdcall = fp->pp->is_stdcall;
-    fp->regmask_dep = get_pp_arg_regmask(fp->pp);
-    fp->has_ret = !IS(fp->pp->ret_type.name, "void");
+  pp_c = proto_parse(g_fhdr, funcn, 1);
+  if (pp_c != NULL)
+    // already in seed, will add to hg_fp later
     return;
-  }
+
+  fp = hg_fp_add(funcn);
 
   g_bp_frame = g_sp_frame = g_stack_fsz = 0;
   g_stack_frame_used = 0;
@@ -6117,9 +6125,6 @@ static void gen_hdr(const char *funcn, int opcnt)
       ferr(&ops[i], "unreachable code\n");
   }
 
-  if (has_ret == -1 && (regmask_dep & (1 << xAX)))
-    has_ret = 1;
-
   for (i = 0; i < g_eqcnt; i++) {
     if (g_eqs[i].offset > max_bp_offset && g_eqs[i].offset < 4*32)
       max_bp_offset = g_eqs[i].offset;
@@ -6138,7 +6143,7 @@ static void gen_hdr(const char *funcn, int opcnt)
   printf("// has_ret %d, regmask_dep %x\n",
     fp->has_ret, fp->regmask_dep);
   output_hdr_fp(stdout, fp, 1);
-  if (IS(funcn, "sub_100073FD")) exit(1);
+  if (IS(funcn, "sub_10007F72")) exit(1);
 #endif
 
   gen_x_cleanup(opcnt);
@@ -6167,7 +6172,7 @@ static void hg_fp_resolve_deps(struct func_prototype *fp)
       // printf("dep %s %s |= %x\n", fp->name,
       //   fp->dep_func[i].name, dep);
 
-      if (fp->has_ret == -1)
+      if (fp->has_ret == -1 && fp->dep_func[i].ret_dep)
         fp->has_ret = fp->dep_func[i].proto->has_ret;
     }
   }
@@ -6287,8 +6292,24 @@ static void output_hdr(FILE *fout)
     [OPLM_QWORD] = "uint64_t",
   };
   const struct scanned_var *var;
+  struct func_prototype *fp;
   char line[256] = { 0, };
+  char name[256];
   int i;
+
+  // add stuff from headers
+  for (i = 0; i < pp_cache_size; i++) {
+    if (pp_cache[i].is_cinc && !pp_cache[i].is_stdcall)
+      snprintf(name, sizeof(name), "_%s", pp_cache[i].name);
+    else
+      snprintf(name, sizeof(name), "%s", pp_cache[i].name);
+    fp = hg_fp_add(name);
+    fp->pp = &pp_cache[i];
+    fp->argc_stack = fp->pp->argc_stack;
+    fp->is_stdcall = fp->pp->is_stdcall;
+    fp->regmask_dep = get_pp_arg_regmask(fp->pp);
+    fp->has_ret = !IS(fp->pp->ret_type.name, "void");
+  }
 
   // resolve deps
   qsort(hg_fp, hg_fp_cnt, sizeof(hg_fp[0]), hg_fp_cmp_name);

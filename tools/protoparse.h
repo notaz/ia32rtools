@@ -44,6 +44,7 @@ struct parsed_proto {
 	unsigned int is_userstack:1;
 	unsigned int is_include:1;    // not from top-level header
 	unsigned int is_osinc:1;      // OS/system library func
+	unsigned int is_cinc:1;       // crt library func
 	unsigned int is_arg:1;        // declared in some func arg
 	unsigned int has_structarg:1;
 	unsigned int has_retreg:1;
@@ -56,7 +57,7 @@ static void pp_copy_arg(struct parsed_proto_arg *d,
 	const struct parsed_proto_arg *s);
 
 static int b_pp_c_handler(char *proto, const char *fname,
-	int is_include, int is_osinc);
+	int is_include, int is_osinc, int is_cinc);
 
 static int do_protostrs(FILE *fhdr, const char *fname, int is_include)
 {
@@ -66,6 +67,7 @@ static int do_protostrs(FILE *fhdr, const char *fname, int is_include)
 	char path[256];
 	char fname_inc[256];
 	int is_osinc;
+	int is_cinc;
 	FILE *finc;
 	int line = 0;
 	int ret;
@@ -74,8 +76,8 @@ static int do_protostrs(FILE *fhdr, const char *fname, int is_include)
 	hdrfn_saved = hdrfn;
 	hdrfn = fname;
 
-	is_osinc = strstr(fname, "stdc.hlist")
-		 || strstr(fname, "win32.hlist");
+	is_cinc = strstr(fname, "stdc.hlist") != NULL;
+	is_osinc = is_cinc || strstr(fname, "stdc.hlist") != NULL;
 
 	while (fgets(protostr, sizeof(protostr), fhdr))
 	{
@@ -119,7 +121,7 @@ static int do_protostrs(FILE *fhdr, const char *fname, int is_include)
 		hdrfline = line;
 
 		ret = b_pp_c_handler(protostr, hdrfn, is_include,
-			is_osinc);
+			is_osinc, is_cinc);
 		if (ret < 0)
 			break;
 	}
@@ -665,7 +667,7 @@ static int pp_cache_size;
 static int pp_cache_alloc;
 
 static int b_pp_c_handler(char *proto, const char *fname,
-	int is_include, int is_osinc)
+	int is_include, int is_osinc, int is_cinc)
 {
 	int ret;
 
@@ -685,6 +687,7 @@ static int b_pp_c_handler(char *proto, const char *fname,
 
 	pp_cache[pp_cache_size].is_include = is_include;
 	pp_cache[pp_cache_size].is_osinc = is_osinc;
+	pp_cache[pp_cache_size].is_cinc = is_cinc;
 	pp_cache_size++;
 	return 0;
 }
