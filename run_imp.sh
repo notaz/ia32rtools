@@ -1,6 +1,8 @@
 #!/bin/sh
 
-mingwb=i686-w64-mingw32
+# warning: i686-w64-mingw32- on Ubuntu 14.04
+# contains broken InterlockedDecrement
+test -n "$mingwb" || mingwb=i686-w64-mingw32
 
 target_s=$1
 src_asm=$2
