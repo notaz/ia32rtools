@@ -1,7 +1,7 @@
 CROSS_COMPILE = i586-mingw32msvc-
 CC = $(CROSS_COMPILE)gcc
 CXX = $(CROSS_COMPILE)g++
-IDASDK = $(wildcard idasdk*)
+IDASDK = $(wildcard ../idasdk*)
 
 CFLAGS += -Wall -Wno-sign-compare -fno-strict-aliasing
 CFLAGS += -I$(IDASDK)/include/ -D__IDP__ -D__PLUGIN__ -D__NT__

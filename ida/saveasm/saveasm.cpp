@@ -726,10 +726,10 @@ pass:
 
 //--------------------------------------------------------------------------
 
-static const char comment[] = "Generate disassembly lines for one address";
+static const char comment[] = "Generate disassembly for nasm";
 static const char help[] = "Generate asm file\n";
 static const char wanted_name[] = "Save asm";
-static const char wanted_hotkey[] = "Ctrl-F6";
+static const char wanted_hotkey[] = "Shift-S";
 
 //--------------------------------------------------------------------------
 //
