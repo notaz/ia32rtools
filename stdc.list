@@ -95,13 +95,30 @@ _atoi
 _abs
 _labs
 
+__findfirst
+__findnext
+__findclose
+__chdir
+__getcwd
+__mkdir
+__mktemp
+__rmdir
+__chmod
+_remove
+_rename
+
 # float
 __control87
 __controlfp
 
-# math
-# __ftol2 - todo
+# msvcrt math
+# __ftol - x87 state
+# __ftol2 - x87 state
 _ceil
+_sqrt
+_pow
+__rotl
+__rotr
 
 # msvcrt
 __beginthread
