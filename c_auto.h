@@ -18,22 +18,22 @@ typedef struct {
 } mmxr;
 
 #define bool int
-#define _BYTE BYTE
-#define _WORD WORD
-#define _DWORD DWORD
+#define _BYTE uint8_t
+#define _WORD uint16_t
+#define _DWORD uint32_t
 #define _UNKNOWN uint8_t
 #undef LOBYTE
 #undef LOWORD
 #undef HIBYTE
 #undef HIWORD
-#define LOBYTE(x)   (*((_BYTE*)&(x)))
-#define LOWORD(x)   (*((_WORD*)&(x)))
-#define HIBYTE(x)   (*((_BYTE*)&(x)+1))
-#define HIWORD(x)   (*((_WORD*)&(x)+1))
-#define BYTE0(x)    (*((_BYTE*)&(x)+0))
-#define BYTE1(x)    (*((_BYTE*)&(x)+1))
-#define BYTE2(x)    (*((_BYTE*)&(x)+2))
-#define BYTE3(x)    (*((_BYTE*)&(x)+3))
+#define LOBYTE(x)   (*((u8*)&(x)))
+#define LOWORD(x)   (*((u16*)&(x)))
+#define HIBYTE(x)   (*((u8*)&(x)+1))
+#define HIWORD(x)   (*((u16*)&(x)+1))
+#define BYTE0(x)    (*((u8*)&(x)+0))
+#define BYTE1(x)    (*((u8*)&(x)+1))
+#define BYTE2(x)    (*((u8*)&(x)+2))
+#define BYTE3(x)    (*((u8*)&(x)+3))
 
 #define memcpy_0 memcpy
 

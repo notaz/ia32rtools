@@ -42,7 +42,7 @@ enum op_flags {
   OPF_DATA   = (1 << 1), /* data processing - writes to dst opr */
   OPF_FLAGS  = (1 << 2), /* sets flags */
   OPF_JMP    = (1 << 3), /* branch, call */
-  OPF_CJMP   = (1 << 4), /* cond. branch (cc or jecxz) */
+  OPF_CJMP   = (1 << 4), /* cond. branch (cc or jecxz/loop) */
   OPF_CC     = (1 << 5), /* uses flags */
   OPF_TAIL   = (1 << 6), /* ret or tail call */
   OPF_RSAVE  = (1 << 7), /* push/pop is local reg save/load */
@@ -73,6 +73,7 @@ enum op_op {
 	OP_MOVSX,
 	OP_XCHG,
 	OP_NOT,
+	OP_XLAT,
 	OP_CDQ,
 	OP_LODS,
 	OP_STOS,
@@ -90,6 +91,7 @@ enum op_op {
 	OP_SHL,
 	OP_SHR,
 	OP_SAR,
+	OP_SHLD,
 	OP_SHRD,
 	OP_ROL,
 	OP_ROR,
@@ -110,6 +112,7 @@ enum op_op {
 	OP_CALL,
 	OP_JMP,
 	OP_JECXZ,
+	OP_LOOP,
 	OP_JCC,
 	OP_SCC,
 	// x87
@@ -509,19 +512,19 @@ static const char *parse_stack_el(const char *name, char *extra_reg,
 
 static int guess_lmod_from_name(struct parsed_opr *opr)
 {
-  if (!strncmp(opr->name, "dword_", 6)) {
+  if (IS_START(opr->name, "dword_") || IS_START(opr->name, "off_")) {
     opr->lmod = OPLM_DWORD;
     return 1;
   }
-  if (!strncmp(opr->name, "word_", 5)) {
+  if (IS_START(opr->name, "word_")) {
     opr->lmod = OPLM_WORD;
     return 1;
   }
-  if (!strncmp(opr->name, "byte_", 5)) {
+  if (IS_START(opr->name, "byte_")) {
     opr->lmod = OPLM_BYTE;
     return 1;
   }
-  if (!strncmp(opr->name, "qword_", 6)) {
+  if (IS_START(opr->name, "qword_")) {
     opr->lmod = OPLM_QWORD;
     return 1;
   }
@@ -843,6 +846,7 @@ static const struct {
   { "movsx",OP_MOVSX,  2, 2, OPF_DATA },
   { "xchg", OP_XCHG,   2, 2, OPF_DATA },
   { "not",  OP_NOT,    1, 1, OPF_DATA },
+  { "xlat", OP_XLAT,   0, 0, OPF_DATA },
   { "cdq",  OP_CDQ,    0, 0, OPF_DATA },
   { "lodsb",OP_LODS,   0, 0, OPF_DATA },
   { "lodsw",OP_LODS,   0, 0, OPF_DATA },
@@ -870,6 +874,7 @@ static const struct {
   { "shr",  OP_SHR,    2, 2, OPF_DATA|OPF_FLAGS },
   { "sal",  OP_SHL,    2, 2, OPF_DATA|OPF_FLAGS },
   { "sar",  OP_SAR,    2, 2, OPF_DATA|OPF_FLAGS },
+  { "shld", OP_SHLD,   3, 3, OPF_DATA|OPF_FLAGS },
   { "shrd", OP_SHRD,   3, 3, OPF_DATA|OPF_FLAGS },
   { "rol",  OP_ROL,    2, 2, OPF_DATA|OPF_FLAGS },
   { "ror",  OP_ROR,    2, 2, OPF_DATA|OPF_FLAGS },
@@ -891,6 +896,7 @@ static const struct {
   { "call", OP_CALL,   1, 1, OPF_JMP|OPF_DATA|OPF_FLAGS },
   { "jmp",  OP_JMP,    1, 1, OPF_JMP },
   { "jecxz",OP_JECXZ,  1, 1, OPF_JMP|OPF_CJMP },
+  { "loop", OP_LOOP,   1, 1, OPF_JMP|OPF_CJMP|OPF_DATA },
   { "jo",   OP_JCC,    1, 1, OPF_CJMP_CC, PFO_O,  0 }, // 70 OF=1
   { "jno",  OP_JCC,    1, 1, OPF_CJMP_CC, PFO_O,  1 }, // 71 OF=0
   { "jc",   OP_JCC,    1, 1, OPF_CJMP_CC, PFO_C,  0 }, // 72 CF=1
@@ -1072,6 +1078,13 @@ static void parse_op(struct parsed_op *op, char words[16][256], int wordc)
     break;
 
   // ops with implicit argumets
+  case OP_XLAT:
+    op->operand_cnt = 2;
+    setup_reg_opr(&op->operand[0], xAX, OPLM_BYTE, &op->regmask_src);
+    op->regmask_dst = op->regmask_src;
+    setup_reg_opr(&op->operand[1], xDX, OPLM_DWORD, &op->regmask_src);
+    break;
+
   case OP_CDQ:
     op->operand_cnt = 2;
     setup_reg_opr(&op->operand[0], xDX, OPLM_DWORD, &op->regmask_dst);
@@ -1115,12 +1128,15 @@ static void parse_op(struct parsed_op *op, char words[16][256], int wordc)
     op->regmask_dst = op->regmask_src;
     break;
 
+  case OP_LOOP:
+    op->regmask_dst = 1 << xCX;
+    // fallthrough
   case OP_JECXZ:
-    op->operand_cnt = 1;
+    op->operand_cnt = 2;
     op->regmask_src = 1 << xCX;
-    op->operand[0].type = OPT_REG;
-    op->operand[0].reg = xCX;
-    op->operand[0].lmod = OPLM_DWORD;
+    op->operand[1].type = OPT_REG;
+    op->operand[1].reg = xCX;
+    op->operand[1].lmod = OPLM_DWORD;
     break;
 
   case OP_IMUL:
@@ -2493,8 +2509,9 @@ static int scan_for_flag_set(int i, int magic, int *branched,
 
   while (i >= 0) {
     if (ops[i].cc_scratch == magic) {
-      ferr(&ops[i], "%s looped\n", __func__);
-      return -1;
+      // is this a problem?
+      //ferr(&ops[i], "%s looped\n", __func__);
+      return 0;
     }
     ops[i].cc_scratch = magic;
 
@@ -2836,7 +2853,7 @@ static void scan_for_call_type(int i, const struct parsed_opr *opr,
 
   if (i < 0) {
     // reached the top - can only be an arg-reg
-    if (opr->type != OPT_REG)
+    if (opr->type != OPT_REG || g_func_pp == NULL)
       return;
 
     for (i = 0; i < g_func_pp->argc; i++) {
@@ -3861,7 +3878,9 @@ static int collect_call_args_r(struct parsed_op *po, int i,
       ops[j].flags &= ~OPF_RSAVE;
 
       // check for __VALIST
-      if (!pp->is_unresolved && pp->arg[arg].type.is_va_list) {
+      if (!pp->is_unresolved && g_func_pp != NULL
+        && pp->arg[arg].type.is_va_list)
+      {
         k = -1;
         ret = resolve_origin(j, &ops[j].operand[0],
                 magic + 1, &k, NULL);
@@ -4874,6 +4893,14 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
         fprintf(fout, "  %s = ~%s;", buf1, buf1);
         break;
 
+      case OP_XLAT:
+        assert_operand_cnt(2);
+        out_dst_opr(buf1, sizeof(buf1), po, &po->operand[0]);
+        out_src_opr_u32(buf2, sizeof(buf2), po, &po->operand[1]);
+        fprintf(fout, "  %s = *(u8 *)(%s + %s);", buf1, buf2, buf1);
+        strcpy(g_comment, "xlat");
+        break;
+
       case OP_CDQ:
         assert_operand_cnt(2);
         fprintf(fout, "  %s = (s32)%s >> 31;",
@@ -5058,8 +5085,11 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
             ferr(po, "TODO\n");
           pfomask &= ~(1 << PFO_C);
         }
-        fprintf(fout, "  %s %s= %s;", buf1, op_to_c(po),
+        fprintf(fout, "  %s %s= %s", buf1, op_to_c(po),
             out_src_opr_u32(buf2, sizeof(buf2), po, &po->operand[1]));
+        if (po->operand[1].type != OPT_CONST)
+          fprintf(fout, " & 0x1f");
+        fprintf(fout, ";");
         output_std_flags(fout, po, &pfomask, buf1);
         last_arith_dst = &po->operand[0];
         delayed_flag_op = NULL;
@@ -5076,6 +5106,7 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
         delayed_flag_op = NULL;
         break;
 
+      case OP_SHLD:
       case OP_SHRD:
         assert_operand_cnt(3);
         propagate_lmod(po, &po->operand[0], &po->operand[1]);
@@ -5083,9 +5114,18 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
         out_dst_opr(buf1, sizeof(buf1), po, &po->operand[0]);
         out_src_opr_u32(buf2, sizeof(buf2), po, &po->operand[1]);
         out_src_opr_u32(buf3, sizeof(buf3), po, &po->operand[2]);
-        fprintf(fout, "  %s >>= %s; %s |= %s << (%d - %s);",
-          buf1, buf3, buf1, buf2, l, buf3);
-        strcpy(g_comment, "shrd");
+        if (po->operand[2].type != OPT_CONST)
+          ferr(po, "TODO: masking\n");
+        if (po->op == OP_SHLD) {
+          fprintf(fout, "  %s <<= %s; %s |= %s >> (%d - %s);",
+            buf1, buf3, buf1, buf2, l, buf3);
+          strcpy(g_comment, "shld");
+        }
+        else {
+          fprintf(fout, "  %s >>= %s; %s |= %s << (%d - %s);",
+            buf1, buf3, buf1, buf2, l, buf3);
+          strcpy(g_comment, "shrd");
+        }
         output_std_flags(fout, po, &pfomask, buf1);
         last_arith_dst = &po->operand[0];
         delayed_flag_op = NULL;
@@ -5392,6 +5432,12 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
         fprintf(fout, "  if (ecx == 0)\n");
         fprintf(fout, "    goto %s;", po->operand[0].name);
         strcat(g_comment, "jecxz");
+        break;
+
+      case OP_LOOP:
+        fprintf(fout, "  if (--ecx == 0)\n");
+        fprintf(fout, "    goto %s;", po->operand[0].name);
+        strcat(g_comment, "loop");
         break;
 
       case OP_JMP:
@@ -5880,6 +5926,9 @@ static void gen_hdr_dep_pass(int i, int opcnt, unsigned char *cbits,
     po = &ops[i];
 
     if ((po->flags & OPF_JMP) && po->op != OP_CALL) {
+      if (po->flags & OPF_RMD)
+        continue;
+
       if (po->btj != NULL) {
         // jumptable
         for (j = 0; j < po->btj->count; j++) {
@@ -6148,6 +6197,13 @@ static void gen_hdr(const char *funcn, int opcnt)
     if (cbits[i >> 3] & (1 << (i & 7)))
       continue;
 
+    if (g_labels[i] == NULL && i > 0 && ops[i - 1].op == OP_CALL
+      && ops[i - 1].pp != NULL && ops[i - 1].pp->is_osinc)
+    {
+      // the compiler sometimes still generates code after
+      // noreturn OS functions
+      break;
+    }
     if (ops[i].op != OP_NOP)
       ferr(&ops[i], "unreachable code\n");
   }
