@@ -243,8 +243,8 @@ static int g_quiet_pp;
 static int g_header_mode;
 
 #define ferr(op_, fmt, ...) do { \
-  printf("%s:%d: error: [%s] '%s': " fmt, asmfn, (op_)->asmln, g_func, \
-    dump_op(op_), ##__VA_ARGS__); \
+  printf("%s:%d: error %u: [%s] '%s': " fmt, asmfn, (op_)->asmln, \
+    __LINE__, g_func, dump_op(op_), ##__VA_ARGS__); \
   fcloseall(); \
   exit(1); \
 } while (0)
@@ -2607,10 +2607,16 @@ static void patch_esp_adjust(struct parsed_op *po, int adj)
 static int scan_for_esp_adjust(int i, int opcnt,
   int adj_expect, int *adj, int *is_multipath, int do_update)
 {
+  int adj_expect_unknown = 0;
   struct parsed_op *po;
   int first_pop = -1;
+  int adj_best = 0;
 
   *adj = *is_multipath = 0;
+  if (adj_expect < 0) {
+    adj_expect_unknown = 1;
+    adj_expect = 32 * 4; // enough?
+  }
 
   for (; i < opcnt && *adj < adj_expect; i++) {
     if (g_labels[i] != NULL)
@@ -2654,6 +2660,8 @@ static int scan_for_esp_adjust(int i, int opcnt,
       }
 
       *adj += lmod_bytes(po, po->operand[0].lmod);
+      if (*adj > adj_best)
+        adj_best = *adj;
     }
     else if (po->flags & (OPF_JMP|OPF_TAIL)) {
       if (po->op == OP_JMP && po->btj == NULL) {
@@ -2668,12 +2676,15 @@ static int scan_for_esp_adjust(int i, int opcnt,
         break;
       if (po->pp != NULL && po->pp->is_stdcall)
         break;
+      if (adj_expect_unknown && first_pop >= 0)
+        break;
       // assume it's another cdecl call
     }
   }
 
   if (first_pop >= 0) {
-    // probably 'pop ecx' was used..
+    // probably only 'pop ecx' was used
+    *adj = adj_best;
     return first_pop;
   }
 
@@ -3103,22 +3114,25 @@ static void scan_prologue_epilogue(int opcnt)
         ferr(&ops[j], "'pop ebp' expected\n");
 
       if (g_stack_fsz != 0) {
-        if (ops[j - 1].op == OP_MOV
+        if (ops[j].op == OP_LEAVE)
+          j--;
+        else if (ops[j].op == OP_POP
+            && ops[j - 1].op == OP_MOV
             && IS(opr_name(&ops[j - 1], 0), "esp")
             && IS(opr_name(&ops[j - 1], 1), "ebp"))
         {
           ops[j - 1].flags |= OPF_RMD | OPF_DONE;
+          j -= 2;
         }
-        else if (ops[j].op != OP_LEAVE
-          && !(g_ida_func_attr & IDAFA_NORETURN))
+        else if (!(g_ida_func_attr & IDAFA_NORETURN))
         {
-          ferr(&ops[j - 1], "esp restore expected\n");
+          ferr(&ops[j], "esp restore expected\n");
         }
 
-        if (ecx_push && ops[j - 2].op == OP_POP
-          && IS(opr_name(&ops[j - 2], 0), "ecx"))
+        if (ecx_push && j >= 0 && ops[j].op == OP_POP
+          && IS(opr_name(&ops[j], 0), "ecx"))
         {
-          ferr(&ops[j - 2], "unexpected ecx pop\n");
+          ferr(&ops[j], "unexpected ecx pop\n");
         }
       }
 
@@ -3456,7 +3470,7 @@ static struct parsed_proto *process_call_early(int i, int opcnt,
   struct parsed_proto *pp;
   int multipath = 0;
   int adj = 0;
-  int ret;
+  int j, ret;
 
   pp = po->pp;
   if (pp == NULL || pp->is_vararg || pp->argc_reg != 0)
@@ -3473,8 +3487,15 @@ static struct parsed_proto *process_call_early(int i, int opcnt,
       return NULL;
     if (multipath)
       return NULL;
-    if (ops[ret].op == OP_POP && adj != 4)
-      return NULL;
+    if (ops[ret].op == OP_POP) {
+      for (j = 1; j < adj / 4; j++) {
+        if (ops[ret + j].op != OP_POP
+          || ops[ret + j].operand[0].reg != xCX)
+        {
+          return NULL;
+        }
+      }
+    }
   }
 
   *adj_i = ret;
@@ -3541,7 +3562,7 @@ static struct parsed_proto *process_call(int i, int opcnt)
 
       pp->is_fptr = 1;
       ret = scan_for_esp_adjust(i + 1, opcnt,
-              32*4, &adj, &multipath, 0);
+              -1, &adj, &multipath, 0);
       if (ret < 0 || adj < 0) {
         if (!g_allow_regfunc)
           ferr(po, "non-__cdecl indirect call unhandled yet\n");
@@ -3562,9 +3583,11 @@ static struct parsed_proto *process_call(int i, int opcnt)
   // look for and make use of esp adjust
   multipath = 0;
   ret = -1;
-  if (!pp->is_stdcall && pp->argc_stack > 0)
+  if (!pp->is_stdcall && pp->argc_stack > 0) {
+    int adj_expect = pp->is_vararg ? -1 : pp->argc_stack * 4;
     ret = scan_for_esp_adjust(i + 1, opcnt,
-            pp->argc_stack * 4, &adj, &multipath, 0);
+            adj_expect, &adj, &multipath, 0);
+  }
   if (ret >= 0) {
     if (pp->is_vararg) {
       if (adj / 4 < pp->argc_stack) {
@@ -4164,11 +4187,12 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
       if (pp != NULL) {
         if (j >= 0) {
           // commit esp adjust
-          ops[j].flags |= OPF_RMD;
           if (ops[j].op != OP_POP)
             patch_esp_adjust(&ops[j], pp->argc_stack * 4);
-          else
-            ops[j].flags |= OPF_DONE;
+          else {
+            for (l = 0; l < pp->argc_stack; l++)
+              ops[j + l].flags |= OPF_DONE | OPF_RMD;
+          }
         }
 
         if (strstr(pp->ret_type.name, "int64"))
@@ -5985,7 +6009,8 @@ static void gen_hdr(const char *funcn, int opcnt)
   int regmask_dep;
   int max_bp_offset = 0;
   int has_ret;
-  int i, j, ret;
+  int i, j, l;
+  int ret;
 
   pp_c = proto_parse(g_fhdr, funcn, 1);
   if (pp_c != NULL)
@@ -6067,11 +6092,12 @@ static void gen_hdr(const char *funcn, int opcnt)
       if (pp != NULL) {
         if (j >= 0) {
           // commit esp adjust
-          ops[j].flags |= OPF_RMD;
           if (ops[j].op != OP_POP)
             patch_esp_adjust(&ops[j], pp->argc_stack * 4);
-          else
-            ops[j].flags |= OPF_DONE;
+          else {
+            for (l = 0; l < pp->argc_stack; l++)
+              ops[j + l].flags |= OPF_DONE | OPF_RMD;
+          }
         }
 
         po->flags |= OPF_DONE;
