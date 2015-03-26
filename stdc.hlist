@@ -279,10 +279,9 @@ unsigned int __cdecl _rotr(unsigned int num, int shift);
 
 // msvcrt
 unsigned long __cdecl _beginthread (void (__cdecl *)(void *), unsigned, void*);
-void __cdecl _endthread	(void);
+DECLSPEC_NORETURN void __cdecl _endthread	(void);
 unsigned long __cdecl _beginthreadex (void *, unsigned int, unsigned int (__stdcall *) (void *), void*, unsigned int, unsigned int*);
-// DECLSPEC_NORETURN
-void __cdecl _endthreadex (unsigned int);
+DECLSPEC_NORETURN void __cdecl _endthreadex (unsigned int);
 
 void __cdecl _lock(int locknum);
 void __cdecl _unlock(int locknum);

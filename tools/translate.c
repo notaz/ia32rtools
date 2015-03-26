@@ -140,6 +140,8 @@ enum opr_lenmod {
 	OPLM_QWORD,
 };
 
+#define MAX_EXITS 128
+
 #define MAX_OPERANDS 3
 #define NAMELEN 112
 
@@ -2172,11 +2174,14 @@ static void op_set_clear_flag(struct parsed_op *po,
   if ((i) < 0) \
     ferr(po, "bad " #i ": %d\n", i)
 
-static int scan_for_pop(int i, int opcnt, const char *reg,
-  int magic, int depth, int *maxdepth, int do_flags)
+// note: this skips over calls and rm'd stuff assuming they're handled
+// so it's intended to use at one of final passes
+static int scan_for_pop(int i, int opcnt, int magic, int reg,
+  int depth, int *maxdepth, int do_flags)
 {
   const struct parsed_proto *pp;
   struct parsed_op *po;
+  int relevant;
   int ret = 0;
   int j;
 
@@ -2196,8 +2201,7 @@ static int scan_for_pop(int i, int opcnt, const char *reg,
       return -1; // deadend
     }
 
-    if ((po->flags & (OPF_RMD|OPF_DONE))
-        || (po->op == OP_PUSH && po->p_argnum != 0)) // arg push
+    if (po->flags & (OPF_RMD|OPF_DONE|OPF_FARG))
       continue;
 
     if ((po->flags & OPF_JMP) && po->op != OP_CALL) {
@@ -2205,7 +2209,7 @@ static int scan_for_pop(int i, int opcnt, const char *reg,
         // jumptable
         for (j = 0; j < po->btj->count; j++) {
           check_i(po, po->btj->d[j].bt_i);
-          ret |= scan_for_pop(po->btj->d[j].bt_i, opcnt, reg, magic,
+          ret |= scan_for_pop(po->btj->d[j].bt_i, opcnt, magic, reg,
                    depth, maxdepth, do_flags);
           if (ret < 0)
             return ret; // dead end
@@ -2215,7 +2219,7 @@ static int scan_for_pop(int i, int opcnt, const char *reg,
 
       check_i(po, po->bt_i);
       if (po->flags & OPF_CJMP) {
-        ret |= scan_for_pop(po->bt_i, opcnt, reg, magic,
+        ret |= scan_for_pop(po->bt_i, opcnt, magic, reg,
                  depth, maxdepth, do_flags);
         if (ret < 0)
           return ret; // dead end
@@ -2226,30 +2230,34 @@ static int scan_for_pop(int i, int opcnt, const char *reg,
       continue;
     }
 
+    relevant = 0;
     if ((po->op == OP_POP || po->op == OP_PUSH)
-        && po->operand[0].type == OPT_REG
-        && IS(po->operand[0].name, reg))
+      && po->operand[0].type == OPT_REG && po->operand[0].reg == reg)
     {
-      if (po->op == OP_PUSH && !(po->flags & OPF_FARGNR)) {
-        depth++;
+      relevant = 1;
+    }
+
+    if (po->op == OP_PUSH) {
+      depth++;
+      if (relevant) {
         if (depth > *maxdepth)
           *maxdepth = depth;
         if (do_flags)
           op_set_clear_flag(po, OPF_RSAVE, OPF_RMD);
       }
-      else if (po->op == OP_POP) {
-        if (depth == 0) {
-          if (do_flags)
-            op_set_clear_flag(po, OPF_RMD, OPF_RSAVE);
-          return 1;
-        }
-        else {
-          depth--;
-          if (depth < 0) // should not happen
-            ferr(po, "fail with depth\n");
-          if (do_flags)
-            op_set_clear_flag(po, OPF_RSAVE, OPF_RMD);
-        }
+    }
+    else if (po->op == OP_POP) {
+      if (depth == 0) {
+        if (relevant && do_flags)
+          op_set_clear_flag(po, OPF_RMD, OPF_RSAVE);
+        return 1;
+      }
+      else {
+        depth--;
+        if (depth < 0) // should not happen
+          ferr(po, "fail with depth\n");
+        if (do_flags)
+          op_set_clear_flag(po, OPF_RSAVE, OPF_RMD);
       }
     }
   }
@@ -2257,79 +2265,317 @@ static int scan_for_pop(int i, int opcnt, const char *reg,
   return ret;
 }
 
-// scan for pop starting from 'ret' op (all paths)
-static int scan_for_pop_ret(int i, int opcnt, const char *reg,
-  int flag_set)
+// scan for 'reg' pop backwards starting from i
+// intended to use for register restore search, so other reg
+// references are considered an error
+static int scan_for_rsave_pop_reg(int i, int magic, int reg, int set_flags)
 {
-  int found = 0;
+  struct parsed_op *po;
+  struct label_ref *lr;
+  int ret = 0;
+
+  ops[i].cc_scratch = magic;
+
+  while (1)
+  {
+    if (g_labels[i] != NULL) {
+      lr = &g_label_refs[i];
+      for (; lr != NULL; lr = lr->next) {
+        check_i(&ops[i], lr->i);
+        ret |= scan_for_rsave_pop_reg(lr->i, magic, reg, set_flags);
+        if (ret < 0)
+          return ret;
+      }
+      if (i > 0 && LAST_OP(i - 1))
+        return ret;
+    }
+
+    i--;
+    if (i < 0)
+      break;
+
+    if (ops[i].cc_scratch == magic)
+      return ret;
+    ops[i].cc_scratch = magic;
+
+    po = &ops[i];
+    if (po->op == OP_POP && po->operand[0].reg == reg) {
+      if (po->flags & (OPF_RMD|OPF_DONE))
+        return -1;
+
+      po->flags |= set_flags;
+      return 1;
+    }
+
+    // this also covers the case where we reach corresponding push
+    if ((po->regmask_dst | po->regmask_src) & (1 << reg))
+      return -1;
+  }
+
+  // nothing interesting on this path
+  return 0;
+}
+
+static void find_reachable_exits(int i, int opcnt, int magic,
+  int *exits, int *exit_count)
+{
+  struct parsed_op *po;
   int j;
 
-  for (; i < opcnt; i++) {
-    if (!(ops[i].flags & OPF_TAIL))
-      continue;
+  for (; i < opcnt; i++)
+  {
+    po = &ops[i];
+    if (po->cc_scratch == magic)
+      return;
+    po->cc_scratch = magic;
 
-    for (j = i - 1; j >= 0; j--) {
-      if (ops[j].flags & (OPF_RMD|OPF_DONE))
+    if (po->flags & OPF_TAIL) {
+      ferr_assert(po, *exit_count < MAX_EXITS);
+      exits[*exit_count] = i;
+      (*exit_count)++;
+      return;
+    }
+
+    if ((po->flags & OPF_JMP) && po->op != OP_CALL) {
+      if (po->flags & OPF_RMD)
         continue;
-      if (ops[j].flags & OPF_JMP)
-        return -1;
 
-      if (ops[j].op == OP_POP && ops[j].datap == NULL
-          && ops[j].operand[0].type == OPT_REG
-          && IS(ops[j].operand[0].name, reg))
-      {
-        found = 1;
-        ops[j].flags |= flag_set;
-        break;
+      if (po->btj != NULL) {
+        for (j = 0; j < po->btj->count; j++) {
+          check_i(po, po->btj->d[j].bt_i);
+          find_reachable_exits(po->btj->d[j].bt_i, opcnt, magic,
+                  exits, exit_count);
+        }
+        return;
       }
 
-      if (g_labels[j] != NULL)
+      check_i(po, po->bt_i);
+      if (po->flags & OPF_CJMP)
+        find_reachable_exits(po->bt_i, opcnt, magic, exits, exit_count);
+      else
+        i = po->bt_i - 1;
+      continue;
+    }
+  }
+}
+
+// scan for 'reg' pop backwards starting from exits (all paths)
+static int scan_for_pop_ret(int i, int opcnt, int reg, int set_flags)
+{
+  static int exits[MAX_EXITS];
+  static int exit_count;
+  int j, ret;
+
+  if (!set_flags) {
+    exit_count = 0;
+    find_reachable_exits(i, opcnt, i + opcnt * 15, exits,
+      &exit_count);
+    ferr_assert(&ops[i], exit_count > 0);
+  }
+
+  for (j = 0; j < exit_count; j++) {
+    ret = scan_for_rsave_pop_reg(exits[j], i + opcnt * 16 + set_flags,
+            reg, set_flags);
+    if (ret == -1)
+      return -1;
+  }
+
+  return 0;
+}
+
+// scan for one or more pop of push <const>
+static int scan_for_pop_const_r(int i, int opcnt, int magic,
+  int push_i, int is_probe)
+{
+  struct parsed_op *po;
+  struct label_ref *lr;
+  int ret = 0;
+  int j;
+
+  for (; i < opcnt; i++)
+  {
+    po = &ops[i];
+    if (po->cc_scratch == magic)
+      return ret; // already checked
+    po->cc_scratch = magic;
+
+    if (po->flags & OPF_JMP) {
+      if (po->flags & OPF_RMD)
+        continue;
+      if (po->op == OP_CALL)
         return -1;
+
+      if (po->btj != NULL) {
+        for (j = 0; j < po->btj->count; j++) {
+          check_i(po, po->btj->d[j].bt_i);
+          ret |= scan_for_pop_const_r(po->btj->d[j].bt_i, opcnt, magic,
+                  push_i, is_probe);
+          if (ret < 0)
+            return ret;
+        }
+        return ret;
+      }
+
+      check_i(po, po->bt_i);
+      if (po->flags & OPF_CJMP) {
+        ret |= scan_for_pop_const_r(po->bt_i, opcnt, magic, push_i,
+                 is_probe);
+        if (ret < 0)
+          return ret;
+      }
+      else {
+        i = po->bt_i - 1;
+      }
+      continue;
+    }
+
+    if ((po->flags & (OPF_TAIL|OPF_RSAVE)) || po->op == OP_PUSH)
+      return -1;
+
+    if (g_labels[i] != NULL) {
+      // all refs must be visited
+      lr = &g_label_refs[i];
+      for (; lr != NULL; lr = lr->next) {
+        check_i(po, lr->i);
+        if (ops[lr->i].cc_scratch != magic)
+          return -1;
+      }
+      if (i > 0 && !LAST_OP(i - 1) && ops[i - 1].cc_scratch != magic)
+        return -1;
+    }
+
+    if (po->op == OP_POP)
+    {
+      if (po->flags & (OPF_RMD|OPF_DONE))
+        return -1;
+
+      if (!is_probe) {
+        po->flags |= OPF_DONE;
+        po->datap = &ops[push_i];
+      }
+      return 1;
     }
   }
 
-  return found ? 0 : -1;
+  return -1;
 }
 
-static void scan_for_pop_const(int i, int opcnt, int *regmask_pp)
+static void scan_for_pop_const(int i, int opcnt, int magic)
+{
+  int ret;
+
+  ret = scan_for_pop_const_r(i + 1, opcnt, magic, i, 1);
+  if (ret == 1) {
+    ops[i].flags |= OPF_RMD | OPF_DONE;
+    scan_for_pop_const_r(i + 1, opcnt, magic + 1, i, 0);
+  }
+}
+
+// check if all branch targets within a marked path are also marked
+// note: the path checked must not be empty or end with a branch
+static int check_path_branches(int opcnt, int magic)
 {
   struct parsed_op *po;
-  int is_multipath = 0;
-  int j;
+  int i, j;
 
-  for (j = i + 1; j < opcnt; j++) {
-    po = &ops[j];
-
-    if (po->op == OP_JMP && po->btj == NULL) {
-      ferr_assert(po, po->bt_i >= 0);
-      j = po->bt_i - 1;
+  for (i = 0; i < opcnt; i++) {
+    po = &ops[i];
+    if (po->cc_scratch != magic)
       continue;
+
+    if (po->flags & OPF_JMP) {
+      if ((po->flags & OPF_RMD) || po->op == OP_CALL)
+        continue;
+
+      if (po->btj != NULL) {
+        for (j = 0; j < po->btj->count; j++) {
+          check_i(po, po->btj->d[j].bt_i);
+          if (ops[po->btj->d[j].bt_i].cc_scratch != magic)
+            return 0;
+        }
+      }
+
+      check_i(po, po->bt_i);
+      if (ops[po->bt_i].cc_scratch != magic)
+        return 0;
+      if ((po->flags & OPF_CJMP) && ops[i + 1].cc_scratch != magic)
+        return 0;
+    }
+  }
+
+  return 1;
+}
+
+// scan for multiple pushes for given pop
+static int scan_pushes_for_pop_r(int i, int magic, int pop_i,
+  int is_probe)
+{
+  int reg = ops[pop_i].operand[0].reg;
+  struct parsed_op *po;
+  struct label_ref *lr;
+  int ret = 0;
+
+  ops[i].cc_scratch = magic;
+
+  while (1)
+  {
+    if (g_labels[i] != NULL) {
+      lr = &g_label_refs[i];
+      for (; lr != NULL; lr = lr->next) {
+        check_i(&ops[i], lr->i);
+        ret |= scan_pushes_for_pop_r(lr->i, magic, pop_i, is_probe);
+        if (ret < 0)
+          return ret;
+      }
+      if (i > 0 && LAST_OP(i - 1))
+        return ret;
     }
 
-    if ((po->flags & (OPF_JMP|OPF_TAIL|OPF_RSAVE))
-      || po->op == OP_PUSH)
-    {
+    i--;
+    if (i < 0)
       break;
-    }
 
-    if (g_labels[j] != NULL)
-      is_multipath = 1;
+    if (ops[i].cc_scratch == magic)
+      return ret;
+    ops[i].cc_scratch = magic;
 
-    if (po->op == OP_POP && !(po->flags & OPF_RMD))
+    po = &ops[i];
+    if (po->op == OP_CALL)
+      return -1;
+    if ((po->flags & (OPF_TAIL|OPF_RSAVE)) || po->op == OP_POP)
+      return -1;
+
+    if (po->op == OP_PUSH)
     {
-      is_multipath |= !!(po->flags & OPF_PPUSH);
-      if (is_multipath) {
-        ops[i].flags |= OPF_PPUSH | OPF_DONE;
-        ops[i].datap = po;
+      if (po->datap != NULL)
+        return -1;
+      if (po->operand[0].type == OPT_REG && po->operand[0].reg == reg)
+        // leave this case for reg save/restore handlers
+        return -1;
+
+      if (!is_probe) {
         po->flags |= OPF_PPUSH | OPF_DONE;
-        *regmask_pp |= 1 << po->operand[0].reg;
+        po->datap = &ops[pop_i];
       }
-      else {
-        ops[i].flags |= OPF_RMD | OPF_DONE;
-        po->flags |= OPF_DONE;
-        po->datap = &ops[i];
-      }
-      break;
+      return 1;
+    }
+  }
+
+  return -1;
+}
+
+static void scan_pushes_for_pop(int i, int opcnt, int *regmask_pp)
+{
+  int magic = i + opcnt * 14;
+  int ret;
+
+  ret = scan_pushes_for_pop_r(i, magic, i, 1);
+  if (ret == 1) {
+    ret = check_path_branches(opcnt, magic);
+    if (ret == 1) {
+      ops[i].flags |= OPF_PPUSH | OPF_DONE;
+      *regmask_pp |= 1 << ops[i].operand[0].reg;
+      scan_pushes_for_pop_r(i, magic + 1, i, 0);
     }
   }
 }
@@ -3563,13 +3809,13 @@ static struct parsed_proto *process_call(int i, int opcnt)
           && ops[call_i].operand[1].type == OPT_LABEL)
         {
           // no other source users?
-          ret = resolve_last_ref(i, &po->operand[0], opcnt * 10,
+          ret = resolve_last_ref(i, &po->operand[0], i + opcnt * 10,
                   &ref_i);
           if (ret == 1 && call_i == ref_i) {
             // and nothing uses it after us?
             ref_i = -1;
             ret = find_next_read(i + 1, opcnt, &po->operand[0],
-                    opcnt * 11, &ref_i);
+                    i + opcnt * 11, &ref_i);
             if (ret != 1)
               // then also don't need the source mov
               ops[call_i].flags |= OPF_RMD;
@@ -4258,7 +4504,11 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
     }
     else if (po->op == OP_PUSH && !(po->flags & OPF_FARG)
       && !(po->flags & OPF_RSAVE) && po->operand[0].type == OPT_CONST)
-        scan_for_pop_const(i, opcnt, &regmask_pp);
+    {
+      scan_for_pop_const(i, opcnt, i + opcnt * 12);
+    }
+    else if (po->op == OP_POP)
+      scan_pushes_for_pop(i, opcnt, &regmask_pp);
   }
 
   // pass6:
@@ -4274,15 +4524,6 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
     if (po->flags & (OPF_RMD|OPF_DONE))
       continue;
 
-    if (po->op == OP_PUSH && (po->flags & OPF_RSAVE)) {
-      reg = po->operand[0].reg;
-      if (!(regmask & (1 << reg)))
-        // not a reg save after all, rerun scan_for_pop
-        po->flags &= ~OPF_RSAVE;
-      else
-        regmask_save |= 1 << reg;
-    }
-
     if (po->op == OP_PUSH && !(po->flags & OPF_FARG)
       && !(po->flags & OPF_RSAVE) && !g_func_pp->is_userstack)
     {
@@ -4292,28 +4533,29 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
         if (reg < 0)
           ferr(po, "reg not set for push?\n");
 
+        // FIXME: OPF_RSAVE, regmask_save
         depth = 0;
-        ret = scan_for_pop(i + 1, opcnt,
-                po->operand[0].name, i + opcnt * 3, 0, &depth, 0);
+        ret = scan_for_pop(i + 1, opcnt, i + opcnt * 3,
+                po->operand[0].reg, 0, &depth, 0);
         if (ret == 1) {
-          if (depth > 1)
+          if (depth > 0)
             ferr(po, "too much depth: %d\n", depth);
 
           po->flags |= OPF_RMD;
-          scan_for_pop(i + 1, opcnt, po->operand[0].name,
-            i + opcnt * 4, 0, &depth, 1);
+          scan_for_pop(i + 1, opcnt, i + opcnt * 4,
+            po->operand[0].reg, 0, &depth, 1);
           continue;
         }
-        ret = scan_for_pop_ret(i + 1, opcnt, po->operand[0].name, 0);
+        ret = scan_for_pop_ret(i + 1, opcnt, po->operand[0].reg, 0);
         if (ret == 0) {
           arg = OPF_RMD;
           if (regmask & (1 << reg)) {
             if (regmask_save & (1 << reg))
               ferr(po, "%s already saved?\n", po->operand[0].name);
-            arg = OPF_RSAVE;
+            // arg = OPF_RSAVE; // FIXME
           }
           po->flags |= arg;
-          scan_for_pop_ret(i + 1, opcnt, po->operand[0].name, arg);
+          scan_for_pop_ret(i + 1, opcnt, po->operand[0].reg, arg);
           continue;
         }
       }
@@ -5713,7 +5955,7 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
           break;
         }
         else if (po->flags & OPF_PPUSH) {
-          // push/pop graph
+          // push/pop graph / non-const
           ferr_assert(po, po->datap == NULL);
           fprintf(fout, "  %s = pp_%s;", buf1, buf1);
           break;
@@ -5988,13 +6230,13 @@ static void gen_hdr_dep_pass(int i, int opcnt, unsigned char *cbits,
         continue;
 
       depth = 0;
-      ret = scan_for_pop(i + 1, opcnt,
-              po->operand[0].name, i + opcnt * 2, 0, &depth, 0);
+      ret = scan_for_pop(i + 1, opcnt, i + opcnt * 2,
+              po->operand[0].reg, 0, &depth, 0);
       if (ret == 1) {
         regmask_save |= 1 << reg;
         po->flags |= OPF_RMD;
-        scan_for_pop(i + 1, opcnt,
-          po->operand[0].name, i + opcnt * 3, 0, &depth, 1);
+        scan_for_pop(i + 1, opcnt, i + opcnt * 3,
+          po->operand[0].reg, 0, &depth, 1);
         continue;
       }
     }
@@ -6139,7 +6381,7 @@ static void gen_hdr(const char *funcn, int opcnt)
       continue;
 
     if (po->op == OP_PUSH && po->operand[0].type == OPT_CONST)
-      scan_for_pop_const(i, opcnt, &regmask_dummy);
+      scan_for_pop_const(i, opcnt, i + opcnt * 13);
   }
 
   // pass5:
@@ -6185,16 +6427,17 @@ static void gen_hdr(const char *funcn, int opcnt)
     if (po->flags & (OPF_RMD|OPF_DONE))
       continue;
 
-    if (po->op == OP_PUSH && po->operand[0].type == OPT_REG)
+    if (po->op == OP_PUSH && po->operand[0].type == OPT_REG
+      && po->operand[0].reg != xCX)
     {
-      ret = scan_for_pop_ret(i + 1, opcnt, po->operand[0].name, 0);
+      ret = scan_for_pop_ret(i + 1, opcnt, po->operand[0].reg, 0);
       if (ret == 0) {
         // regmask_save |= 1 << po->operand[0].reg; // do it later
         po->flags |= OPF_RSAVE | OPF_RMD | OPF_DONE;
-        scan_for_pop_ret(i + 1, opcnt, po->operand[0].name, OPF_RMD);
+        scan_for_pop_ret(i + 1, opcnt, po->operand[0].reg, OPF_RMD);
       }
     }
-    else if (po->op == OP_CALL && !(po->flags & OPF_DONE))
+    else if (po->op == OP_CALL)
     {
       pp = process_call(i, opcnt);
 
