@@ -256,8 +256,7 @@ static int g_header_mode;
     dump_op(op_), ##__VA_ARGS__)
 
 #define ferr_assert(op_, cond) do { \
-  if (!(cond)) ferr(op_, "assertion '%s' failed on ln :%d\n", #cond, \
-                    __LINE__); \
+  if (!(cond)) ferr(op_, "assertion '%s' failed\n", #cond); \
 } while (0)
 
 const char *regs_r32[] = {
@@ -1223,6 +1222,17 @@ static void parse_op(struct parsed_op *op, char words[16][256], int wordc)
 
   default:
     break;
+  }
+
+  if (op->operand[0].type == OPT_REG
+   && op->operand[0].lmod == OPLM_DWORD
+   && op->operand[1].type == OPT_CONST)
+  {
+    if ((op->op == OP_AND && op->operand[1].val == 0)
+     || (op->op == OP_OR && op->operand[1].val == ~0))
+    {
+      op->regmask_src = 0;
+    }
   }
 }
 
@@ -3804,7 +3814,8 @@ static int collect_call_args_r(struct parsed_op *po, int i,
       if (pp->is_unresolved)
         break;
 
-      ferr(po, "arg collect %d/%d hit esp adjust of %d\n",
+      fnote(po, "(this call)\n");
+      ferr(&ops[j], "arg collect %d/%d hit esp adjust of %d\n",
         arg, pp->argc, ops[j].operand[1].val);
     }
     else if (ops[j].op == OP_POP && !(ops[j].flags & OPF_DONE))
@@ -3812,7 +3823,8 @@ static int collect_call_args_r(struct parsed_op *po, int i,
       if (pp->is_unresolved)
         break;
 
-      ferr(po, "arg collect %d/%d hit pop\n", arg, pp->argc);
+      fnote(po, "(this call)\n");
+      ferr(&ops[j], "arg collect %d/%d hit pop\n", arg, pp->argc);
     }
     else if (ops[j].flags & OPF_CJMP)
     {
@@ -5034,28 +5046,38 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
 
       // arithmetic w/flags
       case OP_AND:
-        if (po->operand[1].type == OPT_CONST && !po->operand[1].val) {
-          // deal with complex dst clear
-          assert_operand_cnt(2);
-          fprintf(fout, "  %s = %s;",
-            out_dst_opr(buf1, sizeof(buf1), po, &po->operand[0]),
-            out_src_opr(buf2, sizeof(buf2), po, &po->operand[1],
-             default_cast_to(buf3, sizeof(buf3), &po->operand[0]), 0));
-          output_std_flags(fout, po, &pfomask, buf1);
-          last_arith_dst = &po->operand[0];
-          delayed_flag_op = NULL;
-          break;
-        }
-        // fallthrough
+        if (po->operand[1].type == OPT_CONST && !po->operand[1].val)
+          goto dualop_arith_const;
+        propagate_lmod(po, &po->operand[0], &po->operand[1]);
+        goto dualop_arith;
+
       case OP_OR:
         propagate_lmod(po, &po->operand[0], &po->operand[1]);
-        // fallthrough
+        if (po->operand[1].type == OPT_CONST) {
+          j = lmod_bytes(po, po->operand[0].lmod);
+          if (((1ull << j * 8) - 1) == po->operand[1].val)
+            goto dualop_arith_const;
+        }
+        goto dualop_arith;
+
       dualop_arith:
         assert_operand_cnt(2);
         fprintf(fout, "  %s %s= %s;",
             out_dst_opr(buf1, sizeof(buf1), po, &po->operand[0]),
             op_to_c(po),
             out_src_opr_u32(buf2, sizeof(buf2), po, &po->operand[1]));
+        output_std_flags(fout, po, &pfomask, buf1);
+        last_arith_dst = &po->operand[0];
+        delayed_flag_op = NULL;
+        break;
+
+      dualop_arith_const:
+        // and 0, or ~0 used instead mov
+        assert_operand_cnt(2);
+        fprintf(fout, "  %s = %s;",
+          out_dst_opr(buf1, sizeof(buf1), po, &po->operand[0]),
+          out_src_opr(buf2, sizeof(buf2), po, &po->operand[1],
+           default_cast_to(buf3, sizeof(buf3), &po->operand[0]), 0));
         output_std_flags(fout, po, &pfomask, buf1);
         last_arith_dst = &po->operand[0];
         delayed_flag_op = NULL;
