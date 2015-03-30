@@ -1,5 +1,6 @@
 
-TESTS = reg_call1 reg_call2 reg_call3 reg_call_tail reg_save
+TESTS = reg_call1 reg_call2 reg_call3 reg_call_tail reg_save \
+	varargs
 
 all: $(addsuffix .ok,$(TESTS))
 
