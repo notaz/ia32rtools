@@ -24,8 +24,8 @@ _isprint
 _tolower
 #_strncnt
 #_findenv
-#__strdup
-#__mbschr
+__strdup
+__mbschr
 _strchr
 _strrchr
 _strtoxl
