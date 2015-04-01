@@ -27,9 +27,9 @@ cat $implist | while read i; do
     ;;
   esac
 
-  grep "\<_\?_$si\>" /usr/$mingwb/lib/lib* "$@" | awk '{print $3}' | \
+  grep -e "\<_\?_$si\>" -e "@$si\>" /usr/$mingwb/lib/lib* "$@" | awk '{print $3}' | \
     while read f; do
-      sym=`${mingwb}-nm $f | grep "\<_\?_$si\>" | grep ' T ' | awk '{print $3}'`
+      sym=`${mingwb}-nm $f | grep -e "\<_\?_$si\>" -e " @$si\>" | grep ' T ' | awk '{print $3}'`
       if test -n "$sym"; then
         echo $sym > $tmpsym
         break
@@ -37,7 +37,7 @@ cat $implist | while read i; do
     done
   sym=`cat $tmpsym`
   if test -z "$sym"; then
-    echo "no file/sym for $i, lf $f"
+    echo "$target_s: no file/sym for $i"
     exit 1
   fi
 

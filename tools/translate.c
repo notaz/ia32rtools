@@ -1087,7 +1087,7 @@ static void parse_op(struct parsed_op *op, char words[16][256], int wordc)
     op->operand_cnt = 2;
     setup_reg_opr(&op->operand[0], xAX, OPLM_BYTE, &op->regmask_src);
     op->regmask_dst = op->regmask_src;
-    setup_reg_opr(&op->operand[1], xDX, OPLM_DWORD, &op->regmask_src);
+    setup_reg_opr(&op->operand[1], xBX, OPLM_DWORD, &op->regmask_src);
     break;
 
   case OP_CDQ:
@@ -1099,8 +1099,6 @@ static void parse_op(struct parsed_op *op, char words[16][256], int wordc)
   case OP_LODS:
   case OP_STOS:
   case OP_SCAS:
-    if (op->operand_cnt != 0)
-      break;
     if      (words[op_w][4] == 'b')
       lmod = OPLM_BYTE;
     else if (words[op_w][4] == 'w')
@@ -1108,20 +1106,21 @@ static void parse_op(struct parsed_op *op, char words[16][256], int wordc)
     else if (words[op_w][4] == 'd')
       lmod = OPLM_DWORD;
     j = 0;
+    op->regmask_src = 0;
     setup_reg_opr(&op->operand[j++], op->op == OP_LODS ? xSI : xDI,
-      lmod, &op->regmask_src);
-    if (op->flags & OPF_REP)
-      setup_reg_opr(&op->operand[j++], xCX, OPLM_DWORD, &op->regmask_src);
+      OPLM_DWORD, &op->regmask_src);
     op->regmask_dst = op->regmask_src;
-    setup_reg_opr(&op->operand[j++], xAX, OPLM_DWORD,
+    setup_reg_opr(&op->operand[j++], xAX, lmod,
       op->op == OP_LODS ? &op->regmask_dst : &op->regmask_src);
+    if (op->flags & OPF_REP) {
+      setup_reg_opr(&op->operand[j++], xCX, OPLM_DWORD, &op->regmask_src);
+      op->regmask_dst |= 1 << xCX;
+    }
     op->operand_cnt = j;
     break;
 
   case OP_MOVS:
   case OP_CMPS:
-    if (op->operand_cnt != 0)
-      break;
     if      (words[op_w][4] == 'b')
       lmod = OPLM_BYTE;
     else if (words[op_w][4] == 'w')
@@ -1129,6 +1128,8 @@ static void parse_op(struct parsed_op *op, char words[16][256], int wordc)
     else if (words[op_w][4] == 'd')
       lmod = OPLM_DWORD;
     j = 0;
+    op->regmask_src = 0;
+    // note: lmod is not correct, don't have where to place it
     setup_reg_opr(&op->operand[j++], xDI, lmod, &op->regmask_src);
     setup_reg_opr(&op->operand[j++], xSI, OPLM_DWORD, &op->regmask_src);
     if (op->flags & OPF_REP)
@@ -5298,10 +5299,11 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
         }
         else {
           assert_operand_cnt(2);
-          fprintf(fout, "  eax = %sesi; esi %c= %d;",
-            lmod_cast_u_ptr(po, po->operand[0].lmod),
+          fprintf(fout, "  %s = %sesi; esi %c= %d;",
+            out_dst_opr(buf1, sizeof(buf1), po, &po->operand[1]),
+            lmod_cast_u_ptr(po, po->operand[1].lmod),
             (po->flags & OPF_DF) ? '-' : '+',
-            lmod_bytes(po, po->operand[0].lmod));
+            lmod_bytes(po, po->operand[1].lmod));
           strcpy(g_comment, "lods");
         }
         break;
@@ -5311,17 +5313,17 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
           assert_operand_cnt(3);
           fprintf(fout, "  for (; ecx != 0; ecx--, edi %c= %d)\n",
             (po->flags & OPF_DF) ? '-' : '+',
-            lmod_bytes(po, po->operand[0].lmod));
+            lmod_bytes(po, po->operand[1].lmod));
           fprintf(fout, "    %sedi = eax;",
-            lmod_cast_u_ptr(po, po->operand[0].lmod));
+            lmod_cast_u_ptr(po, po->operand[1].lmod));
           strcpy(g_comment, "rep stos");
         }
         else {
           assert_operand_cnt(2);
           fprintf(fout, "  %sedi = eax; edi %c= %d;",
-            lmod_cast_u_ptr(po, po->operand[0].lmod),
+            lmod_cast_u_ptr(po, po->operand[1].lmod),
             (po->flags & OPF_DF) ? '-' : '+',
-            lmod_bytes(po, po->operand[0].lmod));
+            lmod_bytes(po, po->operand[1].lmod));
           strcpy(g_comment, "stos");
         }
         break;
@@ -5388,7 +5390,7 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
       case OP_SCAS:
         // only does ZF (for now)
         // repe ~ repeat while ZF=1
-        j = lmod_bytes(po, po->operand[0].lmod);
+        j = lmod_bytes(po, po->operand[1].lmod);
         l = (po->flags & OPF_DF) ? '-' : '+';
         if (po->flags & OPF_REP) {
           assert_operand_cnt(3);
@@ -5396,8 +5398,8 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
             "  for (; ecx != 0; ecx--) {\n");
           fprintf(fout,
             "    cond_z = (%seax == %sedi); edi %c= %d;\n",
-              lmod_cast_u(po, po->operand[0].lmod),
-              lmod_cast_u_ptr(po, po->operand[0].lmod), l, j);
+              lmod_cast_u(po, po->operand[1].lmod),
+              lmod_cast_u_ptr(po, po->operand[1].lmod), l, j);
           fprintf(fout,
             "    if (cond_z %s 0) break;\n",
               (po->flags & OPF_REPZ) ? "==" : "!=");
@@ -5409,8 +5411,8 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
         else {
           assert_operand_cnt(2);
           fprintf(fout, "  cond_z = (%seax == %sedi); edi %c= %d;",
-              lmod_cast_u(po, po->operand[0].lmod),
-              lmod_cast_u_ptr(po, po->operand[0].lmod), l, j);
+              lmod_cast_u(po, po->operand[1].lmod),
+              lmod_cast_u_ptr(po, po->operand[1].lmod), l, j);
           strcpy(g_comment, "scas");
         }
         pfomask &= ~(1 << PFO_Z);
@@ -5851,7 +5853,7 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
         break;
 
       case OP_LOOP:
-        fprintf(fout, "  if (--ecx == 0)\n");
+        fprintf(fout, "  if (--ecx != 0)\n");
         fprintf(fout, "    goto %s;", po->operand[0].name);
         strcat(g_comment, "loop");
         break;
