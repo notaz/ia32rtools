@@ -1421,10 +1421,45 @@ static const char *opr_reg_p(struct parsed_op *po, struct parsed_opr *popr)
   return regs_r32[popr->reg];
 }
 
+static int check_simple_cast(const char *cast, int *bits, int *is_signed)
+{
+  if      (IS_START(cast, "(s8)") || IS_START(cast, "(u8)"))
+    *bits = 8;
+  else if (IS_START(cast, "(s16)") || IS_START(cast, "(u16)"))
+    *bits = 16;
+  else if (IS_START(cast, "(s32)") || IS_START(cast, "(u32)"))
+    *bits = 32;
+  else if (IS_START(cast, "(s64)") || IS_START(cast, "(u64)"))
+    *bits = 64;
+  else
+    return -1;
+
+  *is_signed = cast[1] == 's' ? 1 : 0;
+  return 0;
+}
+
+static int check_deref_cast(const char *cast, int *bits)
+{
+  if      (IS_START(cast, "*(u8 *)"))
+    *bits = 8;
+  else if (IS_START(cast, "*(u16 *)"))
+    *bits = 16;
+  else if (IS_START(cast, "*(u32 *)"))
+    *bits = 32;
+  else if (IS_START(cast, "*(u64 *)"))
+    *bits = 64;
+  else
+    return -1;
+
+  return 0;
+}
+
 // cast1 is the "final" cast
 static const char *simplify_cast(const char *cast1, const char *cast2)
 {
   static char buf[256];
+  int bits1, bits2;
+  int s1, s2;
 
   if (cast1[0] == 0)
     return cast2;
@@ -1432,14 +1467,22 @@ static const char *simplify_cast(const char *cast1, const char *cast2)
     return cast1;
   if (IS(cast1, cast2))
     return cast1;
-  if (IS(cast1, "(s8)") && IS(cast2, "(u8)"))
-    return cast1;
-  if (IS(cast1, "(s16)") && IS(cast2, "(u16)"))
-    return cast1;
-  if (IS(cast1, "(u8)") && IS_START(cast2, "*(u8 *)"))
-    return cast2;
-  if (IS(cast1, "(u16)") && IS_START(cast2, "*(u16 *)"))
-    return cast2;
+
+  if (check_simple_cast(cast1, &bits1, &s1) == 0
+    && check_simple_cast(cast2, &bits2, &s2) == 0)
+  {
+    if (bits1 <= bits2)
+      return cast1;
+  }
+  if (check_simple_cast(cast1, &bits1, &s1) == 0
+    && check_deref_cast(cast2, &bits2) == 0)
+  {
+    if (bits1 == bits2) {
+      snprintf(buf, sizeof(buf), "*(%c%d *)", s1 ? 's' : 'u', bits1);
+      return buf;
+    }
+  }
+
   if (strchr(cast1, '*') && IS_START(cast2, "(u32)"))
     return cast1;
 
