@@ -1,6 +1,6 @@
 int sub_test(const char * a1, ...)
 {
-  union { u32 d[128]; u16 w[256]; u8 b[512]; } sf;
+  union { u32 d[128]; u8 b[512]; } sf;
   va_list ap;
   u32 eax;
 
