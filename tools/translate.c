@@ -208,7 +208,8 @@ struct parsed_op {
 };
 
 // datap:
-// OP_CALL  - parser proto hint (str)
+// on start:  function/data type hint (sctproto)
+// after analysis:
 // (OPF_CC) - points to one of (OPF_FLAGS) that affects cc op
 // OP_PUSH  - points to OP_POP in complex push/pop graph
 // OP_POP   - points to OP_PUSH in simple push/pop pair
@@ -641,7 +642,7 @@ static char *default_cast_to(char *buf, size_t buf_size,
 {
   buf[0] = 0;
 
-  if (!opr->is_ptr)
+  if (!opr->is_ptr || strchr(opr->name, '['))
     return buf;
   if (opr->pp == NULL || opr->pp->type.name == NULL
     || opr->pp->is_fptr)
@@ -3488,10 +3489,25 @@ static void resolve_branches_parse_calls(int opcnt)
     po->bt_i = -1;
     po->btj = NULL;
 
+    if (po->datap != NULL) {
+      pp = calloc(1, sizeof(*pp));
+      my_assert_not(pp, NULL);
+
+      ret = parse_protostr(po->datap, pp);
+      if (ret < 0)
+        ferr(po, "bad protostr supplied: %s\n", (char *)po->datap);
+      free(po->datap);
+      po->datap = NULL;
+      po->pp = pp;
+    }
+
     if (po->op == OP_CALL) {
       pp = NULL;
 
-      if (po->operand[0].type == OPT_LABEL) {
+      if (po->pp != NULL)
+        pp = po->pp;
+      else if (po->operand[0].type == OPT_LABEL)
+      {
         tmpname = opr_name(po, 0);
         if (IS_START(tmpname, "loc_"))
           ferr(po, "call to loc_*\n");
@@ -3520,16 +3536,6 @@ static void resolve_branches_parse_calls(int opcnt)
           pp = proto_clone(pp_c);
           my_assert_not(pp, NULL);
         }
-      }
-      else if (po->datap != NULL) {
-        pp = calloc(1, sizeof(*pp));
-        my_assert_not(pp, NULL);
-
-        ret = parse_protostr(po->datap, pp);
-        if (ret < 0)
-          ferr(po, "bad protostr supplied: %s\n", (char *)po->datap);
-        free(po->datap);
-        po->datap = NULL;
       }
 
       if (pp != NULL) {
@@ -3807,36 +3813,11 @@ static void scan_prologue_epilogue(int opcnt)
   }
 }
 
-static const struct parsed_proto *resolve_icall(int i, int opcnt,
-  int *pp_i, int *multi_src)
-{
-  const struct parsed_proto *pp = NULL;
-  int search_advice = 0;
-
-  *multi_src = 0;
-  *pp_i = -1;
-
-  switch (ops[i].operand[0].type) {
-  case OPT_REGMEM:
-  case OPT_LABEL:
-  case OPT_OFFSET:
-    pp = try_recover_pp(&ops[i], &ops[i].operand[0], &search_advice);
-    if (!search_advice)
-      break;
-    // fallthrough
-  default:
-    scan_for_call_type(i, &ops[i].operand[0], i + opcnt * 9, &pp,
-      pp_i, multi_src);
-    break;
-  }
-
-  return pp;
-}
-
 // find an instruction that changed opr before i op
 // *op_i must be set to -1 by the caller
-// *entry is set to 1 if one source is determined to be the caller
+// *is_caller is set to 1 if one source is determined to be g_func arg
 // returns 1 if found, *op_i is then set to origin
+// returns -1 if multiple origins are found
 static int resolve_origin(int i, const struct parsed_opr *opr,
   int magic, int *op_i, int *is_caller)
 {
@@ -4013,6 +3994,96 @@ static int try_resolve_const(int i, const struct parsed_opr *opr,
   }
 
   return -1;
+}
+
+static const struct parsed_proto *resolve_icall(int i, int opcnt,
+  int *pp_i, int *multi_src)
+{
+  const struct parsed_proto *pp = NULL;
+  int search_advice = 0;
+  int offset = -1;
+  char name[256];
+  char s_reg[4];
+  int reg, len;
+  int ret;
+
+  *multi_src = 0;
+  *pp_i = -1;
+
+  switch (ops[i].operand[0].type) {
+  case OPT_REGMEM:
+    // try to resolve struct member calls
+    ret = sscanf(ops[i].operand[0].name, "%3s+%x%n",
+            s_reg, &offset, &len);
+    if (ret == 2 && len == strlen(ops[i].operand[0].name))
+    {
+      reg = char_array_i(regs_r32, ARRAY_SIZE(regs_r32), s_reg);
+      if (reg >= 0) {
+        struct parsed_opr opr = OPR_INIT(OPT_REG, OPLM_DWORD, reg);
+        int j = -1;
+        ret = resolve_origin(i, &opr, i + opcnt * 19, &j, NULL);
+        if (ret != 1)
+          break;
+        if (ops[j].op == OP_MOV && ops[j].operand[1].type == OPT_REGMEM
+          && ops[j].operand[0].lmod == OPLM_DWORD
+          && ops[j].pp == NULL) // no hint
+        {
+          // allow one simple dereference (directx)
+          reg = char_array_i(regs_r32, ARRAY_SIZE(regs_r32),
+                  ops[j].operand[1].name);
+          if (reg < 0)
+            break;
+          struct parsed_opr opr2 = OPR_INIT(OPT_REG, OPLM_DWORD, reg);
+          int k = -1;
+          ret = resolve_origin(j, &opr2, j + opcnt * 19, &k, NULL);
+          if (ret != 1)
+            break;
+          j = k;
+        }
+        if (ops[j].op != OP_MOV)
+          break;
+        if (ops[j].operand[0].lmod != OPLM_DWORD)
+          break;
+        if (ops[j].pp != NULL) {
+          // type hint in asm
+          pp = ops[j].pp;
+        }
+        else if (ops[j].operand[1].type == OPT_REGMEM) {
+          // allow 'hello[ecx]' - assume array of same type items
+          ret = sscanf(ops[j].operand[1].name, "%[^[][e%2s]",
+                  name, s_reg);
+          if (ret != 2)
+            break;
+          pp = proto_parse(g_fhdr, name, g_quiet_pp);
+        }
+        else if (ops[j].operand[1].type == OPT_LABEL)
+          pp = proto_parse(g_fhdr, ops[j].operand[1].name, g_quiet_pp);
+        else
+          break;
+        if (pp == NULL)
+          break;
+        if (pp->is_func || pp->is_fptr || !pp->type.is_struct) {
+          pp = NULL;
+          break;
+        }
+        pp = proto_lookup_struct(g_fhdr, pp->type.name, offset);
+      }
+      break;
+    }
+    // fallthrough
+  case OPT_LABEL:
+  case OPT_OFFSET:
+    pp = try_recover_pp(&ops[i], &ops[i].operand[0], &search_advice);
+    if (!search_advice)
+      break;
+    // fallthrough
+  default:
+    scan_for_call_type(i, &ops[i].operand[0], i + opcnt * 9, &pp,
+      pp_i, multi_src);
+    break;
+  }
+
+  return pp;
 }
 
 static struct parsed_proto *process_call_early(int i, int opcnt,
@@ -8065,11 +8136,8 @@ do_pending_endp:
 
     parse_op(&ops[pi], words, wordc);
 
-    if (sctproto != NULL) {
-      if (ops[pi].op == OP_CALL || ops[pi].op == OP_JMP)
-        ops[pi].datap = sctproto;
-      sctproto = NULL;
-    }
+    ops[pi].datap = sctproto;
+    sctproto = NULL;
     pi++;
   }
 

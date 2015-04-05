@@ -1865,30 +1865,131 @@ DWORD WINAPI lineTranslateDialogA(HLINEAPP,DWORD,DWORD,HWND,LPCSTR);
 DWORD WINAPI lineUnhold(HCALL);
 DWORD WINAPI lineUnparkA(HLINE,DWORD,LPHCALL,LPCSTR);
 
+struct IDirectDraw {
+          // IUnknown methods
+/*00*/    HRESULT (WINAPI *QueryInterface)(void *this, REFIID riid, void** ppvObject);
+/*04*/    ULONG (WINAPI *AddRef)(void *this);
+/*08*/    ULONG (WINAPI *Release)(void *this);
+          // IDirectDraw methods
+/*0c*/    int (WINAPI *Compact)(void *this);
+/*10*/    int (WINAPI *CreateClipper)(void *this, DWORD dwFlags, LPDIRECTDRAWCLIPPER *lplpDDClipper, IUnknown *pUnkOuter);
+/*14*/    int (WINAPI *CreatePalette)(void *this, DWORD dwFlags, LPPALETTEENTRY lpColorTable, LPDIRECTDRAWPALETTE *lplpDDPalette, IUnknown *pUnkOuter); // 14
+/*18*/    int (WINAPI *CreateSurface)(void *this, LPDDSURFACEDESC lpDDSurfaceDesc, LPDIRECTDRAWSURFACE *lplpDDSurface, IUnknown *pUnkOuter);
+/*1c*/    int (WINAPI *DuplicateSurface)(void *this, LPDIRECTDRAWSURFACE lpDDSurface, LPDIRECTDRAWSURFACE *lplpDupDDSurface);
+/*20*/    int (WINAPI *EnumDisplayModes)(void *this, DWORD dwFlags, LPDDSURFACEDESC lpDDSurfaceDesc, LPVOID lpContext, LPDDENUMMODESCALLBACK lpEnumModesCallback);
+/*24*/    int (WINAPI *EnumSurfaces)(void *this, DWORD dwFlags, LPDDSURFACEDESC lpDDSD, LPVOID lpContext, LPDDENUMSURFACESCALLBACK lpEnumSurfacesCallback);
+/*28*/    int (WINAPI *FlipToGDISurface)(void *this);
+/*2c*/    int (WINAPI *GetCaps)(void *this, LPDDCAPS lpDDDriverCaps, LPDDCAPS lpDDHELCaps);
+/*30*/    int (WINAPI *GetDisplayMode)(void *this, LPDDSURFACEDESC lpDDSurfaceDesc);
+/*34*/    int (WINAPI *GetFourCCCodes)(void *this, LPDWORD lpNumCodes, LPDWORD lpCodes);
+/*38*/    int (WINAPI *GetGDISurface)(void *this, LPDIRECTDRAWSURFACE *lplpGDIDDSurface);
+/*3c*/    int (WINAPI *GetMonitorFrequency)(void *this, LPDWORD lpdwFrequency);
+/*40*/    int (WINAPI *GetScanLine)(void *this, LPDWORD lpdwScanLine);
+/*44*/    int (WINAPI *GetVerticalBlankStatus)(void *this, BOOL *lpbIsInVB);
+/*48*/    int (WINAPI *Initialize)(void *this, GUID *lpGUID);
+/*4c*/    int (WINAPI *RestoreDisplayMode)(void *this);
+/*50*/    int (WINAPI *SetCooperativeLevel)(void *this, HWND hWnd, DWORD dwFlags);
+/*54*/    int (WINAPI *SetDisplayMode)(void *this, DWORD dwWidth, DWORD dwHeight, DWORD dwBPP);
+/*58*/    int (WINAPI *WaitForVerticalBlank)(void *this, DWORD dwFlags, HANDLE hEvent);
+};
+
+struct IDirectDrawPalette {
+          // IUnknown methods
+/*00*/    HRESULT (WINAPI *QueryInterface)(void *this, REFIID riid, void** ppvObject);
+/*04*/    ULONG (WINAPI *AddRef)(void *this);
+/*08*/    ULONG (WINAPI *Release)(void *this);
+          // IDirectDrawPalette methods
+/*0c*/    int (WINAPI *GetCaps)(void *this, LPDWORD lpdwCaps);
+/*10*/    int (WINAPI *GetEntries)(void *this, DWORD dwFlags, DWORD dwBase, DWORD dwNumEntries, LPPALETTEENTRY lpEntries);
+/*14*/    int (WINAPI *Initialize)(void *this, LPDIRECTDRAW lpDD, DWORD dwFlags, LPPALETTEENTRY lpDDColorTable);
+/*18*/    int (WINAPI *SetEntries)(void *this, DWORD dwFlags, DWORD dwStartingEntry, DWORD dwCount, LPPALETTEENTRY lpEntries);
+};
+
+struct IDirectDrawSurface {
+          // IUnknown methods
+/*00*/    HRESULT (WINAPI *QueryInterface)(void *this, REFIID riid, void** ppvObject);
+/*04*/    ULONG (WINAPI *AddRef)(void *this);
+/*08*/    ULONG (WINAPI *Release)(void *this);
+          // IDirectDrawSurface methods
+/*0c*/    int (WINAPI *AddAttachedSurface)(void *this, LPDIRECTDRAWSURFACE lpDDSAttachedSurface);
+/*10*/    int (WINAPI *AddOverlayDirtyRect)(void *this, LPRECT lpRect);
+/*14*/    int (WINAPI *Blt)(void *this, LPRECT lpDestRect, LPDIRECTDRAWSURFACE lpDDSrcSurface, LPRECT lpSrcRect, DWORD dwFlags, LPDDBLTFX lpDDBltFx);
+/*18*/    int (WINAPI *BltBatch)(void *this, LPDDBLTBATCH lpDDBltBatch, DWORD dwCount, DWORD dwFlags);
+/*1c*/    int (WINAPI *BltFast)(void *this, DWORD dwX, DWORD dwY, LPDIRECTDRAWSURFACE lpDDSrcSurface, LPRECT lpSrcRect, DWORD dwTrans);
+/*20*/    int (WINAPI *DeleteAttachedSurface)(void *this, DWORD dwFlags, LPDIRECTDRAWSURFACE lpDDSAttachedSurface);
+/*24*/    int (WINAPI *EnumAttachedSurfaces)(void *this, LPVOID lpContext, LPDDENUMSURFACESCALLBACK lpEnumSurfacesCallback);
+/*28*/    int (WINAPI *EnumOverlayZOrders)(void *this, DWORD dwFlags, LPVOID lpContext, LPDDENUMSURFACESCALLBACK lpfnCallback);
+/*2c*/    int (WINAPI *Flip)(void *this, LPDIRECTDRAWSURFACE lpDDSurfaceTargetOverride, DWORD dwFlags);
+/*30*/    int (WINAPI *GetAttachedSurface)(void *this, LPDDSCAPS lpDDSCaps, LPDIRECTDRAWSURFACE *lplpDDAttachedSurface);
+/*34*/    int (WINAPI *GetBltStatus)(void *this, DWORD dwFlags);
+/*38*/    int (WINAPI *GetCaps)(void *this, LPDDSCAPS lpDDSCaps);
+/*3c*/    int (WINAPI *GetClipper)(void *this, LPDIRECTDRAWCLIPPER *lplpDDClipper);
+/*40*/    int (WINAPI *GetColorKey)(void *this, DWORD dwFlags, LPDDCOLORKEY lpDDColorKey);
+/*44*/    int (WINAPI *GetDC)(void *this, HDC *lphDC);
+/*48*/    int (WINAPI *GetFlipStatus)(void *this, DWORD dwFlags);
+/*4c*/    int (WINAPI *GetOverlayPosition)(void *this, LPLONG lplX, LPLONG lplY);
+/*50*/    int (WINAPI *GetPalette)(void *this, LPDIRECTDRAWPALETTE *lplpDDPalette);
+/*54*/    int (WINAPI *GetPixelFormat)(void *this, LPDDPIXELFORMAT lpDDPixelFormat);
+/*58*/    int (WINAPI *GetSurfaceDesc)(void *this, LPDDSURFACEDESC lpDDSurfaceDesc);
+/*5c*/    int (WINAPI *Initialize)(void *this, LPDIRECTDRAW lpDD, LPDDSURFACEDESC lpDDSurfaceDesc);
+/*60*/    int (WINAPI *IsLost)(void *this);
+/*64*/    int (WINAPI *Lock)(void *this, LPRECT lpDestRect, LPDDSURFACEDESC lpDDSurfaceDesc, DWORD dwFlags, HANDLE hEvent);
+/*68*/    int (WINAPI *ReleaseDC)(void *this, HDC hDC);
+/*6c*/    int (WINAPI *Restore)(void *this);
+/*70*/    int (WINAPI *SetClipper)(void *this, LPDIRECTDRAWCLIPPER lpDDClipper);
+/*74*/    int (WINAPI *SetColorKey)(void *this, DWORD dwFlags, LPDDCOLORKEY lpDDColorKey);
+/*78*/    int (WINAPI *SetOverlayPosition)(void *this, LONG lX, LONG lY);
+/*7c*/    int (WINAPI *SetPalette)(void *this, LPDIRECTDRAWPALETTE lpDDPalette);
+/*80*/    int (WINAPI *Unlock)(void *this, LPVOID lpSurfaceData);
+/*84*/    int (WINAPI *UpdateOverlay)(void *this, LPRECT lpSrcRect, LPDIRECTDRAWSURFACE lpDDDestSurface, LPRECT lpDestRect, DWORD dwFlags, LPDDOVERLAYFX lpDDOverlayFx);
+/*88*/    int (WINAPI *UpdateOverlayDisplay)(void *this, DWORD dwFlags);
+/*8c*/    int (WINAPI *UpdateOverlayZOrder)(void *this, DWORD dwFlags, LPDIRECTDRAWSURFACE lpDDSReference);
+};
+
+struct IDirectSound {
+          // IUnknown methods
+/*00*/    HRESULT (WINAPI *QueryInterface)(void *this, REFIID riid, void** ppvObject);
+/*04*/    ULONG (WINAPI *AddRef)(void *this);
+/*08*/    ULONG (WINAPI *Release)(void *this);
+          // IDirectSound methods
+/*0c*/    int (WINAPI *CreateSoundBuffer)(void *this, LPCDSBUFFERDESC lpcDSBufferDesc, LPLPDIRECTSOUNDBUFFER lplpDirectSoundBuffer, IUnknown *pUnkOuter);
+/*10*/    int (WINAPI *GetCaps)(void *this, LPDSCAPS lpDSCaps);
+/*14*/    int (WINAPI *DuplicateSoundBuffer)(void *this, LPDIRECTSOUNDBUFFER lpDsbOriginal, LPLPDIRECTSOUNDBUFFER lplpDsbDuplicate);
+/*18*/    int (WINAPI *SetCooperativeLevel)(void *this, HWND hwnd, DWORD dwLevel);
+/*1c*/    int (WINAPI *Compact)(void *this);
+/*20*/    int (WINAPI *GetSpeakerConfig)(void *this, LPDWORD lpdwSpeakerConfig);
+/*24*/    int (WINAPI *SetSpeakerConfig)(void *this, DWORD dwSpeakerConfig);
+/*28*/    int (WINAPI *Initialize)(void *this, LPCGUID lpcGuid);
+};
+
+struct IDirectSoundBuffer {
+          // IUnknown methods
+/*00*/    HRESULT (WINAPI *QueryInterface)(void *this, REFIID riid, void** ppvObject);
+/*04*/    ULONG (WINAPI *AddRef)(void *this);
+/*08*/    ULONG (WINAPI *Release)(void *this);
+          // IDirectSoundBuffer methods
+/*0c*/    int (WINAPI *GetCaps)(void *this, LPDSBCAPS lpDSBufferCaps);
+/*10*/    int (WINAPI *GetCurrentPosition)(void *this, LPDWORD lpdwCurrentPlayCursor, LPDWORD lpdwCurrentWriteCursor);
+/*14*/    int (WINAPI *GetFormat)(void *this, LPWAVEFORMATEX lpwfxFormat, DWORD dwSizeAllocated, LPDWORD lpdwSizeWritten);
+/*18*/    int (WINAPI *GetVolume)(void *this, LPLONG lplVolume);
+/*1c*/    int (WINAPI *GetPan)(void *this, LPLONG lplpan);
+/*20*/    int (WINAPI *GetFrequency)(void *this, LPDWORD lpdwFrequency);
+/*24*/    int (WINAPI *GetStatus)(void *this, LPDWORD lpdwStatus);
+/*28*/    int (WINAPI *Initialize)(void *this, LPDIRECTSOUND lpDirectSound, LPCDSBUFFERDESC lpcDSBufferDesc);
+/*2c*/    int (WINAPI *Lock)(void *this, DWORD dwOffset, DWORD dwBytes, LPVOID *ppvAudioPtr1, LPDWORD pdwAudioBytes1, LPVOID *ppvAudioPtr2, LPDWORD pdwAudioBytes2, DWORD dwFlags);
+/*30*/    int (WINAPI *Play)(void *this, DWORD dwReserved1, DWORD dwReserved2, DWORD dwFlags);
+/*34*/    int (WINAPI *SetCurrentPosition)(void *this, DWORD dwNewPosition);
+/*38*/    int (WINAPI *SetFormat)(void *this, LPCWAVEFORMATEX lpcfxFormat);
+/*3c*/    int (WINAPI *SetVolume)(void *this, LONG lVolume);
+/*40*/    int (WINAPI *SetPan)(void *this, LONG lPan);
+/*44*/    int (WINAPI *SetFrequency)(void *this, DWORD dwFrequency);
+/*48*/    int (WINAPI *Stop)(void *this);
+/*4c*/    int (WINAPI *Unlock)(void *this, LPVOID pvAudioPtr1, DWORD dwAudioBytes1, LPVOID pvAudioPtr2, DWORD dwAudioPtr2);
+/*50*/    int (WINAPI *Restore)(void *this);
+};
 
 //    sctproto: int (__stdcall *Direct*Create)(void *, void *, void *)
 // 08 sctproto: int (WINAPI *dx_Release)(void *iface)
-// IDirectDraw
-// 14 sctproto: int (WINAPI *ddraw1_CreatePalette)(void *iface, DWORD flags, PALETTEENTRY *entries, void **palette, void *)
-// 18 sctproto: int (WINAPI *ddraw1_CreateSurface)(void *iface, void *surface_desc, void **surface, void *)
-// 2C sctproto: int (WINAPI *ddraw1_GetCaps)(void *iface, void *driver_caps, void *hel_caps)
-// 38 sctproto: int (WINAPI *ddraw1_GetGDISurface)(void *iface, void **surface)
-// 44 sctproto: int (WINAPI *ddraw1_GetVerticalBlankStatus)(void *iface, BOOL *status)
-// 50 sctproto: int (WINAPI *ddraw1_SetCooperativeLevel)(void *iface, HWND window, DWORD flags)
-// 54 sctproto: int (WINAPI *ddraw1_SetDisplayMode)(void *iface, DWORD width, DWORD height, DWORD bpp)
-// 58 sctproto: int (WINAPI *ddraw1_WaitForVerticalBlank)(void *iface, DWORD flags, HANDLE event)
-// IDirectDrawPalette
-// 10 sctproto: int (WINAPI *palette_GetEntries)(void *, DWORD flags, DWORD start, DWORD count, PALETTEENTRY *entries)
-// 18 sctproto: int (WINAPI *palette_SetEntries)(void *, DWORD flags, DWORD start, DWORD count, PALETTEENTRY *entries)
-// IDirectDrawSurface
-// 14 sctproto: int (WINAPI *surface1_Blt)(void *, RECT *, void *, RECT *, DWORD, void *)
-// 30 sctproto: int (WINAPI *surface1_GetAttachedSurface)(void *, void *caps, void **attachment)
-// 38 sctproto: int (WINAPI *surface1_GetCaps)(void *iface, void *caps)
-// 54 sctproto: int (WINAPI *surface1_GetPixelFormat)(void *iface, void *fmt)
-// 64 sctproto: int (WINAPI *surface1_Lock)(void *, void *, void *, DWORD, HANDLE)
-// 6C sctproto: int (WINAPI *surface1_Restore)(void *)
-// 7C sctproto: int (WINAPI *surface1_SetPalette)(void *iface, void *palette)
-// 80 sctproto: int (WINAPI *surface1_Unlock)(void *, void *)
 // IDirectSound8
 // 0C sctproto: int (WINAPI *dsound_CreateSoundBuffer)(void *iface, void *dsbd, void **ppdsb, void *lpunk)
 // 18 sctproto: int (WINAPI *dsound_SetCooperativeLevel)(void *iface, HWND hwnd, DWORD level)
