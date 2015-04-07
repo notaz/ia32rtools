@@ -7379,7 +7379,78 @@ static char *next_word_s(char *w, size_t wsize, char *s)
   return s + i;
 }
 
-static void scan_variables(FILE *fasm)
+static int cmpstringp(const void *p1, const void *p2)
+{
+  return strcmp(*(char * const *)p1, *(char * const *)p2);
+}
+
+static int is_xref_needed(char *p, char **rlist, int rlist_len)
+{
+  char *p2;
+
+  p = sskip(p);
+  if (strstr(p, "..."))
+    // unable to determine, assume needed
+    return 1;
+
+  if (*p == '.') // .text, .data, ...
+    // ref from other data or non-function -> no
+    return 0;
+
+  p2 = strpbrk(p, "+:\r\n\x18");
+  if (p2 != NULL)
+    *p2 = 0;
+  if (bsearch(&p, rlist, rlist_len, sizeof(rlist[0]), cmpstringp))
+    // referenced from removed code
+    return 0;
+
+  return 1;
+}
+
+static int xrefs_show_need(FILE *fasm, char *p,
+  char **rlist, int rlist_len)
+{
+  int found_need = 0;
+  char line[256];
+  long pos;
+
+  p = strrchr(p, ';');
+  if (p != NULL && *p == ';' && IS_START(p + 2, "DATA XREF: ")) {
+    p += 13;
+    if (is_xref_needed(p, rlist, rlist_len))
+      return 1;
+  }
+
+  pos = ftell(fasm);
+  while (1)
+  {
+    if (!my_fgets(line, sizeof(line), fasm))
+      break;
+    // non-first line is always indented
+    if (!my_isblank(line[0]))
+      break;
+
+    // should be no content, just comment
+    p = sskip(line);
+    if (*p != ';')
+      break;
+
+    p = strrchr(p, ';');
+    p += 2;
+    // it's printed once, but no harm to check again
+    if (IS_START(p, "DATA XREF: "))
+      p += 11;
+
+    if (is_xref_needed(p, rlist, rlist_len)) {
+      found_need = 1;
+      break;
+    }
+  }
+  fseek(fasm, pos, SEEK_SET);
+  return found_need;
+}
+
+static void scan_variables(FILE *fasm, char **rlist, int rlist_len)
 {
   struct scanned_var *var;
   char line[256] = { 0, };
@@ -7447,6 +7518,10 @@ static void scan_variables(FILE *fasm)
         // when this starts, we don't need anything from this section
         break;
       }
+
+      // check refs comment(s)
+      if (!xrefs_show_need(fasm, p, rlist, rlist_len))
+        continue;
 
       if ((hg_var_cnt & 0xff) == 0) {
         hg_vars = realloc(hg_vars, sizeof(hg_vars[0])
@@ -7544,11 +7619,6 @@ static int cmp_chunks(const void *p1, const void *p2)
 {
   const struct chunk_item *c1 = p1, *c2 = p2;
   return strcmp(c1->name, c2->name);
-}
-
-static int cmpstringp(const void *p1, const void *p2)
-{
-  return strcmp(*(char * const *)p1, *(char * const *)p2);
 }
 
 static void scan_ahead(FILE *fasm)
@@ -7748,7 +7818,7 @@ int main(int argc, char *argv[])
   }
 
   if (g_header_mode)
-    scan_variables(fasm);
+    scan_variables(fasm, rlist, rlist_len);
 
   while (my_fgets(line, sizeof(line), fasm))
   {
