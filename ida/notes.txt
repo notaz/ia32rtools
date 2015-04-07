@@ -1,0 +1,9 @@
+
+manual adjust:
+- (exe only) find constants in .text that are actually pointers
+  (adjust as needed):
+     [456][0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F]h
+     _[456][0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F]\+
+- get rid of function chunks where possible (they're usually tailcalls)
+- search for 'dword_xx+N', make byte/word, also word->byte
+- convert ds:0[eax*4] -> [eax*4+0] (h hotkey)

@@ -26,16 +26,3 @@ s/\(\<j[mn]\?[abceglopszp]e\?\>\)\tloc_/\1\tnear ptr loc_/;\
 s/\<jmp\tsub_/jmp\tnear ptr sub_/;\
 ' $1" >> $f
 . $f
-
-# manual fixup:
-# - 'end start' -> 'end'
-# - 'mov edi, edi', 'lea ...' -> align
-# - add 'near ptr' to some jumps
-# - 'cmp     [ebp+edx+0], cl' -> 'cmp     [ebp+edx*1+0], cl'
-# - 0FFxxh constants - masm treats a byte, ONLY sometimes prefix with 'word ptr'
-# - jmp near:
-#   - jmp _strchr
-# - search for 'dword_xx+N', make byte/word, also word->byte
-# - get rid of type propagation, regenerate as 'simple' var_
-# - convert ds:0[eax*4] -> [eax*4+0] (h hotkey)
-# - rm function chunks - they're funcs reached by tailcalls (usually)
