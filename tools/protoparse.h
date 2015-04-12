@@ -87,7 +87,7 @@ static int do_protostrs(FILE *fhdr, const char *fname, int is_include)
 	hdrfn = fname;
 
 	is_cinc = strstr(fname, "stdc.hlist") != NULL;
-	is_osinc = is_cinc || strstr(fname, "stdc.hlist") != NULL;
+	is_osinc = is_cinc || strstr(fname, "win32.hlist") != NULL;
 
 	while (fgets(protostr, sizeof(protostr), fhdr))
 	{

@@ -2,11 +2,11 @@
 CC = winegcc
 RC = wrc
 
-CFLAGS += -Wall -ggdb -fno-strict-aliasing -mno-cygwin
+CFLAGS += -Wall -g -gdwarf-2 -fno-strict-aliasing -mno-cygwin
 ifndef DEBUG
 CFLAGS += -O2
 endif
-LDFLAGS += -ggdb
+LDFLAGS += -g
 
 ifdef ARM
 CFLAGS += -mcpu=cortex-a8 -mtune=cortex-a8 -mfloat-abi=softfp -mfpu=neon
