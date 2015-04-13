@@ -3458,17 +3458,31 @@ static int get_pp_arg_regmask_src(const struct parsed_proto *pp)
 
 static int get_pp_arg_regmask_dst(const struct parsed_proto *pp)
 {
+  int regmask = 0;
+  int i, reg;
+
+  if (pp->has_retreg) {
+    for (i = 0; i < pp->argc; i++) {
+      if (pp->arg[i].type.is_retreg) {
+        reg = char_array_i(regs_r32,
+                ARRAY_SIZE(regs_r32), pp->arg[i].reg);
+        ferr_assert(ops, reg >= 0);
+        regmask |= 1 << reg;
+      }
+    }
+  }
+
   if (strstr(pp->ret_type.name, "int64"))
-    return (1 << xAX) | (1 << xDX);
+    return regmask | (1 << xAX) | (1 << xDX);
   if (IS(pp->ret_type.name, "float")
    || IS(pp->ret_type.name, "double"))
   {
-    return mxST0;
+    return regmask | mxST0;
   }
   if (strcasecmp(pp->ret_type.name, "void") == 0)
-    return 0;
+    return regmask;
 
-  return mxAX;
+  return regmask | mxAX;
 }
 
 static void resolve_branches_parse_calls(int opcnt)
@@ -4801,7 +4815,10 @@ static void reg_use_pass(int i, int opcnt, unsigned char *cbits,
     if (po->flags & OPF_TAIL) {
       if (regmask_now & (mxST0 | mxST1))
         ferr(po, "float regs on tail: %x\n", regmask_now);
-      return;
+
+      // there is support for "conditional tailcall", sort of
+      if (!(po->flags & OPF_CC))
+        return;
     }
   }
 }
@@ -4955,17 +4972,6 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
 
   regmask_arg = get_pp_arg_regmask_src(g_func_pp);
   regmask_ret = get_pp_arg_regmask_dst(g_func_pp);
-
-  if (g_func_pp->has_retreg) {
-    for (arg = 0; arg < g_func_pp->argc; arg++) {
-      if (g_func_pp->arg[arg].type.is_retreg) {
-        reg = char_array_i(regs_r32,
-                ARRAY_SIZE(regs_r32), g_func_pp->arg[arg].reg);
-        ferr_assert(ops, reg >= 0);
-        regmask_ret |= 1 << reg;
-      }
-    }
-  }
 
   // pass1:
   // - resolve all branches
