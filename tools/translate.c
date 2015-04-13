@@ -249,6 +249,10 @@ enum ida_func_attr {
   IDAFA_FPD      = (1 << 5),
 };
 
+enum sct_func_attr {
+  SCTFA_CLEAR_SF = (1 << 0), // clear stack frame
+};
+
 enum x87_const {
   X87_CONST_1 = 1,
   X87_CONST_2T,
@@ -279,6 +283,9 @@ static int g_sp_frame;
 static int g_stack_frame_used;
 static int g_stack_fsz;
 static int g_ida_func_attr;
+static int g_sct_func_attr;
+static int g_stack_clear_start; // in dwords
+static int g_stack_clear_len;
 static int g_skip_func;
 static int g_allow_regfunc;
 static int g_quiet_pp;
@@ -5475,6 +5482,24 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
   if (had_decl)
     fprintf(fout, "\n");
 
+  // do stack clear, if needed
+  if (g_sct_func_attr & SCTFA_CLEAR_SF) {
+    fprintf(fout, "  ");
+    if (g_stack_clear_len != 0) {
+      if (g_stack_clear_len <= 4) {
+        for (i = 0; i < g_stack_clear_len; i++)
+          fprintf(fout, "sf.d[%d] = ", g_stack_clear_start + i);
+        fprintf(fout, "0;\n");
+      }
+      else {
+        fprintf(fout, "memset(&sf[%d], 0, %d);\n",
+          g_stack_clear_start, g_stack_clear_len * 4);
+      }
+    }
+    else
+      fprintf(fout, "memset(&sf, 0, sizeof(sf));\n");
+  }
+
   if (g_func_pp->is_vararg) {
     if (g_func_pp->argc_stack == 0)
       ferr(ops, "vararg func without stack args?\n");
@@ -7872,6 +7897,40 @@ int main(int argc, char *argv[])
           }
         }
       }
+      else if (p[2] == 's' && IS_START(p, "; sctattr:"))
+      {
+        static const char *attrs[] = {
+          "clear_sf",
+        };
+
+        // parse manual attribute-list comment
+        g_sct_func_attr = 0;
+        p = sskip(p + 10);
+
+        for (; *p != 0; p = sskip(p)) {
+          for (i = 0; i < ARRAY_SIZE(attrs); i++) {
+            if (!strncmp(p, attrs[i], strlen(attrs[i]))) {
+              g_sct_func_attr |= 1 << i;
+              p += strlen(attrs[i]);
+              break;
+            }
+          }
+          if (i == 0 && *p == '=') {
+            // clear_sf=start,len (in dwords)
+            ret = sscanf(p, "=%d,%d%n", &g_stack_clear_start,
+                    &g_stack_clear_len, &j);
+            if (ret < 2) {
+              anote("unparsed clear_sf attr value: %s\n", p);
+              break;
+            }
+            p += j;
+          }
+          else if (i == ARRAY_SIZE(attrs)) {
+            anote("unparsed sct attr: %s\n", p);
+            break;
+          }
+        }
+      }
       else if (p[2] == 'S' && IS_START(p, "; START OF FUNCTION CHUNK FOR "))
       {
         p += 30;
@@ -8040,6 +8099,9 @@ do_pending_endp:
       pending_endp = 0;
       in_func = 0;
       g_ida_func_attr = 0;
+      g_sct_func_attr = 0;
+      g_stack_clear_start = 0;
+      g_stack_clear_len = 0;
       skip_warned = 0;
       g_skip_func = 0;
       g_func[0] = 0;
