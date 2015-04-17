@@ -250,7 +250,8 @@ enum ida_func_attr {
 };
 
 enum sct_func_attr {
-  SCTFA_CLEAR_SF = (1 << 0), // clear stack frame
+  SCTFA_CLEAR_SF   = (1 << 0), // clear stack frame
+  SCTFA_CLEAR_REGS = (1 << 1), // clear registers (mask)
 };
 
 enum x87_const {
@@ -286,6 +287,7 @@ static int g_ida_func_attr;
 static int g_sct_func_attr;
 static int g_stack_clear_start; // in dwords
 static int g_stack_clear_len;
+static int g_regmask_init;
 static int g_skip_func;
 static int g_allow_regfunc;
 static int g_quiet_pp;
@@ -326,6 +328,7 @@ enum x86_regs {
 };
 
 #define mxAX     (1 << xAX)
+#define mxCX     (1 << xCX)
 #define mxDX     (1 << xDX)
 #define mxST0    (1 << xST0)
 #define mxST1    (1 << xST1)
@@ -4771,21 +4774,6 @@ static void reg_use_pass(int i, int opcnt, unsigned char *cbits,
     if (g_bp_frame && !(po->flags & OPF_EBP_S))
       regmask_new &= ~(1 << xBP);
 
-    if (po->op == OP_CALL) {
-      // allow fastcall calls from anywhere, calee may be also sitting
-      // in some fastcall table even when it's not using reg args
-      if (regmask_new & po->regmask_src & (1 << xCX)) {
-        *regmask_init |= (1 << xCX);
-        regmask_now |= (1 << xCX);
-        regmask_new &= ~(1 << xCX);
-      }
-      if (regmask_new & po->regmask_src & (1 << xDX)) {
-        *regmask_init |= (1 << xDX);
-        regmask_now |= (1 << xDX);
-        regmask_new &= ~(1 << xDX);
-      }
-    }
-
     if (regmask_new != 0)
       fnote(po, "uninitialized reg mask: %x\n", regmask_new);
 
@@ -4965,6 +4953,8 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
 
   g_bp_frame = g_sp_frame = g_stack_fsz = 0;
   g_stack_frame_used = 0;
+  if (g_sct_func_attr & SCTFA_CLEAR_REGS)
+    regmask_init = g_regmask_init;
 
   g_func_pp = proto_parse(fhdr, funcn, 0);
   if (g_func_pp == NULL)
@@ -5091,7 +5081,7 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
   // - find POPs for PUSHes, rm both
   // - scan for all used registers
   memset(cbits, 0, sizeof(cbits));
-  reg_use_pass(0, opcnt, cbits, 0, &regmask,
+  reg_use_pass(0, opcnt, cbits, regmask_init, &regmask,
     0, &regmask_save, &regmask_init, regmask_arg);
 
   // pass7:
@@ -7210,7 +7200,7 @@ static void output_hdr_fp(FILE *fout, const struct func_prototype *fp,
   char *p, namebuf[NAMELEN];
   const char *name;
   int regmask_dep;
-  int argc_stack;
+  int argc_normal;
   int j, arg;
 
   for (; count > 0; count--, fp++) {
@@ -7248,18 +7238,25 @@ static void output_hdr_fp(FILE *fout, const struct func_prototype *fp,
     }
 
     regmask_dep = fp->regmask_dep;
-    argc_stack = fp->argc_stack;
+    argc_normal = fp->argc_stack;
 
     fprintf(fout, "%-5s", fp->pp ? fp->pp->ret_type.name :
       (fp->has_ret ? "int" : "void"));
-    if (regmask_dep && (fp->is_stdcall || argc_stack == 0)
-      && (regmask_dep & ~((1 << xCX) | (1 << xDX))) == 0)
+    if (regmask_dep && (fp->is_stdcall || fp->argc_stack > 0)
+      && (regmask_dep & ~mxCX) == 0)
+    {
+      fprintf(fout, "/*__thiscall*/  ");
+      argc_normal++;
+      regmask_dep = 0;
+    }
+    else if (regmask_dep && (fp->is_stdcall || fp->argc_stack == 0)
+      && (regmask_dep & ~(mxCX | mxDX)) == 0)
     {
       fprintf(fout, "  __fastcall    ");
-      if (!(regmask_dep & (1 << xDX)) && argc_stack == 0)
-        argc_stack = 1;
+      if (!(regmask_dep & (1 << xDX)) && fp->argc_stack == 0)
+        argc_normal = 1;
       else
-        argc_stack += 2;
+        argc_normal += 2;
       regmask_dep = 0;
     }
     else if (regmask_dep && !fp->is_stdcall) {
@@ -7289,7 +7286,7 @@ static void output_hdr_fp(FILE *fout, const struct func_prototype *fp,
       }
     }
 
-    for (j = 0; j < argc_stack; j++) {
+    for (j = 0; j < argc_normal; j++) {
       arg++;
       if (arg != 1)
         fprintf(fout, ", ");
@@ -7907,6 +7904,7 @@ int main(int argc, char *argv[])
       {
         static const char *attrs[] = {
           "clear_sf",
+          "clear_regmask",
         };
 
         // parse manual attribute-list comment
@@ -7921,12 +7919,17 @@ int main(int argc, char *argv[])
               break;
             }
           }
-          if (i == 0 && *p == '=') {
-            // clear_sf=start,len (in dwords)
-            ret = sscanf(p, "=%d,%d%n", &g_stack_clear_start,
-                    &g_stack_clear_len, &j);
+          if (*p == '=') {
+            j = ret = 0;
+            if (i == 0)
+              // clear_sf=start,len (in dwords)
+              ret = sscanf(p, "=%d,%d%n", &g_stack_clear_start,
+                      &g_stack_clear_len, &j);
+            else if (i == 1)
+              // clear_regmask=<mask>
+              ret = sscanf(p, "=%d%n", &g_regmask_init, &j) + 1;
             if (ret < 2) {
-              anote("unparsed clear_sf attr value: %s\n", p);
+              anote("unparsed attr value: %s\n", p);
               break;
             }
             p += j;
@@ -8108,6 +8111,7 @@ do_pending_endp:
       g_sct_func_attr = 0;
       g_stack_clear_start = 0;
       g_stack_clear_len = 0;
+      g_regmask_init = 0;
       skip_warned = 0;
       g_skip_func = 0;
       g_func[0] = 0;
