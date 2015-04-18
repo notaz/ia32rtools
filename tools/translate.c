@@ -6774,10 +6774,13 @@ static struct scanned_var {
 } *hg_vars;
 static int hg_var_cnt;
 
+static char **hg_refs;
+static int hg_ref_cnt;
+
 static void output_hdr_fp(FILE *fout, const struct func_prototype *fp,
   int count);
 
-struct func_prototype *hg_fp_add(const char *funcn)
+static struct func_prototype *hg_fp_add(const char *funcn)
 {
   struct func_prototype *fp;
 
@@ -6838,6 +6841,19 @@ static int hg_fp_cmp_id(const void *p1_, const void *p2_)
   return p1->id - p2->id;
 }
 #endif
+
+static void hg_ref_add(const char *name)
+{
+  if ((hg_ref_cnt & 0xff) == 0) {
+    hg_refs = realloc(hg_refs, sizeof(hg_refs[0]) * (hg_ref_cnt + 0x100));
+    my_assert_not(hg_refs, NULL);
+    memset(hg_refs + hg_ref_cnt, 0, sizeof(hg_refs[0]) * 0x100);
+  }
+
+  hg_refs[hg_ref_cnt] = strdup(name);
+  my_assert_not(hg_refs[hg_ref_cnt], NULL);
+  hg_ref_cnt++;
+}
 
 // recursive register dep pass
 // - track saved regs (part 2)
@@ -7193,6 +7209,24 @@ static void hg_fp_resolve_deps(struct func_prototype *fp)
   }
 }
 
+// make all thiscall/edx arg functions referenced from .data fastcall
+static void do_func_refs_from_data(void)
+{
+  struct func_prototype *fp, fp_s;
+  int i;
+
+  for (i = 0; i < hg_ref_cnt; i++) {
+    strcpy(fp_s.name, hg_refs[i]);
+    fp = bsearch(&fp_s, hg_fp, hg_fp_cnt,
+      sizeof(hg_fp[0]), hg_fp_cmp_name);
+    if (fp == NULL)
+      continue;
+
+    if (fp->argc_stack != 0 && (fp->regmask_dep & (mxCX | mxDX)))
+      fp->regmask_dep |= mxCX | mxDX;
+  }
+}
+
 static void output_hdr_fp(FILE *fout, const struct func_prototype *fp,
   int count)
 {
@@ -7338,6 +7372,9 @@ static void output_hdr(FILE *fout)
   for (i = 0; i < hg_fp_cnt; i++)
     hg_fp_resolve_deps(&hg_fp[i]);
 
+  // adjust functions referenced from data segment
+  do_func_refs_from_data();
+
   // note: messes up .proto ptr, don't use
   //qsort(hg_fp, hg_fp_cnt, sizeof(hg_fp[0]), hg_fp_cmp_id);
 
@@ -7381,7 +7418,7 @@ static char *next_word_s(char *w, size_t wsize, char *s)
   s = sskip(s);
 
   i = 0;
-  if (*s == '\'') {
+  if (*s == '\'' && s[1] != '\r' && s[1] != '\n') {
     w[0] = s[0];
     for (i = 1; i < wsize - 1; i++) {
       if (s[i] == 0) {
@@ -7435,7 +7472,7 @@ static int is_xref_needed(char *p, char **rlist, int rlist_len)
   return 1;
 }
 
-static int xrefs_show_need(FILE *fasm, char *p,
+static int ida_xrefs_show_need(FILE *fasm, char *p,
   char **rlist, int rlist_len)
 {
   int found_need = 0;
@@ -7482,7 +7519,8 @@ static void scan_variables(FILE *fasm, char **rlist, int rlist_len)
 {
   struct scanned_var *var;
   char line[256] = { 0, };
-  char words[3][256];
+  char words[4][256];
+  int no_identifier;
   char *p = NULL;
   int wordc;
   int l;
@@ -7521,8 +7559,7 @@ static void scan_variables(FILE *fasm, char **rlist, int rlist_len)
       asmln++;
 
       p = line;
-      if (my_isblank(*p))
-        continue;
+      no_identifier = my_isblank(*p);
 
       p = sskip(p);
       if (*p == 0 || *p == ';')
@@ -7542,13 +7579,19 @@ static void scan_variables(FILE *fasm, char **rlist, int rlist_len)
       if (wordc < 2)
         continue;
 
+      if (no_identifier) {
+        if (wordc >= 3 && IS(words[0], "dd") && IS(words[1], "offset"))
+          hg_ref_add(words[2]);
+        continue;
+      }
+
       if (IS_START(words[0], "__IMPORT_DESCRIPTOR_")) {
         // when this starts, we don't need anything from this section
         break;
       }
 
       // check refs comment(s)
-      if (!xrefs_show_need(fasm, p, rlist, rlist_len))
+      if (!ida_xrefs_show_need(fasm, p, rlist, rlist_len))
         continue;
 
       if ((hg_var_cnt & 0xff) == 0) {
@@ -7578,8 +7621,11 @@ static void scan_variables(FILE *fasm, char **rlist, int rlist_len)
         continue;
       }
 
-      if      (IS(words[1], "dd"))
+      if      (IS(words[1], "dd")) {
         var->lmod = OPLM_DWORD;
+        if (wordc >= 4 && IS(words[2], "offset"))
+          hg_ref_add(words[3]);
+      }
       else if (IS(words[1], "dw"))
         var->lmod = OPLM_WORD;
       else if (IS(words[1], "db")) {
