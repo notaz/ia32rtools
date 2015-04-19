@@ -309,6 +309,18 @@ static void idaapi run(int /*arg*/)
       }
     }
 
+    // detect tailcalls to next func with 'jmp $+5' (offset 0)
+    if (f_area.endEA - f_area.startEA >= 5
+      && decode_insn(f_area.endEA - 5) && cmd.itype == NN_jmp
+      && cmd.Operands[0].type == o_near
+      && cmd.Operands[0].addr == f_area.endEA
+      && get_name(BADADDR, f_area.endEA, buf, sizeof(buf))
+      && get_cmt(f_area.endEA - 5, false, buf2, sizeof(buf2)) <= 0)
+    {
+      qsnprintf(buf2, sizeof(buf2), "sctpatch: jmp %s", buf);
+      set_cmt(f_area.endEA - 5, buf2, false);
+    }
+
     func = get_next_func(ea);
   }
 
