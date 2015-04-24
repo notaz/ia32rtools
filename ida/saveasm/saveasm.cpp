@@ -64,10 +64,12 @@ static const char *reserved_names[] = {
   "type",
   "offset",
   "aam",
+  "aas",
   "text",
   "size",
   "c",
   "align",
+  "addr",
 };
 
 static int is_name_reserved(const char *name)
@@ -107,11 +109,14 @@ static int is_insn_jmp(uint16 itype)
 }
 
 static void do_def_line(char *buf, size_t buf_size, const char *line,
-  ea_t ea)
+  ea_t ea, func_t *func)
 {
+  char func_name[256] = "<nf>";
+  int is_libfunc = 0;
+  int global_label;
   ea_t *ea_ret;
+  int i, len;
   char *p;
-  int len;
 
   tag_remove(line, buf, buf_size); // remove color codes
   len = strlen(buf);
@@ -127,7 +132,22 @@ static void do_def_line(char *buf, size_t buf_size, const char *line,
   if (*p == ':') {
     ea_ret = (ea_t *)bsearch(&ea, nonlocal_bt, nonlocal_bt_cnt,
       sizeof(nonlocal_bt[0]), nonlocal_bt_cmp);
-    if (ea_ret != 0) {
+    global_label = (ea_ret != NULL);
+    if (!global_label) {
+      if (func != NULL) {
+        get_func_name(ea, func_name, sizeof(func_name));
+        is_libfunc = func->flags & FUNC_LIB;
+      }
+      for (i = 0; i < get_item_size(ea); i++) {
+        xrefblk_t xb;
+        if (xb.first_to(ea + i, XREF_DATA)) {
+          if (!is_libfunc && xb.type == dr_O)
+            msg("%x: offset xref in %s\n", ea, func_name);
+          global_label = 1;
+        }
+      }
+    }
+    if (global_label) {
       if (p[1] != ' ')
         msg("no trailing blank in '%s'\n", buf);
       else
@@ -450,7 +470,8 @@ static void idaapi run(int /*arg*/)
         do_undef = 1;
       }
       // masm doesn't understand large aligns
-      else if (isAlign(ea_flags) && ea_size > 0x10) {
+      else if (isAlign(ea_flags) && ea_size >= 0x10)
+      {
         msg("%x: undefining align %d\n", ea, ea_size);
         do_unknown(ea, DOUNK_EXPAND);
       }
@@ -464,7 +485,8 @@ static void idaapi run(int /*arg*/)
     }
   }
 
-  // check namelist for reserved names
+  // check namelist for reserved names and
+  // matching names with different case (nasm ignores case)
   n = get_nlist_size();
   for (i = 0; i < n; i++) {
     ea = get_nlist_ea(i);
@@ -473,6 +495,23 @@ static void idaapi run(int /*arg*/)
       msg("%x: null name?\n", ea);
       continue;
     }
+    qsnprintf(buf, sizeof(buf), "%s", name);
+
+    int need_rename = is_name_reserved(name);
+    if (!need_rename) {
+      p = buf;
+      pp = (char **)bsearch(&p, name_cache, name_cache_size,
+              sizeof(name_cache[0]), name_cache_cmp);
+      if (pp != NULL) {
+        if (pp > name_cache && stricmp(pp[-1], pp[0]) == 0)
+          need_rename = 1;
+        else if (pp < name_cache + name_cache_size - 1
+          && stricmp(pp[0], pp[1]) == 0)
+        {
+          need_rename = 1;
+        }
+      }
+    }
 
     // rename vars with '?@' (funcs are ok)
     int change_qat = 0;
@@ -480,9 +519,8 @@ static void idaapi run(int /*arg*/)
     if (!isCode(ea_flags) && strpbrk(name, "?@"))
       change_qat = 1;
 
-    if (change_qat || is_name_reserved(name)) {
+    if (need_rename || change_qat) {
       msg("%x: renaming name '%s'\n", ea, name);
-      qsnprintf(buf, sizeof(buf), "%s", name);
 
       if (change_qat) {
         for (p = buf; *p != 0; p++) {
@@ -524,7 +562,7 @@ static void idaapi run(int /*arg*/)
   ln.set_place(&pl);
   n = ln.get_linecnt();
   for (i = 0; i < n - 1; i++) {
-    do_def_line(buf, sizeof(buf), ln.down(), ea);
+    do_def_line(buf, sizeof(buf), ln.down(), ea, NULL);
     if (strstr(buf, "include"))
       continue;
 
@@ -559,6 +597,8 @@ static void idaapi run(int /*arg*/)
       if (wasBreak())
         break;
     }
+
+    func = get_func(ea);
 
     segment_t *seg = getseg(ea);
     if (!seg || (seg->type != SEG_CODE && seg->type != SEG_DATA))
@@ -625,7 +665,7 @@ static void idaapi run(int /*arg*/)
 pass:
     n = ln.get_linecnt();
     for (i = pl.lnnum; i < n; i++) {
-      do_def_line(buf, sizeof(buf), ln.down(), ea);
+      do_def_line(buf, sizeof(buf), ln.down(), ea, func);
 
       char *fw;
       for (fw = buf; *fw != 0 && *fw == ' '; )
