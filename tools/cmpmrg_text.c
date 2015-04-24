@@ -291,53 +291,61 @@ void parse_headers(FILE *f, unsigned int *base_out,
 	*raw_symtab_out = symt_all;
 }
 
-static int handle_pad(uint8_t *d_obj, uint8_t *d_exe, int maxlen)
+static int try_align(uint8_t *d_obj, uint8_t *d_exe, int maxlen)
 {
-	static const uint8_t p7[7] = { 0x8d, 0xa4, 0x24, 0x00, 0x00, 0x00, 0x00 };
-	static const uint8_t p6[6] = { 0x8d, 0x9b, 0x00, 0x00, 0x00, 0x00 };
-	static const uint8_t p5[5] = { 0x05, 0x00, 0x00, 0x00, 0x00 }; // add eax, 0
-	static const uint8_t p4[4] = { 0x8d, 0x64, 0x24, 0x00 }; // lea
-	static const uint8_t p3[3] = { 0x8d, 0x49, 0x00 }; // lea ecx, [ecx]
-	static const uint8_t p2[2] = { 0x8b, 0xff }; // mov edi, edi
-	static const uint8_t p1[1] = { 0x90 }; // nop
+	static const uint8_t aligns[8][7] = {
+		{ }, // [0] not used
+		{ 0x90 }, // [1] nop
+		{ 0x8b, 0xff }, // mov edi, edi
+		{ 0x8d, 0x49, 0x00 }, // lea ecx, [ecx]
+		{ 0x8d, 0x64, 0x24, 0x00 }, // lea
+		{ 0x05, 0x00, 0x00, 0x00, 0x00 }, // add eax, 0
+		{ 0x8d, 0x9b, 0x00, 0x00, 0x00, 0x00 },
+		{ 0x8d, 0xa4, 0x24, 0x00, 0x00, 0x00, 0x00 },
+	};
+	int j = 0;
 	int len;
 	int i;
 
+	// check exe for common pad/align patterns
 	for (i = 0; i < maxlen; i++)
 		if (d_exe[i] != 0xcc)
 			break;
 
-	for (len = i; len > 0; )
+	while (j < 8) {
+		for (j = 1; j < 8; j++) {
+			if (maxlen - i < j) {
+				j = 8;
+				break;
+			}
+			if (memcmp(&d_exe[i], aligns[j], j) == 0) {
+				i += j;
+				break;
+			}
+		}
+	}
+	if (i == 0)
+		return 0;
+
+	// now check the obj
+	for (j = 0, len = i; len > 0; )
 	{
 		i = len;
 		if (i > 7)
 			i = 7;
 
-		switch (i) {
-		#define CASE(x) \
-		case sizeof(p ## x): \
-			if (memcmp(d_obj, p ## x, sizeof(p ## x))) \
-				return 0; \
-			memset(d_obj, 0xcc, sizeof(p ## x)); \
+		if (memcmp(d_obj, aligns[i], i) != 0)
 			break;
-		CASE(7)
-		CASE(6)
-		CASE(5)
-		CASE(4)
-		CASE(3)
-		CASE(2)
-		CASE(1)
-		default:
-			printf("%s: unhandled len: %d\n", __func__, len);
-			return 0;
-		#undef CASE
-		}
+
+		memcpy(d_obj, d_exe, i);
+		j += i;
 
 		len -= i;
 		d_obj += i;
+		d_exe += i;
 	}
 
-	return 1;
+	return j;
 }
 
 struct equiv_opcode {
@@ -394,6 +402,9 @@ struct equiv_opcode {
 	{ 5, -1, 0, 0,
 	 { 0x00,0x04,0x24,0x00,0x90 }, { 0x00,0xc7,0xff,0x00,0xff },
 	 { 0x00,0x44,0x24,0x00,0x00 }, { 0x00,0xc7,0xff,0xff,0x00 }, },
+	{ 8, -1, 0, 0,
+	 { 0x00,0x04,0x24,0x00,0x00,0x00,0x00,0x90 }, { 0x00,0xc7,0xff,0x00,0x00,0x00,0x00,0xff },
+	 { 0x00,0x44,0x24,0x00,0x00,0x00,0x00,0x00 }, { 0x00,0xc7,0xff,0xff,0x00,0x00,0x00,0x00 }, },
 
         // various align insns/fillups
 	{ 2, -1, 0, 0,
@@ -514,6 +525,7 @@ int main(int argc, char *argv[])
 	long sztext_cmn;
 	int do_cmp = 1;
 	int retval = 1;
+	int bad = 0;
 	int left;
 	int arg;
 	int ret;
@@ -581,16 +593,17 @@ int main(int argc, char *argv[])
 	if (do_cmp)
 	for (i = 0; i < sztext_cmn; i++)
 	{
-		if (s_text_obj.data[i] == s_text_exe.data[i])
+		if (s_text_obj.data[i] == s_text_exe.data[i]) {
+			bad = 0;
 			continue;
+		}
 
 		left = sztext_cmn - i;
 
-		if (s_text_exe.data[i] == 0xcc || s_text_exe.data[i] == 0x90) {
-			// padding
-			if (handle_pad(s_text_obj.data + i,
-			    s_text_exe.data + i, left))
-				continue;
+		ret = try_align(s_text_obj.data + i, s_text_exe.data + i, left);
+		if (ret > 0) {
+			i += ret - 1;
+			continue;
 		}
 
 		ret = check_equiv(s_text_obj.data + i, s_text_exe.data + i, left);
@@ -601,7 +614,10 @@ int main(int argc, char *argv[])
 
 		printf("%x: %02x vs %02x\n", base + i,
 			s_text_obj.data[i], s_text_exe.data[i]);
-		goto out;
+		if (bad)
+			goto out;
+
+		bad = 1;
 	}
 
 	// fill removed funcs with 'int3'
