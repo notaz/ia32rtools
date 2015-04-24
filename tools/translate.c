@@ -7973,7 +7973,7 @@ int main(int argc, char *argv[])
                       &g_stack_clear_len, &j);
             else if (i == 1)
               // clear_regmask=<mask>
-              ret = sscanf(p, "=%d%n", &g_regmask_init, &j) + 1;
+              ret = sscanf(p, "=%x%n", &g_regmask_init, &j) + 1;
             if (ret < 2) {
               anote("unparsed attr value: %s\n", p);
               break;

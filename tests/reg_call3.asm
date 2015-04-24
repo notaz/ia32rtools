@@ -4,6 +4,7 @@
 
 _text           segment para public 'CODE' use32
 
+; sctattr: clear_regmask=0c
 sub_test        proc near
                 xor     ebx, ebx
                 push    1
