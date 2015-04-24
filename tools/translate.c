@@ -136,6 +136,11 @@ enum op_op {
   OP_FISUB,
   OP_FIDIVR,
   OP_FISUBR,
+  OP_FCOS,
+  OP_FPATAN,
+  OP_FPTAN,
+  OP_FSIN,
+  OP_FSQRT,
   // mmx
   OP_EMMS,
   // pseudo-ops for lib calls
@@ -1045,6 +1050,11 @@ static const struct {
   { "fisub",  OP_FISUB,  1, 1, 0 },
   { "fidivr", OP_FIDIVR, 1, 1, 0 },
   { "fisubr", OP_FISUBR, 1, 1, 0 },
+  { "fcos",   OP_FCOS,   0, 0, 0 },
+  { "fpatan", OP_FPATAN, 0, 0, OPF_FPOP },
+  { "fptan",  OP_FPTAN,  0, 0, OPF_FPUSH },
+  { "fsin",   OP_FSIN,   0, 0, 0 },
+  { "fsqrt",  OP_FSQRT,  0, 0, 0 },
   // mmx
   { "emms",   OP_EMMS,   0, 0, OPF_DATA },
   { "movq",   OP_MOV,    2, 2, OPF_DATA },
@@ -1372,8 +1382,20 @@ static void parse_op(struct parsed_op *op, char words[16][256], int wordc)
   case OP_FISUB:
   case OP_FIDIVR:
   case OP_FISUBR:
+  case OP_FCOS:
+  case OP_FSIN:
+  case OP_FSQRT:
     op->regmask_src |= mxST0;
     op->regmask_dst |= mxST0;
+    break;
+
+  case OP_FPATAN:
+    op->regmask_src |= mxST0 | mxST1;
+    op->regmask_dst |= mxST0;
+    break;
+
+  case OP_FPTAN:
+    aerr("TODO\n");
     break;
 
   default:
@@ -4931,11 +4953,13 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
   unsigned int uval;
   int save_arg_vars[MAX_ARG_GRP] = { 0, };
   unsigned char cbits[MAX_OPS / 8];
+  const char *float_type;
   int cond_vars = 0;
   int need_tmp_var = 0;
   int need_tmp64 = 0;
   int had_decl = 0;
   int label_pending = 0;
+  int need_double = 0;
   int regmask_save = 0; // regs saved/restored in this func
   int regmask_arg;      // regs from this function args (fastcall, etc)
   int regmask_ret;      // regs needed on ret
@@ -5252,10 +5276,14 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
       if (j == -1)
         po->flags |= OPF_32BIT;
     }
+    else if (po->op == OP_FLD && po->operand[0].lmod == OPLM_QWORD)
+      need_double = 1;
 
     if (po->op == OP_RCL || po->op == OP_RCR || po->op == OP_XCHG)
       need_tmp_var = 1;
   }
+
+  float_type = need_double ? "double" : "float";
 
   // output starts here
 
@@ -5416,7 +5444,7 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
   if (regmask_now & 0xff0000) {
     for (reg = 16; reg < 24; reg++) {
       if (regmask_now & (1 << reg)) {
-        fprintf(fout, "  double f_st%d", reg - 16);
+        fprintf(fout, "  %s f_st%d", float_type, reg - 16);
         if (regmask_init & (1 << reg))
           fprintf(fout, " = 0");
         fprintf(fout, ";\n");
@@ -6559,7 +6587,7 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
       case OP_FILD:
         if (po->flags & OPF_FSHIFT)
           fprintf(fout, "  f_st1 = f_st0;\n");
-        fprintf(fout, "  f_st0 = (double)%s;",
+        fprintf(fout, "  f_st0 = (%s)%s;", float_type,
           out_src_opr(buf1, sizeof(buf1), po, &po->operand[0],
             lmod_cast(po, po->operand[0].lmod, 1), 0));
         strcat(g_comment, " fild");
@@ -6635,7 +6663,7 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
         case OP_FISUB: j = '-'; break;
         default: j = 'x'; break;
         }
-        fprintf(fout, "  f_st0 %c= (double)%s;", j,
+        fprintf(fout, "  f_st0 %c= (%s)%s;", j, float_type,
           out_src_opr(buf1, sizeof(buf1), po, &po->operand[0],
             lmod_cast(po, po->operand[0].lmod, 1), 0));
         break;
@@ -6645,6 +6673,26 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
         fprintf(fout, "  f_st0 = %s %c f_st0;",
           out_src_opr_float(buf2, sizeof(buf2), po, &po->operand[1]),
           po->op == OP_FIDIVR ? '/' : '-');
+        break;
+
+      case OP_FCOS:
+        fprintf(fout, "  f_st0 = cos%s(f_st0);",
+          need_double ? "" : "f");
+        break;
+
+      case OP_FPATAN:
+        fprintf(fout, "  f_st0 = atan%s(f_st1 / f_st0);",
+          need_double ? "" : "f");
+        break;
+
+      case OP_FSIN:
+        fprintf(fout, "  f_st0 = sin%s(f_st0);",
+          need_double ? "" : "f");
+        break;
+
+      case OP_FSQRT:
+        fprintf(fout, "  f_st0 = sqrt%s(f_st0);",
+          need_double ? "" : "f");
         break;
 
       case OPP_FTOL:
