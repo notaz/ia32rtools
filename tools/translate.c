@@ -79,6 +79,7 @@ enum op_op {
 	OP_NOT,
 	OP_XLAT,
 	OP_CDQ,
+	OP_BSWAP,
 	OP_LODS,
 	OP_STOS,
 	OP_MOVS,
@@ -147,6 +148,8 @@ enum op_op {
   // mmx
   OP_EMMS,
   // pseudo-ops for lib calls
+  OPP_ALLSHL,
+  OPP_ALLSHR,
   OPP_FTOL,
   // undefined
   OP_UD2,
@@ -924,6 +927,7 @@ static const struct {
   { "not",  OP_NOT,    1, 1, OPF_DATA },
   { "xlat", OP_XLAT,   0, 0, OPF_DATA },
   { "cdq",  OP_CDQ,    0, 0, OPF_DATA },
+  { "bswap",OP_BSWAP,  1, 1, OPF_DATA },
   { "lodsb",OP_LODS,   0, 0, OPF_DATA },
   { "lodsw",OP_LODS,   0, 0, OPF_DATA },
   { "lodsd",OP_LODS,   0, 0, OPF_DATA },
@@ -1069,6 +1073,8 @@ static const struct {
   { "emms",   OP_EMMS,   0, 0, OPF_DATA },
   { "movq",   OP_MOV,    2, 2, OPF_DATA },
   // pseudo-ops for lib calls
+  { "_allshl",OPP_ALLSHL },
+  { "_allshr",OPP_ALLSHR },
   { "_ftol",  OPP_FTOL },
   // must be last
   { "ud2",    OP_UD2 },
@@ -1167,6 +1173,7 @@ static void parse_op(struct parsed_op *op, char words[16][256], int wordc)
   case OP_INC:
   case OP_DEC:
   case OP_NEG:
+  case OP_BSWAP:
   // more below..
     op->regmask_src |= op->regmask_dst;
     break;
@@ -3542,7 +3549,9 @@ static void resolve_branches_parse_calls(int opcnt)
     unsigned int regmask_src;
     unsigned int regmask_dst;
   } pseudo_ops[] = {
-    { "__ftol", OPP_FTOL, OPF_FPOP, mxST0, mxAX | mxDX },
+    { "__allshl", OPP_ALLSHL, OPF_DATA, mxAX|mxDX|mxCX, mxAX|mxDX },
+    { "__allshr", OPP_ALLSHR, OPF_DATA, mxAX|mxDX|mxCX, mxAX|mxDX },
+    { "__ftol",   OPP_FTOL,   OPF_FPOP, mxST0, mxAX | mxDX },
   };
   const struct parsed_proto *pp_c;
   struct parsed_proto *pp;
@@ -3867,7 +3876,16 @@ static void scan_prologue_epilogue(int opcnt)
             || !IS(opr_name(&ops[j], 0), "esp")
             || ops[j].operand[1].type != OPT_CONST
             || ops[j].operand[1].val != g_stack_fsz)
+        {
+          if (ops[i].op == OP_CALL && ops[i].pp != NULL
+            && ops[i].pp->is_noreturn)
+          {
+            // noreturn tailcall with no epilogue
+            i++;
+            continue;
+          }
           ferr(&ops[j], "'add esp' expected\n");
+        }
 
         ops[j].flags |= OPF_RMD | OPF_DONE | OPF_NOREGS;
         ops[j].operand[1].val = 0; // hack for stack arg scanner
@@ -4341,9 +4359,11 @@ static int collect_call_args_early(struct parsed_op *po, int i,
     else if (ops[j].op == OP_PUSH) {
       if (ops[j].flags & (OPF_FARG|OPF_FARGNR))
         return -1;
-      ret = scan_for_mod(&ops[j], j + 1, i, 1);
-      if (ret >= 0)
-        return -1;
+      if (!g_header_mode) {
+        ret = scan_for_mod(&ops[j], j + 1, i, 1);
+        if (ret >= 0)
+          return -1;
+      }
 
       if (pp->arg[arg].type.is_va_list)
         return -1;
@@ -4794,17 +4814,6 @@ static void reg_use_pass(int i, int opcnt, unsigned char *cbits,
     if (po->flags & OPF_NOREGS)
       continue;
 
-    if (po->flags & OPF_FPUSH) {
-      if (regmask_now & mxST1)
-        regmask_now |= mxSTa; // switch to "full stack" mode
-      if (regmask_now & mxSTa)
-        po->flags |= OPF_FSHIFT;
-      if (!(regmask_now & mxST7_2)) {
-        regmask_now =
-          (regmask_now & ~mxST1_0) | ((regmask_now & mxST0) << 1);
-      }
-    }
-
     // if incomplete register is used, clear it on init to avoid
     // later use of uninitialized upper part in some situations
     if ((po->flags & OPF_DATA) && po->operand[0].type == OPT_REG
@@ -4834,6 +4843,17 @@ static void reg_use_pass(int i, int opcnt, unsigned char *cbits,
           scan_fwd_set_flags(i + 1, opcnt, i + opcnt * 5, OPF_EBP_S);
         else
           regmask_op &= ~(1 << xBP);
+      }
+    }
+
+    if (po->flags & OPF_FPUSH) {
+      if (regmask_now & mxST1)
+        regmask_now |= mxSTa; // switch to "full stack" mode
+      if (regmask_now & mxSTa)
+        po->flags |= OPF_FSHIFT;
+      if (!(regmask_now & mxST7_2)) {
+        regmask_now =
+          (regmask_now & ~mxST1_0) | ((regmask_now & mxST0) << 1);
       }
     }
 
@@ -5210,16 +5230,23 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
         cond_vars |= 1 << PFO_C;
     }
 
-    if (po->op == OP_CMPS || po->op == OP_SCAS) {
+    switch (po->op) {
+    case OP_CMPS:
+    case OP_SCAS:
       cond_vars |= 1 << PFO_Z;
-    }
-    else if (po->op == OP_MUL
-      || (po->op == OP_IMUL && po->operand_cnt == 1))
-    {
+      break;
+
+    case OP_MUL:
       if (po->operand[0].lmod == OPLM_DWORD)
         need_tmp64 = 1;
-    }
-    else if (po->op == OP_CALL) {
+      break;
+
+    case OP_IMUL:
+      if (po->operand_cnt == 1 && po->operand[0].lmod == OPLM_DWORD)
+        need_tmp64 = 1;
+      break;
+
+    case OP_CALL:
       // note: resolved non-reg calls are OPF_DONE already
       pp = po->pp;
       ferr_assert(po, pp != NULL);
@@ -5266,27 +5293,31 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
         if (pp->argc_stack > 0)
           pp->is_stdcall = 1;
       }
-    }
-    else if (po->op == OP_MOV && po->operand[0].pp != NULL
-      && po->operand[1].pp != NULL)
-    {
-      // <var> = offset <something>
-      if ((po->operand[1].pp->is_func || po->operand[1].pp->is_fptr)
-        && !IS_START(po->operand[1].name, "off_"))
+      break;
+
+    case OP_MOV:
+      if (po->operand[0].pp != NULL && po->operand[1].pp != NULL)
       {
-        if (!po->operand[0].pp->is_fptr)
-          ferr(po, "%s not declared as fptr when it should be\n",
-            po->operand[0].name);
-        if (pp_cmp_func(po->operand[0].pp, po->operand[1].pp)) {
-          pp_print(buf1, sizeof(buf1), po->operand[0].pp);
-          pp_print(buf2, sizeof(buf2), po->operand[1].pp);
-          fnote(po, "var:  %s\n", buf1);
-          fnote(po, "func: %s\n", buf2);
-          ferr(po, "^ mismatch\n");
+        // <var> = offset <something>
+        if ((po->operand[1].pp->is_func || po->operand[1].pp->is_fptr)
+          && !IS_START(po->operand[1].name, "off_"))
+        {
+          if (!po->operand[0].pp->is_fptr)
+            ferr(po, "%s not declared as fptr when it should be\n",
+              po->operand[0].name);
+          if (pp_cmp_func(po->operand[0].pp, po->operand[1].pp)) {
+            pp_print(buf1, sizeof(buf1), po->operand[0].pp);
+            pp_print(buf2, sizeof(buf2), po->operand[1].pp);
+            fnote(po, "var:  %s\n", buf1);
+            fnote(po, "func: %s\n", buf2);
+            ferr(po, "^ mismatch\n");
+          }
         }
       }
-    }
-    else if (po->op == OP_DIV || po->op == OP_IDIV) {
+      break;
+
+    case OP_DIV:
+    case OP_IDIV:
       if (po->operand[0].lmod == OPLM_DWORD) {
         // 32bit division is common, look for it
         if (po->op == OP_DIV)
@@ -5300,21 +5331,40 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
       }
       else
         need_tmp_var = 1;
-    }
-    else if (po->op == OP_CLD)
+      break;
+
+    case OP_CLD:
       po->flags |= OPF_RMD | OPF_DONE;
-    else if (po->op == OPP_FTOL) {
+      break;
+
+    case OP_RCL:
+    case OP_RCR:
+    case OP_XCHG:
+      need_tmp_var = 1;
+      break;
+
+    case OP_FLD:
+      if (po->operand[0].lmod == OPLM_QWORD)
+        need_double = 1;
+      break;
+
+    case OPP_ALLSHL:
+    case OPP_ALLSHR:
+      need_tmp64 = 1;
+      break;
+
+    case OPP_FTOL: {
       struct parsed_opr opr = OPR_INIT(OPT_REG, OPLM_DWORD, xDX);
       j = -1;
       find_next_read(i + 1, opcnt, &opr, i + opcnt * 18, &j);
       if (j == -1)
         po->flags |= OPF_32BIT;
+      break;
     }
-    else if (po->op == OP_FLD && po->operand[0].lmod == OPLM_QWORD)
-      need_double = 1;
 
-    if (po->op == OP_RCL || po->op == OP_RCR || po->op == OP_XCHG)
-      need_tmp_var = 1;
+    default:
+      break;
+    }
   }
 
   float_type = need_double ? "double" : "float";
@@ -5761,6 +5811,12 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
             out_dst_opr(buf1, sizeof(buf1), po, &po->operand[0]),
             out_src_opr_u32(buf2, sizeof(buf2), po, &po->operand[1]));
         strcpy(g_comment, "cdq");
+        break;
+
+      case OP_BSWAP:
+        assert_operand_cnt(1);
+        out_dst_opr(buf1, sizeof(buf1), po, &po->operand[0]);
+        fprintf(fout, "  %s = __builtin_bswap32(%s);", buf1, buf1);
         break;
 
       case OP_LODS:
@@ -6617,6 +6673,17 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
         no_output = 1;
         break;
 
+      // pseudo ops
+      case OPP_ALLSHL:
+      case OPP_ALLSHR:
+        fprintf(fout, "  tmp64 = ((u64)edx << 32) | eax;\n");
+        fprintf(fout, "  tmp64 = (s64)tmp64 %s= LOBYTE(ecx);\n",
+          po->op == OPP_ALLSHL ? "<<" : ">>");
+        fprintf(fout, "  edx = tmp64 >> 32; eax = tmp64;");
+        strcat(g_comment, po->op == OPP_ALLSHL
+          ? " allshl" : " allshr");
+        break;
+
       // x87
       case OP_FLD:
         if (need_float_stack) {
@@ -7375,7 +7442,7 @@ static void gen_hdr(const char *funcn, int opcnt)
       fp->argc_stack--;
   }
 
-  fp->regmask_dep = regmask_dep & ~(1 << xSP);
+  fp->regmask_dep = regmask_dep & ~((1 << xSP) | mxSTa);
   fp->has_ret = has_ret;
 #if 0
   printf("// has_ret %d, regmask_dep %x\n",

@@ -21,7 +21,7 @@ arg_0           = dword ptr  8
                 fxch    st(1)
                 fchs
                 fsubrp  st, st
-                fld     st(1)
+                fld     st
                 fyl2x
                 fld     st
                 fstp    [ebp+var_18]

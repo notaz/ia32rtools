@@ -17,7 +17,7 @@ int sub_test(int a1, int a2)
   { double t = f_st0; f_st0 = f_st1; f_st1 = t; }  // fxch
   f_st0 = -f_st0;
   f_st0 = f_st1;
-  f_st1 = f_st0;  f_st0 = f_st1;  // fld
+  f_st1 = f_st0;  // fld st
   f_st0 = f_st1 * log2(f_st0);
   f_st1 = f_st0;  // fld st
   *((double *)(u32)&sf.q[1]) = f_st0;  f_st0 = f_st1;  // var_18 fst

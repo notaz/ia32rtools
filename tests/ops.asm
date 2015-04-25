@@ -34,6 +34,10 @@ loop:
                 cdq
                 bsf     eax, ecx
 
+                call    __allshl
+                call    __allshr
+                bswap   eax
+
                 push    1
                 pop     eax
                 pop     edi

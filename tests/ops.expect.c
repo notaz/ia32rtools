@@ -7,6 +7,7 @@ int sub_test()
   u32 esi;
   u32 edi;
   u32 cond_z;
+  u64 tmp64;
 
   ebx = 0x10000;
   esi = 0x20000;
@@ -32,6 +33,13 @@ loop:
   *(u32 *)edi = eax; edi -= 4;  // stos
   edx = (s32)eax >> 31;  // cdq
   eax = ecx ? __builtin_ffs(ecx) - 1 : 0;  // bsf
+  tmp64 = ((u64)edx << 32) | eax;
+  tmp64 = (s64)tmp64 <<= LOBYTE(ecx);
+  edx = tmp64 >> 32; eax = tmp64;  // allshl
+  tmp64 = ((u64)edx << 32) | eax;
+  tmp64 = (s64)tmp64 >>= LOBYTE(ecx);
+  edx = tmp64 >> 32; eax = tmp64;  // allshr
+  eax = __builtin_bswap32(eax);
   eax = 1;
   return eax;
 }
