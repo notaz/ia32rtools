@@ -9,17 +9,18 @@ int sub_test(int a1, int a2)
   f_st0 = (double)(s32)sf.d[0];  // var_20 fild
   f_st0 /= (double)(s32)a1;  // arg_0
   f_st0 *= *((double *)(u32)&sf.q[1]);  // var_18
-  f_st1 = f_st0;
-  f_st0 = (double)(s32)sf.d[0];  // var_20 fild
+  f_st1 = f_st0;  f_st0 = (double)(s32)sf.d[0];  // var_20 fild
   f_st1 /= f_st0;
   f_st0 = f_st1 + f_st0;
-  f_st1 = f_st0;
-  f_st0 = 1.0;
+  f_st1 = f_st0;  f_st0 = 1.0;
   f_st0 = *((double *)(u32)&sf.q[1]) / f_st0;  // var_18
-  f_st1 = f_st0;
-  f_st0 = f_st1;  // fld
-  *((double *)(u32)&sf.q[1]) = f_st0;
-  f_st0 = f_st1;  // var_18 fst
+  { double t = f_st0; f_st0 = f_st1; f_st1 = t; }  // fxch
+  f_st0 = -f_st0;
+  f_st0 = f_st1;
+  f_st1 = f_st0;  f_st0 = f_st1;  // fld
+  f_st0 = f_st1 * log2(f_st0);
+  f_st1 = f_st0;  // fld st
+  *((double *)(u32)&sf.q[1]) = f_st0;  f_st0 = f_st1;  // var_18 fst
   *((float *)(u32)&sf.d[0]) = f_st0;  // var_20 fst
   eax = (s32)f_st0;  // ftol
   return eax;

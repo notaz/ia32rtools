@@ -17,8 +17,13 @@ arg_0           = dword ptr  8
                 fdiv    st(1), st
                 faddp   st(1), st
                 fld1
-                fdivrp  [ebp+var_18]
+                fdivr   [ebp+var_18]
+                fxch    st(1)
+                fchs
+                fsubrp  st, st
                 fld     st(1)
+                fyl2x
+                fld     st
                 fstp    [ebp+var_18]
                 fst     [ebp+var_20]
                 call    __ftol

@@ -136,11 +136,14 @@ enum op_op {
   OP_FISUB,
   OP_FIDIVR,
   OP_FISUBR,
+  OP_FCHS,
   OP_FCOS,
   OP_FPATAN,
   OP_FPTAN,
   OP_FSIN,
   OP_FSQRT,
+  OP_FXCH,
+  OP_FYL2X,
   // mmx
   OP_EMMS,
   // pseudo-ops for lib calls
@@ -337,6 +340,9 @@ enum x86_regs {
 #define mxDX     (1 << xDX)
 #define mxST0    (1 << xST0)
 #define mxST1    (1 << xST1)
+#define mxST1_0  (mxST1 | mxST0)
+#define mxST7_2  (0xfc << xST0)
+#define mxSTa    (0xff << xST0)
 
 // possible basic comparison types (without inversion)
 enum parsed_flag_op {
@@ -1029,6 +1035,7 @@ static const struct {
   { "fld",    OP_FLD,    1, 1, OPF_FPUSH },
   { "fild",   OP_FILD,   1, 1, OPF_FPUSH },
   { "fld1",   OP_FLDc,   0, 0, OPF_FPUSH },
+  { "fldln2", OP_FLDc,   0, 0, OPF_FPUSH },
   { "fldz",   OP_FLDc,   0, 0, OPF_FPUSH },
   { "fstp",   OP_FST,    1, 1, OPF_FPOP },
   { "fst",    OP_FST,    1, 1, 0 },
@@ -1050,11 +1057,14 @@ static const struct {
   { "fisub",  OP_FISUB,  1, 1, 0 },
   { "fidivr", OP_FIDIVR, 1, 1, 0 },
   { "fisubr", OP_FISUBR, 1, 1, 0 },
+  { "fchs",   OP_FCHS,   0, 0, 0 },
   { "fcos",   OP_FCOS,   0, 0, 0 },
   { "fpatan", OP_FPATAN, 0, 0, OPF_FPOP },
   { "fptan",  OP_FPTAN,  0, 0, OPF_FPUSH },
   { "fsin",   OP_FSIN,   0, 0, 0 },
   { "fsqrt",  OP_FSQRT,  0, 0, 0 },
+  { "fxch",   OP_FXCH,   1, 1, 0 },
+  { "fyl2x",  OP_FYL2X,  0, 0, OPF_FPOP },
   // mmx
   { "emms",   OP_EMMS,   0, 0, OPF_DATA },
   { "movq",   OP_MOV,    2, 2, OPF_DATA },
@@ -1345,6 +1355,8 @@ static void parse_op(struct parsed_op *op, char words[16][256], int wordc)
     op->regmask_dst |= mxST0;
     if      (IS(words[op_w] + 3, "1"))
       op->operand[0].val = X87_CONST_1;
+    else if (IS(words[op_w] + 3, "ln2"))
+      op->operand[0].val = X87_CONST_LN2;
     else if (IS(words[op_w] + 3, "z"))
       op->operand[0].val = X87_CONST_Z;
     else
@@ -1382,14 +1394,17 @@ static void parse_op(struct parsed_op *op, char words[16][256], int wordc)
   case OP_FISUB:
   case OP_FIDIVR:
   case OP_FISUBR:
+  case OP_FCHS:
   case OP_FCOS:
   case OP_FSIN:
   case OP_FSQRT:
+  case OP_FXCH:
     op->regmask_src |= mxST0;
     op->regmask_dst |= mxST0;
     break;
 
   case OP_FPATAN:
+  case OP_FYL2X:
     op->regmask_src |= mxST0 | mxST1;
     op->regmask_dst |= mxST0;
     break;
@@ -2190,7 +2205,7 @@ static char *out_src_opr_u32(char *buf, size_t buf_size,
 }
 
 static char *out_src_opr_float(char *buf, size_t buf_size,
-  struct parsed_op *po, struct parsed_opr *popr)
+  struct parsed_op *po, struct parsed_opr *popr, int need_float_stack)
 {
   const char *cast = NULL;
   char tmp[256];
@@ -2200,7 +2215,15 @@ static char *out_src_opr_float(char *buf, size_t buf_size,
     if (popr->reg < xST0 || popr->reg > xST7)
       ferr(po, "bad reg: %d\n", popr->reg);
 
-    snprintf(buf, buf_size, "f_st%d", popr->reg - xST0);
+    if (need_float_stack) {
+      if (popr->reg == xST0)
+        snprintf(buf, buf_size, "f_st[f_stp & 7]");
+      else
+        snprintf(buf, buf_size, "f_st[(f_stp + %d) & 7]",
+          popr->reg - xST0);
+    }
+    else
+      snprintf(buf, buf_size, "f_st%d", popr->reg - xST0);
     break;
 
   case OPT_REGMEM:
@@ -2229,10 +2252,10 @@ static char *out_src_opr_float(char *buf, size_t buf_size,
 }
 
 static char *out_dst_opr_float(char *buf, size_t buf_size,
-  struct parsed_op *po, struct parsed_opr *popr)
+  struct parsed_op *po, struct parsed_opr *popr, int need_float_stack)
 {
   // same?
-  return out_src_opr_float(buf, buf_size, po, popr);
+  return out_src_opr_float(buf, buf_size, po, popr, need_float_stack);
 }
 
 static void out_test_for_cc(char *buf, size_t buf_size,
@@ -3803,11 +3826,11 @@ static void scan_prologue_epilogue(int opcnt)
   {
     g_sp_frame = 1;
 
-    i++;
     do {
       for (; i < opcnt; i++)
         if (ops[i].flags & OPF_TAIL)
           break;
+
       j = i - 1;
       if (i == opcnt && (ops[j].flags & OPF_JMP)) {
         if (ops[j].bt_i != -1 || ops[j].btj != NULL)
@@ -4663,7 +4686,6 @@ static void reg_use_pass(int i, int opcnt, unsigned char *cbits,
   int *regmask_init, int regmask_arg)
 {
   struct parsed_op *po;
-  unsigned int mask;
   int already_saved;
   int regmask_new;
   int regmask_op;
@@ -4763,6 +4785,10 @@ static void reg_use_pass(int i, int opcnt, unsigned char *cbits,
             po->regmask_dst &= ~(1 << xAX);
         }
       }
+
+      // not "full stack" mode and have something in stack
+      if (!(regmask_now & mxST7_2) && (regmask_now & mxST1_0))
+        ferr(po, "float stack is not empty on func call\n");
     }
 
     if (po->flags & OPF_NOREGS)
@@ -4770,11 +4796,13 @@ static void reg_use_pass(int i, int opcnt, unsigned char *cbits,
 
     if (po->flags & OPF_FPUSH) {
       if (regmask_now & mxST1)
-        ferr(po, "TODO: FPUSH on active ST1\n");
-      if (regmask_now & mxST0)
+        regmask_now |= mxSTa; // switch to "full stack" mode
+      if (regmask_now & mxSTa)
         po->flags |= OPF_FSHIFT;
-      mask = mxST0 | mxST1;
-      regmask_now = (regmask_now & ~mask) | ((regmask_now & mxST0) << 1);
+      if (!(regmask_now & mxST7_2)) {
+        regmask_now =
+          (regmask_now & ~mxST1_0) | ((regmask_now & mxST0) << 1);
+      }
     }
 
     // if incomplete register is used, clear it on init to avoid
@@ -4814,16 +4842,18 @@ static void reg_use_pass(int i, int opcnt, unsigned char *cbits,
 
     // released regs
     if (po->flags & OPF_FPOP) {
-      mask = mxST0 | mxST1;
-      if (!(regmask_now & mask))
+      if ((regmask_now & mxSTa) == 0)
         ferr(po, "float pop on empty stack?\n");
-      if (regmask_now & mxST1)
+      if (regmask_now & (mxST7_2 | mxST1))
         po->flags |= OPF_FSHIFT;
-      regmask_now = (regmask_now & ~mask) | ((regmask_now & mxST1) >> 1);
+      if (!(regmask_now & mxST7_2)) {
+        regmask_now =
+          (regmask_now & ~mxST1_0) | ((regmask_now & mxST1) >> 1);
+      }
     }
 
     if (po->flags & OPF_TAIL) {
-      if (regmask_now & (mxST0 | mxST1))
+      if (!(regmask_now & mxST7_2) && (regmask_now & mxST1_0))
         ferr(po, "float regs on tail: %x\n", regmask_now);
 
       // there is support for "conditional tailcall", sort of
@@ -4954,9 +4984,12 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
   int save_arg_vars[MAX_ARG_GRP] = { 0, };
   unsigned char cbits[MAX_OPS / 8];
   const char *float_type;
-  int cond_vars = 0;
+  const char *float_st0;
+  const char *float_st1;
+  int need_float_stack = 0;
   int need_tmp_var = 0;
   int need_tmp64 = 0;
+  int cond_vars = 0;
   int had_decl = 0;
   int label_pending = 0;
   int need_double = 0;
@@ -4969,6 +5002,7 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
   int regmask = 0;      // used regs
   int pfomask = 0;
   int found = 0;
+  int dead_dst;
   int no_output;
   int i, j, l;
   int arg;
@@ -5284,6 +5318,9 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
   }
 
   float_type = need_double ? "double" : "float";
+  need_float_stack = !!(regmask & mxST7_2);
+  float_st0 = need_float_stack ? "f_st[f_stp & 7]" : "f_st0";
+  float_st1 = need_float_stack ? "f_st[(f_stp + 1) & 7]" : "f_st1";
 
   // output starts here
 
@@ -5441,14 +5478,21 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
     }
   }
   // ... x87
-  if (regmask_now & 0xff0000) {
-    for (reg = 16; reg < 24; reg++) {
-      if (regmask_now & (1 << reg)) {
-        fprintf(fout, "  %s f_st%d", float_type, reg - 16);
-        if (regmask_init & (1 << reg))
-          fprintf(fout, " = 0");
-        fprintf(fout, ";\n");
-        had_decl = 1;
+  if (need_float_stack) {
+    fprintf(fout, "  %s f_st[8];\n", float_type);
+    fprintf(fout, "  int f_stp = 0;\n");
+    had_decl = 1;
+  }
+  else {
+    if (regmask_now & 0xff0000) {
+      for (reg = 16; reg < 24; reg++) {
+        if (regmask_now & (1 << reg)) {
+          fprintf(fout, "  %s f_st%d", float_type, reg - 16);
+          if (regmask_init & (1 << reg))
+            fprintf(fout, " = 0");
+          fprintf(fout, ";\n");
+          had_decl = 1;
+        }
       }
     }
   }
@@ -6350,7 +6394,11 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
               fprintf(fout, "(u32)");
           }
           else if (po->regmask_dst & mxST0) {
-            fprintf(fout, "f_st0 = ");
+            ferr_assert(po, po->flags & OPF_FPUSH);
+            if (need_float_stack)
+              fprintf(fout, "f_st[--f_stp & 7] = ");
+            else
+              fprintf(fout, "f_st0 = ");
           }
         }
 
@@ -6571,57 +6619,97 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
 
       // x87
       case OP_FLD:
-        if (po->flags & OPF_FSHIFT)
-          fprintf(fout, "  f_st1 = f_st0;\n");
-        if (po->operand[0].type == OPT_REG
-          && po->operand[0].reg == xST0)
-        {
-          strcat(g_comment, " fld st");
-          break;
+        if (need_float_stack) {
+          out_src_opr_float(buf1, sizeof(buf1),
+            po, &po->operand[0], 1);
+          if (po->regmask_src & mxSTa) {
+            fprintf(fout, "  f_st[(f_stp - 1) & 7] = %s; f_stp--;",
+              buf1);
+          }
+          else
+            fprintf(fout, "  f_st[--f_stp & 7] = %s;", buf1);
         }
-        fprintf(fout, "  f_st0 = %s;",
-          out_src_opr_float(buf1, sizeof(buf1), po, &po->operand[0]));
+        else {
+          if (po->flags & OPF_FSHIFT)
+            fprintf(fout, "  f_st1 = f_st0;");
+          if (po->operand[0].type == OPT_REG
+            && po->operand[0].reg == xST0)
+          {
+            strcat(g_comment, " fld st");
+            break;
+          }
+          fprintf(fout, "  f_st0 = %s;",
+            out_src_opr_float(buf1, sizeof(buf1),
+              po, &po->operand[0], 0));
+        }
         strcat(g_comment, " fld");
         break;
 
       case OP_FILD:
-        if (po->flags & OPF_FSHIFT)
-          fprintf(fout, "  f_st1 = f_st0;\n");
-        fprintf(fout, "  f_st0 = (%s)%s;", float_type,
-          out_src_opr(buf1, sizeof(buf1), po, &po->operand[0],
-            lmod_cast(po, po->operand[0].lmod, 1), 0));
+        out_src_opr(buf1, sizeof(buf1), po, &po->operand[0],
+          lmod_cast(po, po->operand[0].lmod, 1), 0);
+        snprintf(buf2, sizeof(buf2), "(%s)%s", float_type, buf1);
+        if (need_float_stack) {
+          fprintf(fout, "  f_st[--f_stp & 7] = %s;", buf2);
+        }
+        else {
+          if (po->flags & OPF_FSHIFT)
+            fprintf(fout, "  f_st1 = f_st0;");
+          fprintf(fout, "  f_st0 = %s;", buf2);
+        }
         strcat(g_comment, " fild");
         break;
 
       case OP_FLDc:
-        if (po->flags & OPF_FSHIFT)
-          fprintf(fout, "  f_st1 = f_st0;\n");
-        fprintf(fout, "  f_st0 = ");
+        if (need_float_stack)
+          fprintf(fout, "  f_st[--f_stp & 7] = ");
+        else {
+          if (po->flags & OPF_FSHIFT)
+            fprintf(fout, "  f_st1 = f_st0;");
+          fprintf(fout, "  f_st0 = ");
+        }
         switch (po->operand[0].val) {
-        case X87_CONST_1: fprintf(fout, "1.0;"); break;
-        case X87_CONST_Z: fprintf(fout, "0.0;"); break;
+        case X87_CONST_1:   fprintf(fout, "1.0;"); break;
+        case X87_CONST_LN2: fprintf(fout, "0.693147180559945;"); break;
+        case X87_CONST_Z:   fprintf(fout, "0.0;"); break;
         default: ferr(po, "TODO\n"); break;
         }
         break;
 
       case OP_FST:
-        if ((po->flags & OPF_FPOP) && po->operand[0].type == OPT_REG
-          && po->operand[0].reg == xST0)
-        {
-          no_output = 1;
-          break;
+        out_dst_opr_float(buf1, sizeof(buf1), po, &po->operand[0],
+          need_float_stack);
+        dead_dst = po->operand[0].type == OPT_REG
+          && po->operand[0].reg == xST0;
+        if (need_float_stack) {
+          if (!dead_dst)
+            fprintf(fout, "  %s = f_st[f_stp & 7];", buf1);
+          if (po->flags & OPF_FSHIFT)
+            fprintf(fout, "  f_stp++;");
         }
-        fprintf(fout, "  %s = f_st0;",
-          out_dst_opr_float(buf1, sizeof(buf1), po, &po->operand[0]));
-        if (po->flags & OPF_FSHIFT)
-          fprintf(fout, "\n  f_st0 = f_st1;");
-        strcat(g_comment, " fst");
+        else {
+          if (!dead_dst)
+            fprintf(fout, "  %s = f_st0;", buf1);
+          if (po->flags & OPF_FSHIFT)
+            fprintf(fout, "  f_st0 = f_st1;");
+        }
+        if (dead_dst && !(po->flags & OPF_FSHIFT))
+          no_output = 1;
+        else
+          strcat(g_comment, " fst");
         break;
 
       case OP_FADD:
       case OP_FDIV:
       case OP_FMUL:
       case OP_FSUB:
+        out_dst_opr_float(buf1, sizeof(buf1), po, &po->operand[0],
+          need_float_stack);
+        out_src_opr_float(buf2, sizeof(buf2), po, &po->operand[1],
+          need_float_stack);
+        dead_dst = (po->flags & OPF_FPOP)
+          && po->operand[0].type == OPT_REG
+          && po->operand[0].reg == xST0;
         switch (po->op) {
         case OP_FADD: j = '+'; break;
         case OP_FDIV: j = '/'; break;
@@ -6629,27 +6717,55 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
         case OP_FSUB: j = '-'; break;
         default: j = 'x'; break;
         }
-        if (po->flags & OPF_FSHIFT) {
-          fprintf(fout, "  f_st0 = f_st1 %c f_st0;", j);
+        if (need_float_stack) {
+          if (!dead_dst)
+            fprintf(fout, "  %s %c= %s;", buf1, j, buf2);
+          if (po->flags & OPF_FSHIFT)
+            fprintf(fout, "  f_stp++;");
         }
         else {
-          fprintf(fout, "  %s %c= %s;",
-           out_dst_opr_float(buf1, sizeof(buf1), po, &po->operand[0]),
-           j,
-           out_src_opr_float(buf2, sizeof(buf2), po, &po->operand[1]));
+          if (po->flags & OPF_FSHIFT) {
+            // note: assumes only 2 regs handled
+            if (!dead_dst)
+              fprintf(fout, "  f_st0 = f_st1 %c f_st0;", j);
+            else
+              fprintf(fout, "  f_st0 = f_st1;");
+          }
+          else if (!dead_dst)
+            fprintf(fout, "  %s %c= %s;", buf1, j, buf2);
         }
+        no_output = (dead_dst && !(po->flags & OPF_FSHIFT));
         break;
 
       case OP_FDIVR:
       case OP_FSUBR:
-        if (po->flags & OPF_FSHIFT)
-          snprintf(buf1, sizeof(buf1), "f_st0");
-        else
-          out_dst_opr_float(buf1, sizeof(buf1), po, &po->operand[0]);
-        fprintf(fout, "  %s = %s %c %s;", buf1,
-          out_src_opr_float(buf2, sizeof(buf2), po, &po->operand[1]),
-          po->op == OP_FDIVR ? '/' : '-',
-          out_src_opr_float(buf3, sizeof(buf3), po, &po->operand[0]));
+        out_dst_opr_float(buf1, sizeof(buf1), po, &po->operand[0],
+          need_float_stack);
+        out_src_opr_float(buf2, sizeof(buf2), po, &po->operand[1],
+          need_float_stack);
+        out_src_opr_float(buf3, sizeof(buf3), po, &po->operand[0],
+          need_float_stack);
+        dead_dst = (po->flags & OPF_FPOP)
+          && po->operand[0].type == OPT_REG
+          && po->operand[0].reg == xST0;
+        j = po->op == OP_FDIVR ? '/' : '-';
+        if (need_float_stack) {
+          if (!dead_dst)
+            fprintf(fout, "  %s = %s %c %s;", buf1, buf2, j, buf3);
+          if (po->flags & OPF_FSHIFT)
+            fprintf(fout, "  f_stp++;");
+        }
+        else {
+          if (po->flags & OPF_FSHIFT) {
+            if (!dead_dst)
+              fprintf(fout, "  f_st0 = f_st0 %c f_st1;", j);
+            else
+              fprintf(fout, "  f_st0 = f_st1;");
+          }
+          else if (!dead_dst)
+            fprintf(fout, "  %s = %s %c %s;", buf1, buf2, j, buf3);
+        }
+        no_output = (dead_dst && !(po->flags & OPF_FSHIFT));
         break;
 
       case OP_FIADD:
@@ -6663,43 +6779,86 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
         case OP_FISUB: j = '-'; break;
         default: j = 'x'; break;
         }
-        fprintf(fout, "  f_st0 %c= (%s)%s;", j, float_type,
+        fprintf(fout, "  %s %c= (%s)%s;", float_st0,
+          j, float_type,
           out_src_opr(buf1, sizeof(buf1), po, &po->operand[0],
             lmod_cast(po, po->operand[0].lmod, 1), 0));
         break;
 
       case OP_FIDIVR:
       case OP_FISUBR:
-        fprintf(fout, "  f_st0 = %s %c f_st0;",
-          out_src_opr_float(buf2, sizeof(buf2), po, &po->operand[1]),
-          po->op == OP_FIDIVR ? '/' : '-');
+        fprintf(fout, "  %s = %s %c %s;", float_st0,
+          out_src_opr_float(buf2, sizeof(buf2), po, &po->operand[1],
+            need_float_stack),
+          po->op == OP_FIDIVR ? '/' : '-', float_st0);
+        break;
+
+      case OP_FCHS:
+        fprintf(fout, "  %s = -%s;", float_st0, float_st0);
         break;
 
       case OP_FCOS:
-        fprintf(fout, "  f_st0 = cos%s(f_st0);",
-          need_double ? "" : "f");
+        fprintf(fout, "  %s = cos%s(%s);", float_st0,
+          need_double ? "" : "f", float_st0);
         break;
 
       case OP_FPATAN:
-        fprintf(fout, "  f_st0 = atan%s(f_st1 / f_st0);",
-          need_double ? "" : "f");
+        if (need_float_stack) {
+          fprintf(fout, "  %s = atan%s(%s / %s);", float_st1,
+            need_double ? "" : "f", float_st1, float_st0);
+          fprintf(fout, " f_stp++;");
+        }
+        else {
+          fprintf(fout, "  f_st0 = atan%s(f_st1 / f_st0);",
+            need_double ? "" : "f");
+        }
+        break;
+
+      case OP_FYL2X:
+        if (need_float_stack) {
+          fprintf(fout, "  %s = %s * log2%s(%s);", float_st1,
+            float_st1, need_double ? "" : "f", float_st0);
+          fprintf(fout, " f_stp++;");
+        }
+        else {
+          fprintf(fout, "  f_st0 = f_st1 * log2%s(f_st0);",
+            need_double ? "" : "f");
+        }
         break;
 
       case OP_FSIN:
-        fprintf(fout, "  f_st0 = sin%s(f_st0);",
-          need_double ? "" : "f");
+        fprintf(fout, "  %s = sin%s(%s);", float_st0,
+          need_double ? "" : "f", float_st0);
         break;
 
       case OP_FSQRT:
-        fprintf(fout, "  f_st0 = sqrt%s(f_st0);",
-          need_double ? "" : "f");
+        fprintf(fout, "  %s = sqrt%s(%s);", float_st0,
+          need_double ? "" : "f", float_st0);
+        break;
+
+      case OP_FXCH:
+        dead_dst = po->operand[0].type == OPT_REG
+          && po->operand[0].reg == xST0;
+        if (!dead_dst) {
+          out_src_opr_float(buf1, sizeof(buf1), po, &po->operand[0],
+            need_float_stack);
+          fprintf(fout, "  { %s t = %s; %s = %s; %s = t; }", float_type,
+            float_st0, float_st0, buf1, buf1);
+          strcat(g_comment, " fxch");
+        }
+        else
+          no_output = 1;
         break;
 
       case OPP_FTOL:
         ferr_assert(po, po->flags & OPF_32BIT);
-        fprintf(fout, "  eax = (s32)f_st0;");
-        if (po->flags & OPF_FSHIFT)
-          fprintf(fout, "\n  f_st0 = f_st1;");
+        fprintf(fout, "  eax = (s32)%s;", float_st0);
+        if (po->flags & OPF_FSHIFT) {
+          if (need_float_stack)
+            fprintf(fout, " f_stp++;");
+          else
+            fprintf(fout, " f_st0 = f_st1;");
+        }
         strcat(g_comment, " ftol");
         break;
 
