@@ -70,6 +70,8 @@ enum op_op {
 	OP_NOP,
 	OP_PUSH,
 	OP_POP,
+	OP_PUSHA,
+	OP_POPA,
 	OP_LEAVE,
 	OP_MOV,
 	OP_LEA,
@@ -125,6 +127,7 @@ enum op_op {
   OP_FILD,
   OP_FLDc,
   OP_FST,
+  OP_FIST,
   OP_FADD,
   OP_FDIV,
   OP_FMUL,
@@ -137,6 +140,8 @@ enum op_op {
   OP_FISUB,
   OP_FIDIVR,
   OP_FISUBR,
+  OP_FCOM,
+  OP_FNSTSW,
   OP_FCHS,
   OP_FCOS,
   OP_FPATAN,
@@ -224,6 +229,7 @@ struct parsed_op {
 // (OPF_CC) - points to one of (OPF_FLAGS) that affects cc op
 // OP_PUSH  - points to OP_POP in complex push/pop graph
 // OP_POP   - points to OP_PUSH in simple push/pop pair
+// OP_FCOM  - needed_status_word_bits | (is_z_check << 16)
 
 struct parsed_equ {
   char name[64];
@@ -918,6 +924,8 @@ static const struct {
   { "nop",  OP_NOP,    0, 0, 0 },
   { "push", OP_PUSH,   1, 1, 0 },
   { "pop",  OP_POP,    1, 1, OPF_DATA },
+  { "pusha",OP_PUSHA,  0, 0, 0 },
+  { "popa", OP_POPA,   0, 0, OPF_DATA },
   { "leave",OP_LEAVE,  0, 0, OPF_DATA },
   { "mov" , OP_MOV,    2, 2, OPF_DATA },
   { "lea",  OP_LEA,    2, 2, OPF_DATA },
@@ -1041,8 +1049,10 @@ static const struct {
   { "fld1",   OP_FLDc,   0, 0, OPF_FPUSH },
   { "fldln2", OP_FLDc,   0, 0, OPF_FPUSH },
   { "fldz",   OP_FLDc,   0, 0, OPF_FPUSH },
-  { "fstp",   OP_FST,    1, 1, OPF_FPOP },
   { "fst",    OP_FST,    1, 1, 0 },
+  { "fstp",   OP_FST,    1, 1, OPF_FPOP },
+  { "fist",   OP_FIST,   1, 1, 0 },
+  { "fistp",  OP_FIST,   1, 1, OPF_FPOP },
   { "fadd",   OP_FADD,   0, 2, 0 },
   { "faddp",  OP_FADD,   0, 2, OPF_FPOP },
   { "fdiv",   OP_FDIV,   0, 2, 0 },
@@ -1061,6 +1071,9 @@ static const struct {
   { "fisub",  OP_FISUB,  1, 1, 0 },
   { "fidivr", OP_FIDIVR, 1, 1, 0 },
   { "fisubr", OP_FISUBR, 1, 1, 0 },
+  { "fcom",   OP_FCOM,   0, 1, 0 },
+  { "fcomp",  OP_FCOM,   0, 1, OPF_FPOP },
+  { "fnstsw", OP_FNSTSW, 1, 1, OPF_DATA },
   { "fchs",   OP_FCHS,   0, 0, 0 },
   { "fcos",   OP_FCOS,   0, 0, 0 },
   { "fpatan", OP_FPATAN, 0, 0, OPF_FPOP },
@@ -1371,6 +1384,7 @@ static void parse_op(struct parsed_op *op, char words[16][256], int wordc)
     break;
 
   case OP_FST:
+  case OP_FIST:
     op->regmask_src |= mxST0;
     break;
 
@@ -1418,6 +1432,10 @@ static void parse_op(struct parsed_op *op, char words[16][256], int wordc)
 
   case OP_FPTAN:
     aerr("TODO\n");
+    break;
+
+  case OP_FCOM:
+    op->regmask_src |= mxST0;
     break;
 
   default:
@@ -2298,7 +2316,8 @@ static void out_test_for_cc(char *buf, size_t buf_size,
 }
 
 static void out_cmp_for_cc(char *buf, size_t buf_size,
-  struct parsed_op *po, enum parsed_flag_op pfo, int is_inv)
+  struct parsed_op *po, enum parsed_flag_op pfo, int is_inv,
+  int is_neg)
 {
   const char *cast, *scast, *cast_use;
   char buf1[256], buf2[256];
@@ -2332,8 +2351,13 @@ static void out_cmp_for_cc(char *buf, size_t buf_size,
   out_src_opr(buf1, sizeof(buf1), po, &po->operand[0], cast_use, 0);
   if (po->op == OP_DEC)
     snprintf(buf2, sizeof(buf2), "1");
-  else
-    out_src_opr(buf2, sizeof(buf2), po, &po->operand[1], cast_use, 0);
+  else {
+    char cast_op2[64];
+    snprintf(cast_op2, sizeof(cast_op2) - 1, "%s", cast_use);
+    if (is_neg)
+      strcat(cast_op2, "-");
+    out_src_opr(buf2, sizeof(buf2), po, &po->operand[1], cast_op2, 0);
+  }
 
   switch (pfo) {
   case PFO_C:
@@ -2401,7 +2425,7 @@ static void out_cmp_test(char *buf, size_t buf_size,
       po->operand[0].lmod, buf3);
   }
   else if (po->op == OP_CMP) {
-    out_cmp_for_cc(buf, buf_size, po, pfo, is_inv);
+    out_cmp_for_cc(buf, buf_size, po, pfo, is_inv, 0);
   }
   else
     ferr(po, "%s: unhandled op: %d\n", __func__, po->op);
@@ -3589,6 +3613,8 @@ static void resolve_branches_parse_calls(int opcnt)
         tmpname = opr_name(po, 0);
         if (IS_START(tmpname, "loc_"))
           ferr(po, "call to loc_*\n");
+        if (IS(tmpname, "__alloca_probe"))
+          continue;
 
         // convert some calls to pseudo-ops
         for (l = 0; l < ARRAY_SIZE(pseudo_ops); l++) {
@@ -3673,7 +3699,8 @@ tailcall:
 
 static void scan_prologue_epilogue(int opcnt)
 {
-  int ecx_push = 0, esp_sub = 0;
+  int ecx_push = 0, esp_sub = 0, pusha = 0;
+  int sandard_epilogue;
   int found;
   int i, j, l;
 
@@ -3687,14 +3714,19 @@ static void scan_prologue_epilogue(int opcnt)
     ops[1].flags |= OPF_RMD | OPF_DONE | OPF_NOREGS;
     i = 2;
 
-    if (ops[2].op == OP_SUB && IS(opr_name(&ops[2], 0), "esp")) {
-      g_stack_fsz = opr_const(&ops[2], 1);
-      ops[2].flags |= OPF_RMD | OPF_DONE | OPF_NOREGS;
+    if (ops[i].op == OP_PUSHA) {
+      ops[i].flags |= OPF_RMD | OPF_DONE | OPF_NOREGS;
+      pusha = 1;
+      i++;
+    }
+
+    if (ops[i].op == OP_SUB && IS(opr_name(&ops[i], 0), "esp")) {
+      g_stack_fsz = opr_const(&ops[i], 1);
+      ops[i].flags |= OPF_RMD | OPF_DONE | OPF_NOREGS;
       i++;
     }
     else {
       // another way msvc builds stack frame..
-      i = 2;
       while (ops[i].op == OP_PUSH && IS(opr_name(&ops[i], 0), "ecx")) {
         g_stack_fsz += 4;
         ops[i].flags |= OPF_RMD | OPF_DONE | OPF_NOREGS;
@@ -3728,10 +3760,20 @@ static void scan_prologue_epilogue(int opcnt)
         j--;
       }
 
-      if ((ops[j].op == OP_POP && IS(opr_name(&ops[j], 0), "ebp"))
-          || ops[j].op == OP_LEAVE)
+      sandard_epilogue = 0;
+      if (ops[j].op == OP_POP && IS(opr_name(&ops[j], 0), "ebp"))
       {
         ops[j].flags |= OPF_RMD | OPF_DONE | OPF_NOREGS;
+        // the standard epilogue is sometimes even used without a sf
+        if (ops[j - 1].op == OP_MOV
+            && IS(opr_name(&ops[j - 1], 0), "esp")
+            && IS(opr_name(&ops[j - 1], 1), "ebp"))
+          sandard_epilogue = 1;
+      }
+      else if (ops[j].op == OP_LEAVE)
+      {
+        ops[j].flags |= OPF_RMD | OPF_DONE | OPF_NOREGS;
+        sandard_epilogue = 1;
       }
       else if (ops[i].op == OP_CALL && ops[i].pp != NULL
         && ops[i].pp->is_noreturn)
@@ -3744,13 +3786,10 @@ static void scan_prologue_epilogue(int opcnt)
       else if (!(g_ida_func_attr & IDAFA_NORETURN))
         ferr(&ops[j], "'pop ebp' expected\n");
 
-      if (g_stack_fsz != 0) {
+      if (g_stack_fsz != 0 || sandard_epilogue) {
         if (ops[j].op == OP_LEAVE)
           j--;
-        else if (ops[j].op == OP_POP
-            && ops[j - 1].op == OP_MOV
-            && IS(opr_name(&ops[j - 1], 0), "esp")
-            && IS(opr_name(&ops[j - 1], 1), "ebp"))
+        else if (sandard_epilogue) // mov esp, ebp
         {
           ops[j - 1].flags |= OPF_RMD | OPF_DONE | OPF_NOREGS;
           j -= 2;
@@ -3765,6 +3804,13 @@ static void scan_prologue_epilogue(int opcnt)
         {
           ferr(&ops[j], "unexpected ecx pop\n");
         }
+      }
+
+      if (pusha) {
+        if (ops[j].op == OP_POPA)
+          ops[j].flags |= OPF_RMD | OPF_DONE | OPF_NOREGS;
+        else
+          ferr(&ops[j], "popa expected\n");
       }
 
       found = 1;
@@ -3793,6 +3839,20 @@ static void scan_prologue_epilogue(int opcnt)
     {
       g_stack_fsz = ops[i].operand[1].val;
       ops[i].flags |= OPF_RMD | OPF_DONE | OPF_NOREGS;
+      i++;
+      esp_sub = 1;
+      break;
+    }
+    else if (ops[i].op == OP_MOV && ops[i].operand[0].reg == xAX
+          && ops[i].operand[1].type == OPT_CONST
+          && ops[i + 1].op == OP_CALL
+          && IS(opr_name(&ops[i + 1], 0), "__alloca_probe"))
+    {
+      g_stack_fsz += ops[i].operand[1].val;
+      ops[i].flags |= OPF_RMD | OPF_DONE | OPF_NOREGS;
+      i++;
+      ops[i].flags |= OPF_RMD | OPF_DONE | OPF_NOREGS;
+      i++;
       esp_sub = 1;
       break;
     }
@@ -3999,6 +4059,45 @@ static int resolve_last_ref(int i, const struct parsed_opr *opr,
   }
 }
 
+// adjust datap of all reachable 'op' insns when moving back
+// returns  1 if at least 1 op was found
+// returns -1 if path without an op was found
+static int adjust_prev_op(int i, enum op_op op, int magic, void *datap)
+{
+  struct label_ref *lr;
+  int ret = 0;
+
+  if (ops[i].cc_scratch == magic)
+    return 0;
+  ops[i].cc_scratch = magic;
+
+  while (1) {
+    if (g_labels[i] != NULL) {
+      lr = &g_label_refs[i];
+      for (; lr != NULL; lr = lr->next) {
+        check_i(&ops[i], lr->i);
+        ret |= adjust_prev_op(lr->i, op, magic, datap);
+      }
+      if (i > 0 && LAST_OP(i - 1))
+        return ret;
+    }
+
+    i--;
+    if (i < 0)
+      return -1;
+
+    if (ops[i].cc_scratch == magic)
+      return 0;
+    ops[i].cc_scratch = magic;
+
+    if (ops[i].op != op)
+      continue;
+
+    ops[i].datap = datap;
+    return 1;
+  }
+}
+
 // find next instruction that reads opr
 // *op_i must be set to -1 by the caller
 // on return, *op_i is set to first referencer insn
@@ -4041,11 +4140,13 @@ static int find_next_read(int i, int opcnt,
     }
 
     if (!is_opr_read(opr, po)) {
-      if (is_opr_modified(opr, po)
-        && (po->op == OP_CALL
-         || ((po->flags & OPF_DATA)
-           && po->operand[0].lmod == OPLM_DWORD)))
+      int full_opr = 1;
+      if (opr->type == OPT_REG && po->operand[0].type == OPT_REG
+          && opr->reg == po->operand[0].reg && (po->flags & OPF_DATA))
       {
+        full_opr = po->operand[0].lmod >= opr->lmod;
+      }
+      if (is_opr_modified(opr, po) && full_opr) {
         // it's overwritten
         return ret;
       }
@@ -4054,6 +4155,65 @@ static int find_next_read(int i, int opcnt,
       continue;
     }
 
+    if (*op_i >= 0)
+      return -1;
+
+    *op_i = i;
+    return 1;
+  }
+
+  return 0;
+}
+
+// find next instruction that reads opr
+// *op_i must be set to -1 by the caller
+// on return, *op_i is set to first flag user insn
+// returns 1 if exactly 1 flag user is found
+static int find_next_flag_use(int i, int opcnt, int magic, int *op_i)
+{
+  struct parsed_op *po;
+  int j, ret = 0;
+
+  for (; i < opcnt; i++)
+  {
+    if (ops[i].cc_scratch == magic)
+      return ret;
+    ops[i].cc_scratch = magic;
+
+    po = &ops[i];
+    if (po->op == OP_CALL)
+      return -1;
+    if (po->flags & OPF_JMP) {
+      if (po->btj != NULL) {
+        // jumptable
+        for (j = 0; j < po->btj->count; j++) {
+          check_i(po, po->btj->d[j].bt_i);
+          ret |= find_next_flag_use(po->btj->d[j].bt_i, opcnt,
+                   magic, op_i);
+        }
+        return ret;
+      }
+
+      if (po->flags & OPF_RMD)
+        continue;
+      check_i(po, po->bt_i);
+      if (po->flags & OPF_CJMP)
+        goto found;
+      else
+        i = po->bt_i - 1;
+      continue;
+    }
+
+    if (!(po->flags & OPF_CC)) {
+      if (po->flags & OPF_FLAGS)
+        // flags changed
+        return ret;
+      if (po->flags & OPF_TAIL)
+        return ret;
+      continue;
+    }
+
+found:
     if (*op_i >= 0)
       return -1;
 
@@ -4081,6 +4241,45 @@ static int try_resolve_const(int i, const struct parsed_opr *opr,
   }
 
   return -1;
+}
+
+static int resolve_used_bits(int i, int opcnt, int reg,
+  int *mask, int *is_z_check)
+{
+  struct parsed_opr opr = OPR_INIT(OPT_REG, OPLM_WORD, reg);
+  int j = -1, k = -1;
+  int ret;
+
+  ret = find_next_read(i, opcnt, &opr, i + opcnt * 20, &j);
+  if (ret != 1)
+    return -1;
+
+  find_next_read(j + 1, opcnt, &opr, i + opcnt * 20 + 1, &k);
+  if (k != -1) {
+    fnote(&ops[j], "(first read)\n");
+    ferr(&ops[k], "TODO: bit resolve: multiple readers\n");
+  }
+
+  if (ops[j].op != OP_TEST || ops[j].operand[1].type != OPT_CONST)
+    ferr(&ops[j], "TODO: bit resolve: not a const test\n");
+
+  ferr_assert(&ops[j], ops[j].operand[0].type == OPT_REG);
+  ferr_assert(&ops[j], ops[j].operand[0].reg == reg);
+
+  *mask = ops[j].operand[1].val;
+  if (ops[j].operand[0].lmod == OPLM_BYTE
+    && ops[j].operand[0].name[1] == 'h')
+  {
+    *mask <<= 8;
+  }
+  ferr_assert(&ops[j], (*mask & ~0xffff) == 0);
+
+  *is_z_check = 0;
+  ret = find_next_flag_use(j + 1, opcnt, i + opcnt * 20 + 2, &k);
+  if (ret == 1)
+    *is_z_check = ops[k].pfo == PFO_Z;
+
+  return 0;
 }
 
 static const struct parsed_proto *resolve_icall(int i, int opcnt,
@@ -4873,8 +5072,15 @@ static void reg_use_pass(int i, int opcnt, unsigned char *cbits,
     }
 
     if (po->flags & OPF_TAIL) {
-      if (!(regmask_now & mxST7_2) && (regmask_now & mxST1_0))
-        ferr(po, "float regs on tail: %x\n", regmask_now);
+      if (!(regmask_now & mxST7_2)) {
+        if (get_pp_arg_regmask_dst(g_func_pp) & mxST0) {
+          if (!(regmask_now & mxST0))
+            ferr(po, "no st0 on float return, mask: %x\n",
+                 regmask_now);
+        }
+        else if (regmask_now & mxST1_0)
+          ferr(po, "float regs on tail: %x\n", regmask_now);
+      }
 
       // there is support for "conditional tailcall", sort of
       if (!(po->flags & OPF_CC))
@@ -5007,13 +5213,14 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
   const char *float_st0;
   const char *float_st1;
   int need_float_stack = 0;
+  int need_float_sw = 0; // status word
   int need_tmp_var = 0;
   int need_tmp64 = 0;
   int cond_vars = 0;
   int had_decl = 0;
   int label_pending = 0;
   int need_double = 0;
-  int regmask_save = 0; // regs saved/restored in this func
+  int regmask_save = 0; // used regs saved/restored in this func
   int regmask_arg;      // regs from this function args (fastcall, etc)
   int regmask_ret;      // regs needed on ret
   int regmask_now;      // temp
@@ -5105,8 +5312,11 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
   // - process calls, stage 2
   // - handle some push/pop pairs
   // - scan for STD/CLD, propagate DF
+  // - try to resolve needed x87 status word bits
   for (i = 0; i < opcnt; i++)
   {
+    int mask, z_check;
+
     po = &ops[i];
     if (po->flags & OPF_RMD)
       continue;
@@ -5142,16 +5352,39 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
     if (po->flags & OPF_DONE)
       continue;
 
-    if (po->op == OP_PUSH && !(po->flags & OPF_FARG)
-      && !(po->flags & OPF_RSAVE) && po->operand[0].type == OPT_CONST)
-    {
-      scan_for_pop_const(i, opcnt, i + opcnt * 12);
-    }
-    else if (po->op == OP_POP)
+    switch (po->op) {
+    case OP_PUSH:
+      if (!(po->flags & OPF_FARG) && !(po->flags & OPF_RSAVE)
+        && po->operand[0].type == OPT_CONST)
+      {
+        scan_for_pop_const(i, opcnt, i + opcnt * 12);
+      }
+      break;
+
+    case OP_POP:
       scan_pushes_for_pop(i, opcnt, &regmask_pp);
-    else if (po->op == OP_STD) {
+      break;
+
+    case OP_STD:
       po->flags |= OPF_DF | OPF_RMD | OPF_DONE;
       scan_propagate_df(i + 1, opcnt);
+      break;
+
+    case OP_FNSTSW:
+      need_float_sw = 1;
+      if (po->operand[0].type != OPT_REG || po->operand[0].reg != xAX)
+        ferr(po, "TODO: fnstsw to mem\n");
+      ret = resolve_used_bits(i + 1, opcnt, xAX, &mask, &z_check);
+      if (ret != 0)
+        ferr(po, "fnstsw resolve failed\n");
+      ret = adjust_prev_op(i, OP_FCOM, i + opcnt * 21,
+              (void *)(long)(mask | (z_check << 16)));
+      if (ret != 1)
+        ferr(po, "failed to find fcom: %d\n", ret);
+      break;
+
+    default:
+      break;
     }
   }
 
@@ -5166,6 +5399,7 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
   // - find flag set ops for their users
   // - do unresolved calls
   // - declare indirect functions
+  // - other op specific processing
   for (i = 0; i < opcnt; i++)
   {
     po = &ops[i];
@@ -5545,6 +5779,11 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
         }
       }
     }
+  }
+
+  if (need_float_sw) {
+    fprintf(fout, "  u16 f_sw;\n");
+    had_decl = 1;
   }
 
   if (regmask_save) {
@@ -6159,6 +6398,12 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
           delayed_flag_op = NULL;
           break;
         }
+        if (pfomask & (1 << PFO_LE)) {
+          out_cmp_for_cc(buf1, sizeof(buf1), po, PFO_LE, 0, 1);
+          fprintf(fout, "  cond_%s = %s;\n",
+            parsed_flag_op_names[PFO_LE], buf1);
+          pfomask &= ~(1 << PFO_LE);
+        }
         goto dualop_arith;
 
       case OP_SUB:
@@ -6171,7 +6416,7 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
             if (j == PFO_Z || j == PFO_S)
               continue;
 
-            out_cmp_for_cc(buf1, sizeof(buf1), po, j, 0);
+            out_cmp_for_cc(buf1, sizeof(buf1), po, j, 0, 0);
             fprintf(fout, "  cond_%s = %s;\n",
               parsed_flag_op_names[j], buf1);
             pfomask &= ~(1 << j);
@@ -6221,7 +6466,7 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
             if (j == PFO_Z || j == PFO_S || j == PFO_C)
               continue;
 
-            out_cmp_for_cc(buf1, sizeof(buf1), po, j, 0);
+            out_cmp_for_cc(buf1, sizeof(buf1), po, j, 0, 0);
             fprintf(fout, "  cond_%s = %s;\n",
               parsed_flag_op_names[j], buf1);
             pfomask &= ~(1 << j);
@@ -6594,7 +6839,10 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
                 g_func_pp->arg[arg].reg, g_func_pp->arg[arg].reg);
         }
  
-        if (!(regmask_ret & (1 << xAX))) {
+        if (regmask_ret & mxST0) {
+          fprintf(fout, "  return %s;", float_st0);
+        }
+        else if (!(regmask_ret & mxAX)) {
           if (i != opcnt - 1 || label_pending)
             fprintf(fout, "  return;");
         }
@@ -6744,26 +6992,36 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
         break;
 
       case OP_FST:
-        out_dst_opr_float(buf1, sizeof(buf1), po, &po->operand[0],
-          need_float_stack);
         dead_dst = po->operand[0].type == OPT_REG
           && po->operand[0].reg == xST0;
-        if (need_float_stack) {
-          if (!dead_dst)
-            fprintf(fout, "  %s = f_st[f_stp & 7];", buf1);
-          if (po->flags & OPF_FSHIFT)
-            fprintf(fout, "  f_stp++;");
+        if (!dead_dst) {
+          fprintf(fout, "  %s = %s;",
+            out_dst_opr_float(buf1, sizeof(buf1), po, &po->operand[0],
+              need_float_stack), float_st0);
         }
-        else {
-          if (!dead_dst)
-            fprintf(fout, "  %s = f_st0;", buf1);
-          if (po->flags & OPF_FSHIFT)
+        if (po->flags & OPF_FSHIFT) {
+          if (need_float_stack)
+            fprintf(fout, "  f_stp++;");
+          else
             fprintf(fout, "  f_st0 = f_st1;");
         }
         if (dead_dst && !(po->flags & OPF_FSHIFT))
           no_output = 1;
         else
           strcat(g_comment, " fst");
+        break;
+
+      case OP_FIST:
+        fprintf(fout, "  %s = %s%s;",
+          out_dst_opr(buf1, sizeof(buf1), po, &po->operand[0]),
+            lmod_cast(po, po->operand[0].lmod, 1), float_st0);
+        if (po->flags & OPF_FSHIFT) {
+          if (need_float_stack)
+            fprintf(fout, "  f_stp++;");
+          else
+            fprintf(fout, "  f_st0 = f_st1;");
+        }
+        strcat(g_comment, " fist");
         break;
 
       case OP_FADD:
@@ -6858,6 +7116,49 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
           out_src_opr_float(buf2, sizeof(buf2), po, &po->operand[1],
             need_float_stack),
           po->op == OP_FIDIVR ? '/' : '-', float_st0);
+        break;
+
+      case OP_FCOM: {
+        int mask, z_check;
+        ferr_assert(po, po->datap != NULL);
+        mask = (long)po->datap & 0xffff;
+        z_check = ((long)po->datap >> 16) & 1;
+        out_src_opr_float(buf1, sizeof(buf1), po, &po->operand[0],
+          need_float_stack);
+        if (mask == 0x0100) { // C0 -> <
+          fprintf(fout, "  f_sw = %s < %s ? 0x0100 : 0;",
+            float_st0, buf1);
+        }
+        else if (mask == 0x4000) { // C3 -> =
+          fprintf(fout, "  f_sw = %s == %s ? 0x4000 : 0;",
+            float_st0, buf1);
+        }
+        else if (mask == 0x4100) { // C3, C0
+          if (z_check) {
+            fprintf(fout, "  f_sw = %s <= %s ? 0x4100 : 0;",
+              float_st0, buf1);
+            strcat(g_comment, " z_chk_det");
+          }
+          else {
+            fprintf(fout, "  f_sw = %s == %s ? 0x4000 : "
+                          "(%s < %s ? 0x0100 : 0);",
+              float_st0, buf1, float_st0, buf1);
+          }
+        }
+        else
+          ferr(po, "unhandled sw mask: %x\n", mask);
+        if (po->flags & OPF_FSHIFT) {
+          if (need_float_stack)
+            fprintf(fout, " f_stp++;");
+          else
+            fprintf(fout, " f_st0 = f_st1;");
+        }
+        break;
+      }
+
+      case OP_FNSTSW:
+        fprintf(fout, "  %s = f_sw;",
+          out_dst_opr(buf1, sizeof(buf1), po, &po->operand[0]));
         break;
 
       case OP_FCHS:

@@ -1,8 +1,6 @@
-int sub_test()
+double sub_test()
 {
   union { u32 d[1]; u8 b[4]; double q[1]; } sf;
-  u32 eax;
-  u32 edx;
   float f_st[8];
   int f_stp = 0;
 
@@ -23,8 +21,8 @@ int sub_test()
   { float t = f_st[f_stp & 7]; f_st[f_stp & 7] = f_st[(f_stp + 6) & 7]; f_st[(f_stp + 6) & 7] = t; }  // fxch
   f_st[f_stp & 7] = -f_st[f_stp & 7];
   f_st[(f_stp + 1) & 7] = atanf(f_st[(f_stp + 1) & 7] / f_st[f_stp & 7]); f_stp++;
+  sf.d[0] = (s32)f_st[f_stp & 7];  // var_4 fist
   *((float *)(u32)&sf.d[0]) = f_st[f_stp & 7];  f_stp++;  // var_4 fst
-  eax = (s32)f_st[f_stp & 7]; f_stp++;  // ftol
-  return eax;
+  return f_st[f_stp & 7];
 }
 

@@ -25,8 +25,8 @@ var_4           = dword ptr -4
                 fxch    st(6)
                 fchs
                 fpatan
+                fist    [ebp+var_4]
                 fstp    [ebp+var_4]
-                call    __ftol
                 mov     esp, ebp
                 pop     ebp
                 retn

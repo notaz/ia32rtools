@@ -16,6 +16,12 @@ arg_0           = dword ptr  8
                 fild    [ebp+var_20]
                 fdiv    st(1), st
                 faddp   st(1), st
+                fcom    [ebp+var_18]
+                xor     eax, eax
+                fnstsw  ax
+                test    ah, 41h
+                mov     eax, 0
+                setz    al
                 fld1
                 fdivr   [ebp+var_18]
                 fxch    st(1)
@@ -24,8 +30,8 @@ arg_0           = dword ptr  8
                 fld     st
                 fyl2x
                 fld     st
-                fstp    [ebp+var_18]
-                fst     [ebp+var_20]
+                fistp   [ebp+var_20]
+                fst     [ebp+var_18]
                 call    __ftol
                 leave
                 retn
