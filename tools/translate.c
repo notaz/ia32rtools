@@ -3095,8 +3095,11 @@ static int scan_for_mod_opr0(struct parsed_op *po_test,
   return -1;
 }
 
-static int scan_for_flag_set(int i, int magic, int *branched,
-  int *setters, int *setter_cnt)
+static int try_resolve_const(int i, const struct parsed_opr *opr,
+  int magic, unsigned int *val);
+
+static int scan_for_flag_set(int i, int opcnt, int magic,
+  int *branched, int *setters, int *setter_cnt)
 {
   struct label_ref *lr;
   int ret;
@@ -3115,7 +3118,7 @@ static int scan_for_flag_set(int i, int magic, int *branched,
       lr = &g_label_refs[i];
       for (; lr->next; lr = lr->next) {
         check_i(&ops[i], lr->i);
-        ret = scan_for_flag_set(lr->i, magic,
+        ret = scan_for_flag_set(lr->i, opcnt, magic,
                 branched, setters, setter_cnt);
         if (ret < 0)
           return ret;
@@ -3126,7 +3129,7 @@ static int scan_for_flag_set(int i, int magic, int *branched,
         i = lr->i;
         continue;
       }
-      ret = scan_for_flag_set(lr->i, magic,
+      ret = scan_for_flag_set(lr->i, opcnt, magic,
               branched, setters, setter_cnt);
       if (ret < 0)
         return ret;
@@ -3136,6 +3139,20 @@ static int scan_for_flag_set(int i, int magic, int *branched,
     if (ops[i].flags & OPF_FLAGS) {
       setters[*setter_cnt] = i;
       (*setter_cnt)++;
+
+      if (ops[i].flags & OPF_REP) {
+        struct parsed_opr opr = OPR_INIT(OPT_REG, OPLM_DWORD, xCX);
+        unsigned int uval;
+
+        ret = try_resolve_const(i, &opr, i + opcnt * 7, &uval);
+        if (ret != 1 || uval == 0) {
+          // can't treat it as full setter because of ecx=0 case,
+          // also disallow delayed compare
+          *branched = 1;
+          continue;
+        }
+      }
+
       return 0;
     }
 
@@ -5316,7 +5333,6 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
   char buf1[256], buf2[256], buf3[256], cast[64];
   struct parsed_proto *pp, *pp_tmp;
   struct parsed_data *pd;
-  unsigned int uval;
   int save_arg_vars[MAX_ARG_GRP] = { 0, };
   unsigned char cbits[MAX_OPS / 8];
   const char *float_type;
@@ -5523,7 +5539,7 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
     {
       int setters[16], cnt = 0, branched = 0;
 
-      ret = scan_for_flag_set(i, i + opcnt * 6,
+      ret = scan_for_flag_set(i, opcnt, i + opcnt * 6,
               &branched, setters, &cnt);
       if (ret < 0 || cnt <= 0)
         ferr(po, "unable to trace flag setter(s)\n");
@@ -6065,32 +6081,6 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
 
     pfomask = po->pfomask;
 
-    if (po->flags & (OPF_REPZ|OPF_REPNZ)) {
-      struct parsed_opr opr = OPR_INIT(OPT_REG, OPLM_DWORD, xCX);
-      ret = try_resolve_const(i, &opr, opcnt * 7 + i, &uval);
-
-      if (ret != 1 || uval == 0) {
-        // we need initial flags for ecx=0 case..
-        if (i > 0 && ops[i - 1].op == OP_XOR
-          && IS(ops[i - 1].operand[0].name,
-                ops[i - 1].operand[1].name))
-        {
-          fprintf(fout, "  cond_z = ");
-          if (pfomask & (1 << PFO_C))
-            fprintf(fout, "cond_c = ");
-          fprintf(fout, "0;\n");
-        }
-        else if (last_arith_dst != NULL) {
-          out_src_opr_u32(buf3, sizeof(buf3), po, last_arith_dst);
-          out_test_for_cc(buf1, sizeof(buf1), po, PFO_Z, 0,
-            last_arith_dst->lmod, buf3);
-          fprintf(fout, "  cond_z = %s;\n", buf1);
-        }
-        else
-          ferr(po, "missing initial ZF\n");
-      }
-    }
-
     switch (po->op)
     {
       case OP_MOV:
@@ -6246,7 +6236,7 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
         if (po->flags & OPF_REP) {
           assert_operand_cnt(3);
           fprintf(fout,
-            "  for (; ecx != 0; ecx--) {\n");
+            "  while (ecx != 0) {\n");
           if (pfomask & (1 << PFO_C)) {
             // ugh..
             fprintf(fout,
@@ -6257,6 +6247,7 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
             "    cond_z = (%sesi == %sedi); esi %c= %d, edi %c= %d;\n",
               buf1, buf1, l, j, l, j);
           fprintf(fout,
+            "    ecx--;\n"
             "    if (cond_z %s 0) break;\n",
               (po->flags & OPF_REPZ) ? "==" : "!=");
           fprintf(fout,
@@ -6284,12 +6275,13 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
         if (po->flags & OPF_REP) {
           assert_operand_cnt(3);
           fprintf(fout,
-            "  for (; ecx != 0; ecx--) {\n");
+            "  while (ecx != 0) {\n");
           fprintf(fout,
             "    cond_z = (%seax == %sedi); edi %c= %d;\n",
               lmod_cast_u(po, po->operand[1].lmod),
               lmod_cast_u_ptr(po, po->operand[1].lmod), l, j);
           fprintf(fout,
+            "    ecx--;\n"
             "    if (cond_z %s 0) break;\n",
               (po->flags & OPF_REPZ) ? "==" : "!=");
           fprintf(fout,
@@ -6482,9 +6474,13 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
         propagate_lmod(po, &po->operand[0], &po->operand[1]);
         if (IS(opr_name(po, 0), opr_name(po, 1))) {
           // special case for XOR
-          if (pfomask & (1 << PFO_BE)) { // weird, but it happens..
-            fprintf(fout, "  cond_be = 1;\n");
-            pfomask &= ~(1 << PFO_BE);
+          int z = PFOB_O | PFOB_C | PFOB_S | (1 << PFO_L);
+          for (j = 0; j <= PFO_LE; j++) {
+            if (pfomask & (1 << j)) {
+              fprintf(fout, "  cond_%s = %d;\n",
+                parsed_flag_op_names[j], (1 << j) & z ? 0 : 1);
+              pfomask &= ~(1 << j);
+            }
           }
           fprintf(fout, "  %s = 0;",
             out_dst_opr(buf1, sizeof(buf1), po, &po->operand[0]));

@@ -35,8 +35,15 @@ loop:
                 bsf     eax, ecx
 
                 call    __allshl
+                mov     edi, eax
                 call    __allshr
                 bswap   eax
+                xor     ecx, eax
+                add     eax, ecx
+
+                repne cmpsb
+                setne   cl
+                adc     cl, cl
 
                 push    1
                 pop     eax
