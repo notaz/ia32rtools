@@ -511,12 +511,12 @@ static int is_reg_in_str(const char *s)
 }
 
 static const char *parse_stack_el(const char *name, char *extra_reg,
-  int early_try)
+  int *base_val, int early_try)
 {
   const char *p, *p2, *s;
   char *endp = NULL;
   char buf[32];
-  long val;
+  long val = -1;
   int len;
 
   if (g_bp_frame || early_try)
@@ -589,6 +589,8 @@ static const char *parse_stack_el(const char *name, char *extra_reg,
   if ('0' <= *p && *p <= '9')
     return NULL;
 
+  if (base_val != NULL)
+    *base_val = val;
   return p;
 }
 
@@ -823,11 +825,12 @@ static int parse_operand(struct parsed_opr *opr,
       aerr("[] parse failure\n");
 
     parse_indmode(opr->name, regmask_indirect, 1);
-    if (opr->lmod == OPLM_UNSPEC && parse_stack_el(opr->name, NULL, 1))
+    if (opr->lmod == OPLM_UNSPEC
+      && parse_stack_el(opr->name, NULL, NULL, 1))
     {
       // might be an equ
       struct parsed_equ *eq =
-        equ_find(NULL, parse_stack_el(opr->name, NULL, 1), &i);
+        equ_find(NULL, parse_stack_el(opr->name, NULL, NULL, 1), &i);
       if (eq)
         opr->lmod = eq->lmod;
 
@@ -1747,7 +1750,7 @@ static struct parsed_equ *equ_find(struct parsed_op *po, const char *name,
 static int is_stack_access(struct parsed_op *po,
   const struct parsed_opr *popr)
 {
-  return (parse_stack_el(popr->name, NULL, 0)
+  return (parse_stack_el(popr->name, NULL, NULL, 0)
     || (g_bp_frame && !(po->flags & OPF_EBP_S)
         && IS_START(popr->name, "ebp")));
 }
@@ -1778,7 +1781,7 @@ static void parse_stack_access(struct parsed_op *po,
       ferr(po, "ebp- parse of '%s' failed\n", name);
   }
   else {
-    bp_arg = parse_stack_el(name, ofs_reg, 0);
+    bp_arg = parse_stack_el(name, ofs_reg, NULL, 0);
     snprintf(g_comment, sizeof(g_comment), "%s", bp_arg);
     eq = equ_find(po, bp_arg, &offset);
     if (eq == NULL)
@@ -1797,9 +1800,44 @@ static void parse_stack_access(struct parsed_op *po,
   }
 
   *offset_out = offset;
-  *stack_ra_out = stack_ra;
+  if (stack_ra_out)
+    *stack_ra_out = stack_ra;
   if (bp_arg_out)
     *bp_arg_out = bp_arg;
+}
+
+static int parse_stack_esp_offset(struct parsed_op *po,
+  const char *name, int *offset_out)
+{
+  char ofs_reg[16] = { 0, };
+  struct parsed_equ *eq;
+  const char *bp_arg;
+  char *endp = NULL;
+  int base_val = 0;
+  int offset = 0;
+
+  if (strstr(name, "esp") == NULL)
+    return -1;
+  bp_arg = parse_stack_el(name, ofs_reg, &base_val, 0);
+  if (bp_arg == NULL) {
+    // just plain offset?
+    if (!IS_START(name, "esp+"))
+      return -1;
+    offset = strtol(name + 4, &endp, 0);
+    if (endp == NULL || *endp != 0)
+      return -1;
+    *offset_out = offset;
+    return 0;
+  }
+
+  if (ofs_reg[0] != 0)
+    return -1;
+  eq = equ_find(po, bp_arg, &offset);
+  if (eq == NULL)
+    ferr(po, "detected but missing eq\n");
+  offset += eq->offset;
+  *offset_out = base_val + offset;
+  return 0;
 }
 
 static int stack_frame_access(struct parsed_op *po,
@@ -4530,9 +4568,69 @@ static struct parsed_proto *process_call(int i, int opcnt)
   return pp;
 }
 
-static int collect_call_args_early(struct parsed_op *po, int i,
-  struct parsed_proto *pp, int *regmask)
+static int collect_call_args_no_push(int i, struct parsed_proto *pp,
+  int *regmask_ffca)
 {
+  struct parsed_op *po;
+  int offset = 0;
+  int base_arg;
+  int j, arg;
+  int ret;
+
+  for (base_arg = 0; base_arg < pp->argc; base_arg++)
+    if (pp->arg[base_arg].reg == NULL)
+      break;
+
+  for (j = i; j > 0; )
+  {
+    ferr_assert(&ops[j], g_labels[j] == NULL);
+    j--;
+
+    po = &ops[j];
+    ferr_assert(po, po->op != OP_PUSH);
+    if (po->op == OP_FST)
+    {
+      if (po->operand[0].type != OPT_REGMEM)
+        continue;
+      ret = parse_stack_esp_offset(po, po->operand[0].name, &offset);
+      if (ret != 0)
+        continue;
+      if (offset < 0 || offset >= pp->argc_stack * 4 || (offset & 3))
+        ferr(po, "bad offset %d (%d args)\n", offset, pp->argc_stack);
+
+      arg = base_arg + offset / 4;
+      po->p_argnext = -1;
+      po->p_argnum = arg + 1;
+      ferr_assert(po, pp->arg[arg].datap == NULL);
+      pp->arg[arg].datap = po;
+      po->flags |= OPF_DONE | OPF_FARGNR | OPF_FARG;
+      if (regmask_ffca != NULL)
+        *regmask_ffca |= 1 << arg;
+    }
+    else if (po->op == OP_SUB && po->operand[0].reg == xSP
+      && po->operand[1].type == OPT_CONST)
+    {
+      po->flags |= OPF_RMD | OPF_DONE | OPF_FARGNR | OPF_FARG;
+      break;
+    }
+  }
+
+  for (arg = base_arg; arg < pp->argc; arg++) {
+    ferr_assert(&ops[i], pp->arg[arg].reg == NULL);
+    po = pp->arg[arg].datap;
+    if (po == NULL)
+      ferr(&ops[i], "arg %d/%d not found\n", arg, pp->argc);
+    if (po->operand[0].lmod == OPLM_QWORD)
+      arg++;
+  }
+
+  return 0;
+}
+
+static int collect_call_args_early(int i, struct parsed_proto *pp,
+  int *regmask, int *regmask_ffca)
+{
+  struct parsed_op *po;
   int arg, ret;
   int j;
 
@@ -4547,19 +4645,20 @@ static int collect_call_args_early(struct parsed_op *po, int i,
       return -1;
     j--;
 
-    if (ops[j].op == OP_CALL)
+    po = &ops[j];
+    if (po->op == OP_CALL)
       return -1;
-    else if (ops[j].op == OP_ADD && ops[j].operand[0].reg == xSP)
+    else if (po->op == OP_ADD && po->operand[0].reg == xSP)
       return -1;
-    else if (ops[j].op == OP_POP)
+    else if (po->op == OP_POP)
       return -1;
-    else if (ops[j].flags & OPF_CJMP)
+    else if (po->flags & OPF_CJMP)
       return -1;
-    else if (ops[j].op == OP_PUSH) {
-      if (ops[j].flags & (OPF_FARG|OPF_FARGNR))
+    else if (po->op == OP_PUSH) {
+      if (po->flags & (OPF_FARG|OPF_FARGNR))
         return -1;
       if (!g_header_mode) {
-        ret = scan_for_mod(&ops[j], j + 1, i, 1);
+        ret = scan_for_mod(po, j + 1, i, 1);
         if (ret >= 0)
           return -1;
       }
@@ -4571,6 +4670,17 @@ static int collect_call_args_early(struct parsed_op *po, int i,
       for (arg++; arg < pp->argc; arg++)
         if (pp->arg[arg].reg == NULL)
           break;
+    }
+    else if (po->op == OP_SUB && po->operand[0].reg == xSP
+      && po->operand[1].type == OPT_CONST)
+    {
+      if (po->flags & (OPF_RMD|OPF_DONE))
+        return -1;
+      if (po->operand[1].val != pp->argc_stack * 4)
+        ferr(po, "unexpected esp adjust: %d\n",
+             po->operand[1].val * 4);
+      ferr_assert(po, pp->argc - arg == pp->argc_stack);
+      return collect_call_args_no_push(i, pp, regmask_ffca);
     }
   }
 
@@ -4592,7 +4702,7 @@ static int collect_call_args_early(struct parsed_op *po, int i,
       ferr_assert(&ops[j], pp->arg[arg].datap == NULL);
       pp->arg[arg].datap = &ops[j];
 
-      if (ops[j].operand[0].type == OPT_REG)
+      if (regmask != NULL && ops[j].operand[0].type == OPT_REG)
         *regmask |= 1 << ops[j].operand[0].reg;
 
       ops[j].flags |= OPF_RMD | OPF_DONE | OPF_FARGNR | OPF_FARG;
@@ -5226,6 +5336,7 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
   int regmask_now;      // temp
   int regmask_init = 0; // regs that need zero initialization
   int regmask_pp = 0;   // regs used in complex push-pop graph
+  int regmask_ffca = 0; // float function call args
   int regmask = 0;      // used regs
   int pfomask = 0;
   int found = 0;
@@ -5283,10 +5394,12 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
     {
       pp = process_call_early(i, opcnt, &j);
       if (pp != NULL) {
-        if (!(po->flags & OPF_ATAIL))
+        if (!(po->flags & OPF_ATAIL)) {
           // since we know the args, try to collect them
-          if (collect_call_args_early(po, i, pp, &regmask) != 0)
+          ret = collect_call_args_early(i, pp, &regmask, &regmask_ffca);
+          if (ret != 0)
             pp = NULL;
+        }
       }
 
       if (pp != NULL) {
@@ -5802,6 +5915,15 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
       if (save_arg_vars[i] & (1 << reg)) {
         fprintf(fout, "  u32 %s;\n",
           saved_arg_name(buf1, sizeof(buf1), i, reg + 1));
+        had_decl = 1;
+      }
+    }
+  }
+
+  if (regmask_ffca) {
+    for (reg = 0; reg < 32; reg++) {
+      if (regmask_ffca & (1 << reg)) {
+        fprintf(fout, "  %s fs_%d;\n", float_type, reg + 1);
         had_decl = 1;
       }
     }
@@ -6763,6 +6885,11 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
             if (tmp_op->flags & OPF_VAPUSH) {
               fprintf(fout, "ap");
             }
+            else if (tmp_op->op == OP_FST) {
+              fprintf(fout, "fs_%d", tmp_op->p_argnum);
+              if (tmp_op->operand[0].lmod == OPLM_QWORD)
+                arg++;
+            }
             else if (tmp_op->p_argpass != 0) {
               fprintf(fout, "a%d", tmp_op->p_argpass);
             }
@@ -6992,13 +7119,19 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
         break;
 
       case OP_FST:
-        dead_dst = po->operand[0].type == OPT_REG
-          && po->operand[0].reg == xST0;
-        if (!dead_dst) {
-          fprintf(fout, "  %s = %s;",
-            out_dst_opr_float(buf1, sizeof(buf1), po, &po->operand[0],
-              need_float_stack), float_st0);
+        if (po->flags & OPF_FARG) {
+          // store to stack as func arg
+          snprintf(buf1, sizeof(buf1), "fs_%d", po->p_argnum);
+          dead_dst = 0;
         }
+        else {
+          out_dst_opr_float(buf1, sizeof(buf1), po, &po->operand[0],
+            need_float_stack);
+          dead_dst = po->operand[0].type == OPT_REG
+            && po->operand[0].reg == xST0;
+        }
+        if (!dead_dst)
+          fprintf(fout, "  %s = %s;", buf1, float_st0);
         if (po->flags & OPF_FSHIFT) {
           if (need_float_stack)
             fprintf(fout, "  f_stp++;");
@@ -7656,7 +7789,7 @@ static void gen_hdr(const char *funcn, int opcnt)
       if (pp != NULL) {
         if (!(po->flags & OPF_ATAIL))
           // since we know the args, try to collect them
-          if (collect_call_args_early(po, i, pp, &regmask_dummy) != 0)
+          if (collect_call_args_early(i, pp, NULL, NULL) != 0)
             pp = NULL;
       }
 

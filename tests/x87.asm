@@ -3,6 +3,7 @@ _text           segment para public 'CODE' use32
 
 sub_test        proc near
 
+var_28          = qword ptr -28h
 var_20          = dword ptr -20h
 var_18          = qword ptr -18h
 arg_0           = dword ptr  8
@@ -16,6 +17,12 @@ arg_0           = dword ptr  8
                 fild    [ebp+var_20]
                 fdiv    st(1), st
                 faddp   st(1), st
+                fld     [ebp+var_18]
+                sub     esp, 10h
+                fstp    [esp+30h+var_28]
+                fstp    qword ptr [esp+0]
+                call    _pow
+                add     esp, 10h
                 fcom    [ebp+var_18]
                 xor     eax, eax
                 fnstsw  ax

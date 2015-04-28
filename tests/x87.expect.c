@@ -6,6 +6,8 @@ int sub_test(int a1, int a2)
   double f_st0;
   double f_st1;
   u16 f_sw;
+  double fs_1;
+  double fs_3;
   u32 cond_z;
 
   f_st0 = (double)(s32)sf.d[0];  // var_20 fild
@@ -14,6 +16,10 @@ int sub_test(int a1, int a2)
   f_st1 = f_st0;  f_st0 = (double)(s32)sf.d[0];  // var_20 fild
   f_st1 /= f_st0;
   f_st0 = f_st1 + f_st0;
+  f_st1 = f_st0;  f_st0 = *((double *)(u32)&sf.q[1]);  // var_18 fld
+  fs_3 = f_st0;  f_st0 = f_st1;  // fst
+  fs_1 = f_st0;  // fst
+  f_st0 = pow(fs_1, fs_3);
   f_sw = f_st0 <= *((double *)(u32)&sf.q[1]) ? 0x4100 : 0;  // var_18 z_chk_det
   eax = 0;
   LOWORD(eax) = f_sw;
