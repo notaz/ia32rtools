@@ -20,7 +20,7 @@ struct parsed_type {
 struct parsed_proto_arg {
 	char *reg;
 	struct parsed_type type;
-	struct parsed_proto *fptr;
+	struct parsed_proto *pp; // fptr or struct
 	void *datap;
 };
 
@@ -353,6 +353,54 @@ static int check_struct_arg(struct parsed_proto_arg *arg)
 	return 0;
 }
 
+static int parse_protostr(char *protostr, struct parsed_proto *pp);
+
+static int parse_arg(char **p_, struct parsed_proto_arg *arg, int xarg)
+{
+	char buf[256];
+	char *p = *p_;
+	char *pe;
+	int ret;
+
+	arg->pp = calloc(1, sizeof(*arg->pp));
+	my_assert_not(arg->pp, NULL);
+	arg->pp->is_arg = 1;
+
+	pe = p;
+	while (1) {
+		pe = strpbrk(pe, ",()");
+		if (pe == NULL)
+			return -1;
+		if (*pe == ',' || *pe == ')')
+			break;
+		pe = strchr(pe, ')');
+		if (pe == NULL)
+			return -1;
+		pe++;
+	}
+
+	if (pe - p > sizeof(buf) - 1)
+		return -1;
+	memcpy(buf, p, pe - p);
+	buf[pe - p] = 0;
+
+	ret = parse_protostr(buf, arg->pp);
+	if (ret < 0)
+		return -1;
+
+	// we don't use actual names right now...
+	snprintf(arg->pp->name, sizeof(arg->pp->name), "a%d", xarg);
+
+	if (!arg->type.is_struct)
+		// we'll treat it as void * for non-calls
+		arg->type.name = strdup("void *");
+	arg->type.is_ptr = 1;
+
+	p += ret;
+	*p_ = p;
+	return 0;
+}
+
 static int parse_protostr(char *protostr, struct parsed_proto *pp)
 {
 	struct parsed_proto_arg *arg;
@@ -360,8 +408,8 @@ static int parse_protostr(char *protostr, struct parsed_proto *pp)
 	char buf[256];
 	char cconv[32];
 	int is_retreg;
-	int xarg = 0;
 	char *p, *p1;
+	int xarg = 0;
 	int i, l;
 	int ret;
 
@@ -416,8 +464,8 @@ static int parse_protostr(char *protostr, struct parsed_proto *pp)
 	if (!strchr(p, ')')) {
 		p = next_idt(buf, sizeof(buf), p);
 		p = sskip(p);
-		if (buf[0] == 0) {
-			printf("%s:%d:%zd: var name missing\n",
+		if (!pp->is_arg && buf[0] == 0) {
+			printf("%s:%d:%zd: var name is missing\n",
 				hdrfn, hdrfline, (p - protostr) + 1);
 			return -1;
 		}
@@ -578,24 +626,15 @@ static int parse_protostr(char *protostr, struct parsed_proto *pp)
 		}
 		p = sskip(p + ret);
 
-		if (*p == '(') {
-			// func ptr
-			arg->fptr = calloc(1, sizeof(*arg->fptr));
-			ret = parse_protostr(p1, arg->fptr);
+		if (*p == '(' || arg->type.is_struct) {
+			// func ptr or struct
+			ret = parse_arg(&p1, arg, xarg);
 			if (ret < 0) {
 				printf("%s:%d:%zd: funcarg parse failed\n",
 					hdrfn, hdrfline, p1 - protostr);
 				return -1;
 			}
-			arg->fptr->is_arg = 1;
-			// we don't use actual names right now..
-			snprintf(arg->fptr->name,
-				sizeof(arg->fptr->name), "a%d", xarg);
-			// we'll treat it as void * for non-calls
-			arg->type.name = strdup("void *");
-			arg->type.is_ptr = 1;
-
-			p = p1 + ret;
+			p = p1;
 		}
 
 		p = next_idt(buf, sizeof(buf), p);
@@ -885,10 +924,10 @@ static void pp_copy_arg(struct parsed_proto_arg *d,
 		d->type.name = strdup(s->type.name);
 		my_assert_not(d->type.name, NULL);
 	}
-	if (s->fptr != NULL) {
-		d->fptr = malloc(sizeof(*d->fptr));
-		my_assert_not(d->fptr, NULL);
-		memcpy(d->fptr, s->fptr, sizeof(*d->fptr));
+	if (s->pp != NULL) {
+		d->pp = malloc(sizeof(*d->pp));
+		my_assert_not(d->pp, NULL);
+		memcpy(d->pp, s->pp, sizeof(*d->pp));
 	}
 }
 
@@ -965,8 +1004,8 @@ static inline void proto_release(struct parsed_proto *pp)
 			free(pp->arg[i].reg);
 		if (pp->arg[i].type.name != NULL)
 			free(pp->arg[i].type.name);
-		if (pp->arg[i].fptr != NULL)
-			free(pp->arg[i].fptr);
+		if (pp->arg[i].pp != NULL)
+			free(pp->arg[i].pp);
 	}
 	if (pp->ret_type.name != NULL)
 		free(pp->ret_type.name);

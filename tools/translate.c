@@ -1782,7 +1782,6 @@ static void parse_stack_access(struct parsed_op *po,
   }
   else {
     bp_arg = parse_stack_el(name, ofs_reg, NULL, 0);
-    snprintf(g_comment, sizeof(g_comment), "%s", bp_arg);
     eq = equ_find(po, bp_arg, &offset);
     if (eq == NULL)
       ferr(po, "detected but missing eq\n");
@@ -1861,6 +1860,8 @@ static int stack_frame_access(struct parsed_op *po,
 
   parse_stack_access(po, name, ofs_reg, &offset,
     &stack_ra, &bp_arg, is_lea);
+
+  snprintf(g_comment, sizeof(g_comment), "%s", bp_arg);
 
   if (offset > stack_ra)
   {
@@ -1960,7 +1961,7 @@ static int stack_frame_access(struct parsed_op *po,
     }
 
     if (unaligned)
-      snprintf(g_comment, sizeof(g_comment), "%s unaligned", bp_arg);
+      strcat(g_comment, " unaligned");
 
     // common problem
     guess_lmod_from_c_type(&tmp_lmod, &g_func_pp->arg[i].type);
@@ -2538,7 +2539,7 @@ static const char *op_to_c(struct parsed_op *po)
 // note: this skips over calls and rm'd stuff assuming they're handled
 // so it's intended to use at one of final passes
 static int scan_for_pop(int i, int opcnt, int magic, int reg,
-  int depth, int flags_set)
+  int depth, int seen_noreturn, int flags_set)
 {
   struct parsed_op *po;
   int relevant;
@@ -2554,10 +2555,12 @@ static int scan_for_pop(int i, int opcnt, int magic, int reg,
     if (po->flags & OPF_TAIL) {
       if (po->op == OP_CALL) {
         if (po->pp != NULL && po->pp->is_noreturn)
-          // assume no stack cleanup for noreturn
-          return 1;
+          seen_noreturn = 1;
+        else
+          return -1;
       }
-      return -1; // deadend
+      else
+        return -1; // deadend
     }
 
     if (po->flags & (OPF_RMD|OPF_DONE|OPF_FARG))
@@ -2569,7 +2572,7 @@ static int scan_for_pop(int i, int opcnt, int magic, int reg,
         for (j = 0; j < po->btj->count; j++) {
           check_i(po, po->btj->d[j].bt_i);
           ret |= scan_for_pop(po->btj->d[j].bt_i, opcnt, magic, reg,
-                   depth, flags_set);
+                   depth, seen_noreturn, flags_set);
           if (ret < 0)
             return ret; // dead end
         }
@@ -2579,7 +2582,7 @@ static int scan_for_pop(int i, int opcnt, int magic, int reg,
       check_i(po, po->bt_i);
       if (po->flags & OPF_CJMP) {
         ret |= scan_for_pop(po->bt_i, opcnt, magic, reg,
-                 depth, flags_set);
+                 depth, seen_noreturn, flags_set);
         if (ret < 0)
           return ret; // dead end
       }
@@ -2608,7 +2611,8 @@ static int scan_for_pop(int i, int opcnt, int magic, int reg,
     }
   }
 
-  return -1;
+  // for noreturn, assume msvc skipped stack cleanup
+  return seen_noreturn ? 1 : -1;
 }
 
 // scan for 'reg' pop backwards starting from i
@@ -3352,7 +3356,8 @@ static void scan_fwd_set_flags(int i, int opcnt, int magic, int flags)
 }
 
 static const struct parsed_proto *try_recover_pp(
-  struct parsed_op *po, const struct parsed_opr *opr, int *search_instead)
+  struct parsed_op *po, const struct parsed_opr *opr,
+  int is_call, int *search_instead)
 {
   const struct parsed_proto *pp = NULL;
   char buf[256];
@@ -3391,10 +3396,12 @@ static const struct parsed_proto *try_recover_pp(
     if (arg == g_func_pp->argc)
       ferr(po, "stack arg %d not in prototype?\n", arg_i);
 
-    pp = g_func_pp->arg[arg].fptr;
-    if (pp == NULL)
-      ferr(po, "icall sa: arg%d is not a fptr?\n", arg + 1);
-    check_func_pp(po, pp, "icall arg");
+    pp = g_func_pp->arg[arg].pp;
+    if (is_call) {
+      if (pp == NULL)
+        ferr(po, "icall arg: arg%d has no pp\n", arg + 1);
+      check_func_pp(po, pp, "icall arg");
+    }
   }
   else if (opr->type == OPT_REGMEM && strchr(opr->name + 1, '[')) {
     // label[index]
@@ -3475,14 +3482,14 @@ static void scan_for_call_type(int i, const struct parsed_opr *opr,
     }
     if (i == g_func_pp->argc)
       return;
-    pp = g_func_pp->arg[i].fptr;
+    pp = g_func_pp->arg[i].pp;
     if (pp == NULL)
       ferr(po, "icall: arg%d (%s) is not a fptr?\n",
         i + 1, g_func_pp->arg[i].reg);
     check_func_pp(po, pp, "icall reg-arg");
   }
   else
-    pp = try_recover_pp(po, opr, NULL);
+    pp = try_recover_pp(po, opr, 1, NULL);
 
   if (*pp_found != NULL && pp != NULL && *pp_found != pp) {
     if (!IS((*pp_found)->ret_type.name, pp->ret_type.name)
@@ -3617,6 +3624,13 @@ static int get_pp_arg_regmask_dst(const struct parsed_proto *pp)
     return regmask;
 
   return regmask | mxAX;
+}
+
+static int are_ops_same(struct parsed_op *po1, struct parsed_op *po2)
+{
+  return po1->op == po2->op && po1->operand_cnt == po2->operand_cnt
+    && memcmp(po1->operand, po2->operand,
+              sizeof(po1->operand[0]) * po1->operand_cnt) == 0;
 }
 
 static void resolve_branches_parse_calls(int opcnt)
@@ -4026,10 +4040,6 @@ static int resolve_origin(int i, const struct parsed_opr *opr,
   struct label_ref *lr;
   int ret = 0;
 
-  if (ops[i].cc_scratch == magic)
-    return 0;
-  ops[i].cc_scratch = magic;
-
   while (1) {
     if (g_labels[i] != NULL) {
       lr = &g_label_refs[i];
@@ -4058,10 +4068,9 @@ static int resolve_origin(int i, const struct parsed_opr *opr,
       continue;
 
     if (*op_i >= 0) {
-      if (*op_i == i)
+      if (*op_i == i || are_ops_same(&ops[*op_i], &ops[i]))
         return ret | 1;
 
-      // XXX: could check if the other op does the same
       return -1;
     }
 
@@ -4079,10 +4088,6 @@ static int resolve_last_ref(int i, const struct parsed_opr *opr,
 {
   struct label_ref *lr;
   int ret = 0;
-
-  if (ops[i].cc_scratch == magic)
-    return 0;
-  ops[i].cc_scratch = magic;
 
   while (1) {
     if (g_labels[i] != NULL) {
@@ -4337,16 +4342,103 @@ static int resolve_used_bits(int i, int opcnt, int reg,
   return 0;
 }
 
+static const struct parsed_proto *resolve_deref(int i, int magic,
+  struct parsed_opr *opr, int level)
+{
+  struct parsed_opr opr_s = OPR_INIT(OPT_REG, OPLM_DWORD, 0);
+  const struct parsed_proto *pp = NULL;
+  int from_caller = 0;
+  char s_reg[4];
+  int offset = 0;
+  int len = 0;
+  int j = -1;
+  int k = -1;
+  int reg;
+  int ret;
+
+  ret = sscanf(opr->name, "%3s+%x%n", s_reg, &offset, &len);
+  if (ret != 2 || len != strlen(opr->name)) {
+    ret = sscanf(opr->name, "%3s%n", s_reg, &len);
+    if (ret != 1 || len != strlen(opr->name))
+      return NULL;
+  }
+
+  reg = char_array_i(regs_r32, ARRAY_SIZE(regs_r32), s_reg);
+  if (reg < 0)
+    return NULL;
+
+  opr_s.reg = reg;
+  ret = resolve_origin(i, &opr_s, i + magic, &j, NULL);
+  if (ret != 1)
+    return NULL;
+
+  if (ops[j].op == OP_MOV && ops[j].operand[1].type == OPT_REGMEM
+    && strlen(ops[j].operand[1].name) == 3
+    && ops[j].operand[0].lmod == OPLM_DWORD
+    && ops[j].pp == NULL // no hint
+    && level == 0)
+  {
+    // allow one simple dereference (com/directx)
+    reg = char_array_i(regs_r32, ARRAY_SIZE(regs_r32),
+            ops[j].operand[1].name);
+    if (reg < 0)
+      return NULL;
+    opr_s.reg = reg;
+    ret = resolve_origin(j, &opr_s, j + magic, &k, NULL);
+    if (ret != 1)
+      return NULL;
+    j = k;
+  }
+  if (ops[j].op != OP_MOV || ops[j].operand[0].lmod != OPLM_DWORD)
+    return NULL;
+
+  if (ops[j].pp != NULL) {
+    // type hint in asm
+    pp = ops[j].pp;
+  }
+  else if (ops[j].operand[1].type == OPT_REGMEM) {
+    pp = try_recover_pp(&ops[j], &ops[j].operand[1], 0, NULL);
+    if (pp == NULL) {
+      // maybe structure ptr in structure
+      pp = resolve_deref(j, magic, &ops[j].operand[1], level + 1);
+    }
+  }
+  else if (ops[j].operand[1].type == OPT_LABEL)
+    pp = proto_parse(g_fhdr, ops[j].operand[1].name, g_quiet_pp);
+  else if (ops[j].operand[1].type == OPT_REG) {
+    // maybe arg reg?
+    k = -1;
+    ret = resolve_origin(j, &ops[j].operand[1], i + magic,
+            &k, &from_caller);
+    if (ret != 1 && from_caller && k == -1 && g_func_pp != NULL) {
+      for (k = 0; k < g_func_pp->argc; k++) {
+        if (g_func_pp->arg[k].reg == NULL)
+          continue;
+        if (IS(g_func_pp->arg[k].reg, ops[j].operand[1].name)) {
+          pp = g_func_pp->arg[k].pp;
+          break;
+        }
+      }
+    }
+  }
+
+  if (pp == NULL)
+    return NULL;
+  if (pp->is_func || pp->is_fptr || !pp->type.is_struct) {
+    if (offset != 0)
+      ferr(&ops[j], "expected struct, got '%s %s'\n",
+           pp->type.name, pp->name);
+    return NULL;
+  }
+
+  return proto_lookup_struct(g_fhdr, pp->type.name, offset);
+}
+
 static const struct parsed_proto *resolve_icall(int i, int opcnt,
   int *pp_i, int *multi_src)
 {
   const struct parsed_proto *pp = NULL;
   int search_advice = 0;
-  int offset = -1;
-  char name[256];
-  char s_reg[4];
-  int reg, len;
-  int ret;
 
   *multi_src = 0;
   *pp_i = -1;
@@ -4354,67 +4446,14 @@ static const struct parsed_proto *resolve_icall(int i, int opcnt,
   switch (ops[i].operand[0].type) {
   case OPT_REGMEM:
     // try to resolve struct member calls
-    ret = sscanf(ops[i].operand[0].name, "%3s+%x%n",
-            s_reg, &offset, &len);
-    if (ret == 2 && len == strlen(ops[i].operand[0].name))
-    {
-      reg = char_array_i(regs_r32, ARRAY_SIZE(regs_r32), s_reg);
-      if (reg >= 0) {
-        struct parsed_opr opr = OPR_INIT(OPT_REG, OPLM_DWORD, reg);
-        int j = -1;
-        ret = resolve_origin(i, &opr, i + opcnt * 19, &j, NULL);
-        if (ret != 1)
-          break;
-        if (ops[j].op == OP_MOV && ops[j].operand[1].type == OPT_REGMEM
-          && ops[j].operand[0].lmod == OPLM_DWORD
-          && ops[j].pp == NULL) // no hint
-        {
-          // allow one simple dereference (directx)
-          reg = char_array_i(regs_r32, ARRAY_SIZE(regs_r32),
-                  ops[j].operand[1].name);
-          if (reg < 0)
-            break;
-          struct parsed_opr opr2 = OPR_INIT(OPT_REG, OPLM_DWORD, reg);
-          int k = -1;
-          ret = resolve_origin(j, &opr2, j + opcnt * 19, &k, NULL);
-          if (ret != 1)
-            break;
-          j = k;
-        }
-        if (ops[j].op != OP_MOV)
-          break;
-        if (ops[j].operand[0].lmod != OPLM_DWORD)
-          break;
-        if (ops[j].pp != NULL) {
-          // type hint in asm
-          pp = ops[j].pp;
-        }
-        else if (ops[j].operand[1].type == OPT_REGMEM) {
-          // allow 'hello[ecx]' - assume array of same type items
-          ret = sscanf(ops[j].operand[1].name, "%[^[][e%2s]",
-                  name, s_reg);
-          if (ret != 2)
-            break;
-          pp = proto_parse(g_fhdr, name, g_quiet_pp);
-        }
-        else if (ops[j].operand[1].type == OPT_LABEL)
-          pp = proto_parse(g_fhdr, ops[j].operand[1].name, g_quiet_pp);
-        else
-          break;
-        if (pp == NULL)
-          break;
-        if (pp->is_func || pp->is_fptr || !pp->type.is_struct) {
-          pp = NULL;
-          break;
-        }
-        pp = proto_lookup_struct(g_fhdr, pp->type.name, offset);
-      }
+    pp = resolve_deref(i, i + opcnt * 19, &ops[i].operand[0], 0);
+    if (pp != NULL)
       break;
-    }
     // fallthrough
   case OPT_LABEL:
   case OPT_OFFSET:
-    pp = try_recover_pp(&ops[i], &ops[i].operand[0], &search_advice);
+    pp = try_recover_pp(&ops[i], &ops[i].operand[0],
+           1, &search_advice);
     if (!search_advice)
       break;
     // fallthrough
@@ -5083,9 +5122,10 @@ static void reg_use_pass(int i, int opcnt, unsigned char *cbits,
         flags_set = OPF_RSAVE | OPF_DONE;
       }
 
-      ret = scan_for_pop(i + 1, opcnt, i + opcnt * 3, reg, 0, 0);
+      ret = scan_for_pop(i + 1, opcnt, i + opcnt * 3, reg, 0, 0, 0);
       if (ret == 1) {
-        scan_for_pop(i + 1, opcnt, i + opcnt * 4, reg, 0, flags_set);
+        scan_for_pop(i + 1, opcnt, i + opcnt * 4,
+          reg, 0, 0, flags_set);
       }
       else {
         ret = scan_for_pop_ret(i + 1, opcnt, po->operand[0].reg, 0);
@@ -5291,9 +5331,11 @@ static void output_pp(FILE *fout, const struct parsed_proto *pp,
   for (i = 0; i < pp->argc; i++) {
     if (i > 0)
       fprintf(fout, ", ");
-    if (pp->arg[i].fptr != NULL && !(flags & OPP_SIMPLE_ARGS)) {
+    if (pp->arg[i].pp != NULL && pp->arg[i].pp->is_func
+      && !(flags & OPP_SIMPLE_ARGS))
+    {
       // func pointer
-      output_pp(fout, pp->arg[i].fptr, 0);
+      output_pp(fout, pp->arg[i].pp, 0);
     }
     else if (pp->arg[i].type.is_retreg) {
       fprintf(fout, "u32 *r_%s", pp->arg[i].reg);
@@ -7621,11 +7663,11 @@ static void gen_hdr_dep_pass(int i, int opcnt, unsigned char *cbits,
       if (po->flags & OPF_DONE)
         continue;
 
-      ret = scan_for_pop(i + 1, opcnt, i + opcnt * 2, reg, 0, 0);
+      ret = scan_for_pop(i + 1, opcnt, i + opcnt * 2, reg, 0, 0, 0);
       if (ret == 1) {
         regmask_save |= 1 << reg;
         po->flags |= OPF_RMD;
-        scan_for_pop(i + 1, opcnt, i + opcnt * 3, reg, 0, OPF_RMD);
+        scan_for_pop(i + 1, opcnt, i + opcnt * 3, reg, 0, 0, OPF_RMD);
         continue;
       }
     }
