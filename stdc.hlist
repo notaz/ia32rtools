@@ -125,6 +125,8 @@ int __cdecl  isxdigit(int);
 int __cdecl  tolower(int);
 int __cdecl  toupper(int);
 
+int __cdecl _isctype (int, int);
+
 clock_t __cdecl 	clock (void);
 time_t __cdecl 		time (time_t*);
 double __cdecl 		difftime (time_t, time_t);

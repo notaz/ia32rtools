@@ -57,6 +57,8 @@ _fread
 _fwrite
 _fseek
 _fgetc
+_fgets
+_fputs
 __filbuf
 __mbsicmp
 __onexit
@@ -127,6 +129,7 @@ __beginthreadex
 __endthreadex
 __lock
 __unlock
+__isctype
 
 # not in mingw
 _memcpy_0

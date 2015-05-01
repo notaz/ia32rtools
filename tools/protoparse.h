@@ -192,12 +192,14 @@ static const char *known_ptr_types[] = {
 	"HACCEL",
 	"HANDLE",
 	"HBITMAP",
+	"HBRUSH",
 	"HCALL",
 	"HCURSOR",
 	"HDC",
 	"HFONT",
 	"HGDIOBJ",
 	"HGLOBAL",
+	"HHOOK",
 	"HICON",
 	"HINSTANCE",
 	"HIMC", // DWORD in mingw, ptr in wine..
@@ -217,6 +219,7 @@ static const char *known_ptr_types[] = {
 	"PDWORD",
 	"PFILETIME",
 	"PLARGE_INTEGER",
+	"PHANDLE",
 	"PHKEY",
 	"PLONG",
 	"PMEMORY_BASIC_INFORMATION",
@@ -224,6 +227,9 @@ static const char *known_ptr_types[] = {
 	"PVOID",
 	"PCVOID",
 	"PWORD",
+	"REFCLSID",
+	"REFIID",
+	"HOOKPROC",
 	"DLGPROC",
 	"TIMERPROC",
 	"WNDENUMPROC",
@@ -512,7 +518,7 @@ static int parse_protostr(char *protostr, struct parsed_proto *pp)
 		pp->is_stdcall = 0; // custom
 		pp->is_userstack = 1;
 	}
-	else if (IS(cconv, "WINAPI"))
+	else if (IS(cconv, "WINAPI") || IS(cconv, "PASCAL"))
 		pp->is_stdcall = 1;
 	else {
 		printf("%s:%d:%zd: unhandled cconv: '%s'\n",
