@@ -156,6 +156,7 @@ enum op_op {
   OPP_ALLSHL,
   OPP_ALLSHR,
   OPP_FTOL,
+  OPP_CIPOW,
   // undefined
   OP_UD2,
 };
@@ -307,6 +308,7 @@ static int g_stack_clear_len;
 static int g_regmask_init;
 static int g_skip_func;
 static int g_allow_regfunc;
+static int g_allow_user_icall;
 static int g_quiet_pp;
 static int g_header_mode;
 
@@ -1092,6 +1094,7 @@ static const struct {
   { "_allshl",OPP_ALLSHL },
   { "_allshr",OPP_ALLSHR },
   { "_ftol",  OPP_FTOL },
+  { "_CIpow", OPP_CIPOW },
   // must be last
   { "ud2",    OP_UD2 },
 };
@@ -2029,9 +2032,11 @@ static int stack_frame_access(struct parsed_op *po,
     case OPLM_QWORD:
       ferr_assert(po, !(sf_ofs & 7));
       ferr_assert(po, ofs_reg[0] == 0);
-      // float callers set is_lea
-      ferr_assert(po, is_lea);
-      snprintf(buf, buf_size, "%ssf.q[%d]", prefix, sf_ofs / 8);
+      // only used for x87 int64/float, float sets is_lea
+      if (is_lea)
+        snprintf(buf, buf_size, "%ssf.q[%d]", prefix, sf_ofs / 8);
+      else
+        snprintf(buf, buf_size, "*(s64 *)&sf.q[%d]", sf_ofs / 8);
       break;
 
     default:
@@ -2050,7 +2055,7 @@ static void check_func_pp(struct parsed_op *po,
   int ret, i;
 
   if (pp->argc_reg != 0) {
-    if (/*!g_allow_regfunc &&*/ !pp->is_fastcall) {
+    if (!g_allow_user_icall && !pp->is_fastcall) {
       pp_print(buf, sizeof(buf), pp);
       ferr(po, "%s: unexpected reg arg in icall: %s\n", pfx, buf);
     }
@@ -2333,7 +2338,7 @@ static void out_test_for_cc(char *buf, size_t buf_size,
 
   switch (pfo) {
   case PFO_Z:
-  case PFO_BE: // CF=1||ZF=1; CF=0
+  case PFO_BE: // CF==1||ZF==1; CF=0
     snprintf(buf, buf_size, "(%s%s %s 0)",
       cast, expr, is_inv ? "!=" : "==");
     break;
@@ -2344,9 +2349,14 @@ static void out_test_for_cc(char *buf, size_t buf_size,
       scast, expr, is_inv ? ">=" : "<");
     break;
 
-  case PFO_LE: // ZF=1||SF!=OF; OF=0
+  case PFO_LE: // ZF==1||SF!=OF; OF=0
     snprintf(buf, buf_size, "(%s%s %s 0)",
       scast, expr, is_inv ? ">" : "<=");
+    break;
+
+  case PFO_C: // CF=0
+  case PFO_O: // OF=0
+    snprintf(buf, buf_size, "(%d)", !!is_inv);
     break;
 
   default:
@@ -3645,6 +3655,7 @@ static void resolve_branches_parse_calls(int opcnt)
     { "__allshl", OPP_ALLSHL, OPF_DATA, mxAX|mxDX|mxCX, mxAX|mxDX },
     { "__allshr", OPP_ALLSHR, OPF_DATA, mxAX|mxDX|mxCX, mxAX|mxDX },
     { "__ftol",   OPP_FTOL,   OPF_FPOP, mxST0, mxAX | mxDX },
+    { "__CIpow",  OPP_CIPOW,  OPF_FPOP, mxST0|mxST1, mxST0 },
   };
   const struct parsed_proto *pp_c;
   struct parsed_proto *pp;
@@ -4774,9 +4785,31 @@ static int collect_call_args_early(int i, struct parsed_proto *pp,
   return 0;
 }
 
+static int sync_argnum(struct parsed_op *po, int argnum)
+{
+  struct parsed_op *po_tmp;
+
+  // see if other branches don't have higher argnum
+  for (po_tmp = po; po_tmp != NULL; ) {
+    if (argnum < po_tmp->p_argnum)
+      argnum = po_tmp->p_argnum;
+    // note: p_argnext is active on current collect_call_args only
+    po_tmp = po_tmp->p_argnext >= 0 ? &ops[po_tmp->p_argnext] : NULL;
+  }
+
+  // make all argnums consistent
+  for (po_tmp = po; po_tmp != NULL; ) {
+    if (po_tmp->p_argnum != 0)
+      po_tmp->p_argnum = argnum;
+    po_tmp = po_tmp->p_argnext >= 0 ? &ops[po_tmp->p_argnext] : NULL;
+  }
+
+  return argnum;
+}
+
 static int collect_call_args_r(struct parsed_op *po, int i,
-  struct parsed_proto *pp, int *regmask, int *save_arg_vars,
-  int *arg_grp, int arg, int magic, int need_op_saving, int may_reuse)
+  struct parsed_proto *pp, int *regmask, int *arg_grp,
+  int arg, int argnum, int magic, int need_op_saving, int may_reuse)
 {
   struct parsed_proto *pp_tmp;
   struct parsed_op *po_tmp;
@@ -4784,7 +4817,6 @@ static int collect_call_args_r(struct parsed_op *po, int i,
   int need_to_save_current;
   int arg_grp_current = 0;
   int save_args_seen = 0;
-  int save_args;
   int ret = 0;
   int reg;
   char buf[32];
@@ -4795,7 +4827,7 @@ static int collect_call_args_r(struct parsed_op *po, int i,
     return -1;
   }
 
-  for (; arg < pp->argc; arg++)
+  for (; arg < pp->argc; arg++, argnum++)
     if (pp->arg[arg].reg == NULL)
       break;
   magic = (magic & 0xffffff) | (arg << 24);
@@ -4821,8 +4853,8 @@ static int collect_call_args_r(struct parsed_op *po, int i,
         check_i(&ops[j], lr->i);
         if ((ops[lr->i].flags & (OPF_JMP|OPF_CJMP)) != OPF_JMP)
           may_reuse = 1;
-        ret = collect_call_args_r(po, lr->i, pp, regmask, save_arg_vars,
-                arg_grp, arg, magic, need_op_saving, may_reuse);
+        ret = collect_call_args_r(po, lr->i, pp, regmask, arg_grp,
+                arg, argnum, magic, need_op_saving, may_reuse);
         if (ret < 0)
           return ret;
       }
@@ -4836,8 +4868,8 @@ static int collect_call_args_r(struct parsed_op *po, int i,
         continue;
       }
       need_op_saving = 1;
-      ret = collect_call_args_r(po, lr->i, pp, regmask, save_arg_vars,
-               arg_grp, arg, magic, need_op_saving, may_reuse);
+      ret = collect_call_args_r(po, lr->i, pp, regmask, arg_grp,
+              arg, argnum, magic, need_op_saving, may_reuse);
       if (ret < 0)
         return ret;
     }
@@ -4895,8 +4927,9 @@ static int collect_call_args_r(struct parsed_op *po, int i,
         ops[j].p_argnext = po_tmp - ops;
       pp->arg[arg].datap = &ops[j];
 
+      argnum = sync_argnum(&ops[j], argnum);
+
       need_to_save_current = 0;
-      save_args = 0;
       reg = -1;
       if (ops[j].operand[0].type == OPT_REG)
         reg = ops[j].operand[0].reg;
@@ -4906,25 +4939,15 @@ static int collect_call_args_r(struct parsed_op *po, int i,
         need_to_save_current = (ret >= 0);
       }
       if (need_op_saving || need_to_save_current) {
-        // mark this push as one that needs operand saving
-        ops[j].flags &= ~OPF_RMD;
-        if (ops[j].p_argnum == 0) {
-          ops[j].p_argnum = arg + 1;
-          save_args |= 1 << arg;
-        }
-        else if (ops[j].p_argnum < arg + 1) {
-          // XXX: might kill valid var..
-          //*save_arg_vars &= ~(1 << (ops[j].p_argnum - 1));
-          ops[j].p_argnum = arg + 1;
-          save_args |= 1 << arg;
-        }
+        // mark this arg as one that needs operand saving
+        pp->arg[arg].is_saved = 1;
 
-        if (save_args_seen & (1 << (ops[j].p_argnum - 1))) {
+        if (save_args_seen & (1 << (argnum - 1))) {
           save_args_seen = 0;
           arg_grp_current++;
           if (arg_grp_current >= MAX_ARG_GRP)
             ferr(&ops[j], "out of arg groups (arg%d), f %s\n",
-              ops[j].p_argnum, pp->name);
+              argnum, pp->name);
         }
       }
       else if (ops[j].p_argnum == 0)
@@ -4960,7 +4983,7 @@ static int collect_call_args_r(struct parsed_op *po, int i,
             {
               ops[k].flags |= OPF_RMD | OPF_NOREGS | OPF_DONE;
               ops[j].flags |= OPF_RMD | OPF_NOREGS | OPF_VAPUSH;
-              save_args &= ~(1 << arg);
+              pp->arg[arg].is_saved = 0;
               reg = -1;
             }
             else
@@ -4976,23 +4999,27 @@ static int collect_call_args_r(struct parsed_op *po, int i,
               ops[k].flags |= OPF_RMD | OPF_DONE;
               ops[j].flags |= OPF_RMD;
               ops[j].p_argpass = ret + 1;
-              save_args &= ~(1 << arg);
+              pp->arg[arg].is_saved = 0;
               reg = -1;
             }
           }
         }
       }
 
-      *save_arg_vars |= save_args;
+      if (pp->arg[arg].is_saved) {
+        ops[j].flags &= ~OPF_RMD;
+        ops[j].p_argnum = argnum;
+      }
 
       // tracking reg usage
       if (reg >= 0)
         *regmask |= 1 << reg;
 
       arg++;
+      argnum++;
       if (!pp->is_unresolved) {
         // next arg
-        for (; arg < pp->argc; arg++)
+        for (; arg < pp->argc; arg++, argnum++)
           if (pp->arg[arg].reg == NULL)
             break;
       }
@@ -5020,19 +5047,17 @@ static int collect_call_args_r(struct parsed_op *po, int i,
 }
 
 static int collect_call_args(struct parsed_op *po, int i,
-  struct parsed_proto *pp, int *regmask, int *save_arg_vars,
-  int magic)
+  struct parsed_proto *pp, int *regmask, int magic)
 {
   // arg group is for cases when pushes for
   // multiple funcs are going on
   struct parsed_op *po_tmp;
-  int save_arg_vars_current = 0;
   int arg_grp = 0;
   int ret;
   int a;
 
-  ret = collect_call_args_r(po, i, pp, regmask,
-          &save_arg_vars_current, &arg_grp, 0, magic, 0, 0);
+  ret = collect_call_args_r(po, i, pp, regmask, &arg_grp,
+          0, 1, magic, 0, 0);
   if (ret < 0)
     return ret;
 
@@ -5045,14 +5070,10 @@ static int collect_call_args(struct parsed_op *po, int i,
       po_tmp = pp->arg[a].datap;
       while (po_tmp != NULL) {
         po_tmp->p_arggrp = arg_grp;
-        if (po_tmp->p_argnext > 0)
-          po_tmp = &ops[po_tmp->p_argnext];
-        else
-          po_tmp = NULL;
+        po_tmp = po_tmp->p_argnext >= 0 ? &ops[po_tmp->p_argnext] : NULL;
       }
     }
   }
-  save_arg_vars[arg_grp] |= save_arg_vars_current;
 
   if (pp->is_unresolved) {
     pp->argc += ret;
@@ -5499,8 +5520,7 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
 
         if (!pp->is_unresolved && !(po->flags & OPF_ATAIL)) {
           // since we know the args, collect them
-          collect_call_args(po, i, pp, &regmask, save_arg_vars,
-            i + opcnt * 2);
+          collect_call_args(po, i, pp, &regmask, i + opcnt * 2);
         }
         // for unresolved, collect after other passes
       }
@@ -5658,19 +5678,18 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
 
       if (pp->is_unresolved) {
         int regmask_stack = 0;
-        collect_call_args(po, i, pp, &regmask, save_arg_vars,
-          i + opcnt * 2);
+        collect_call_args(po, i, pp, &regmask, i + opcnt * 2);
 
         // this is pretty rough guess:
         // see ecx and edx were pushed (and not their saved versions)
         for (arg = 0; arg < pp->argc; arg++) {
-          if (pp->arg[arg].reg != NULL)
+          if (pp->arg[arg].reg != NULL && !pp->arg[arg].is_saved)
             continue;
 
           tmp_op = pp->arg[arg].datap;
           if (tmp_op == NULL)
             ferr(po, "parsed_op missing for arg%d\n", arg);
-          if (tmp_op->p_argnum == 0 && tmp_op->operand[0].type == OPT_REG)
+          if (tmp_op->operand[0].type == OPT_REG)
             regmask_stack |= 1 << tmp_op->operand[0].reg;
         }
 
@@ -5770,6 +5789,10 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
     default:
       break;
     }
+
+    // this might need it's own pass...
+    if (po->op != OP_FST && po->p_argnum > 0)
+      save_arg_vars[po->p_arggrp] |= 1 << (po->p_argnum - 1);
   }
 
   float_type = need_double ? "double" : "float";
@@ -6910,6 +6933,13 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
             if (pp->arg[arg].reg != NULL) {
               if (pp->arg[arg].type.is_retreg)
                 fprintf(fout, "&%s", pp->arg[arg].reg);
+              else if (IS(pp->arg[arg].reg, "ebp")
+                    && !(po->flags & OPF_EBP_S))
+              {
+                // rare special case
+                fprintf(fout, "%s(u32)&sf.b[sizeof(sf)]", cast);
+                strcat(g_comment, " bp_ref");
+              }
               else
                 fprintf(fout, "%s%s", cast, pp->arg[arg].reg);
               continue;
@@ -6931,7 +6961,8 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
             else if (tmp_op->p_argpass != 0) {
               fprintf(fout, "a%d", tmp_op->p_argpass);
             }
-            else if (tmp_op->p_argnum != 0) {
+            else if (pp->arg[arg].is_saved) {
+              ferr_assert(po, tmp_op->p_argnum > 0);
               fprintf(fout, "%s%s", cast,
                 saved_arg_name(buf1, sizeof(buf1),
                   tmp_op->p_arggrp, tmp_op->p_argnum));
@@ -7090,7 +7121,7 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
       case OPP_ALLSHL:
       case OPP_ALLSHR:
         fprintf(fout, "  tmp64 = ((u64)edx << 32) | eax;\n");
-        fprintf(fout, "  tmp64 = (s64)tmp64 %s= LOBYTE(ecx);\n",
+        fprintf(fout, "  tmp64 = (s64)tmp64 %s LOBYTE(ecx);\n",
           po->op == OPP_ALLSHL ? "<<" : ">>");
         fprintf(fout, "  edx = tmp64 >> 32; eax = tmp64;");
         strcat(g_comment, po->op == OPP_ALLSHL
@@ -7363,6 +7394,7 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
           fprintf(fout, "  f_st0 = f_st1 * log2%s(f_st0);",
             need_double ? "" : "f");
         }
+        strcat(g_comment, " fyl2x");
         break;
 
       case OP_FSIN:
@@ -7399,6 +7431,19 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
             fprintf(fout, " f_st0 = f_st1;");
         }
         strcat(g_comment, " ftol");
+        break;
+
+      case OPP_CIPOW:
+        if (need_float_stack) {
+          fprintf(fout, "  %s = pow%s(%s, %s);", float_st1,
+            need_double ? "" : "f", float_st1, float_st0);
+          fprintf(fout, " f_stp++;");
+        }
+        else {
+          fprintf(fout, "  f_st0 = pow%s(f_st1, f_st0);",
+            need_double ? "" : "f");
+        }
+        strcat(g_comment, " CIpow");
         break;
 
       // mmx
@@ -7741,7 +7786,6 @@ static void gen_hdr_dep_pass(int i, int opcnt, unsigned char *cbits,
 
 static void gen_hdr(const char *funcn, int opcnt)
 {
-  int save_arg_vars[MAX_ARG_GRP] = { 0, };
   unsigned char cbits[MAX_OPS / 8];
   const struct parsed_proto *pp_c;
   struct parsed_proto *pp;
@@ -7872,8 +7916,8 @@ static void gen_hdr(const char *funcn, int opcnt)
 
       if (!pp->is_unresolved && !(po->flags & OPF_ATAIL)) {
         // since we know the args, collect them
-        ret = collect_call_args(po, i, pp, &regmask_dummy, save_arg_vars,
-          i + opcnt * 1);
+        ret = collect_call_args(po, i, pp, &regmask_dummy,
+                i + opcnt * 1);
       }
     }
   }
@@ -8541,6 +8585,8 @@ int main(int argc, char *argv[])
       verbose = 1;
     else if (IS(argv[arg], "-rf"))
       g_allow_regfunc = 1;
+    else if (IS(argv[arg], "-uc"))
+      g_allow_user_icall = 1;
     else if (IS(argv[arg], "-m"))
       multi_seg = 1;
     else if (IS(argv[arg], "-hdr"))
@@ -8555,6 +8601,7 @@ int main(int argc, char *argv[])
            "options:\n"
            "  -hdr - header generation mode\n"
            "  -rf  - allow unannotated indirect calls\n"
+           "  -uc  - allow ind. calls/refs to __usercall\n"
            "  -m   - allow multiple .text sections\n"
            "[rlist] is a file with function names to skip,"
            " one per line\n",

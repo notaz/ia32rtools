@@ -22,6 +22,7 @@ struct parsed_proto_arg {
 	struct parsed_type type;
 	struct parsed_proto *pp; // fptr or struct
 	void *datap;
+	unsigned int is_saved:1; // not set here, for tool use
 };
 
 struct parsed_proto {

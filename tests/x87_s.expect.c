@@ -15,7 +15,7 @@ double sub_test()
   f_st[--f_stp & 7] = (float)(s32)sf.d[0];  // var_4 fild
   f_stp++;
   f_st[(f_stp + 5) & 7] /= f_st[f_stp & 7];  f_stp++;
-  f_st[(f_stp + 1) & 7] = f_st[(f_stp + 1) & 7] * log2f(f_st[f_stp & 7]); f_stp++;
+  f_st[(f_stp + 1) & 7] = f_st[(f_stp + 1) & 7] * log2f(f_st[f_stp & 7]); f_stp++;  // fyl2x
   f_st[(f_stp + 2) & 7] -= f_st[f_stp & 7];  f_stp++;
   f_stp++;
   { float t = f_st[f_stp & 7]; f_st[f_stp & 7] = f_st[(f_stp + 6) & 7]; f_st[(f_stp + 6) & 7] = t; }  // fxch
