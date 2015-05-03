@@ -44,3 +44,7 @@ static inline BOOL PtInRect_sa(LPCRECT r, int x, int y)
   POINT p = { x, y };
   return PtInRect(r, p);
 }
+
+#define do_skip_code_abort() \
+  printf("%s:%d: skip_code_abort\n", __FILE__, __LINE__); \
+  *(volatile int *)0 = 1

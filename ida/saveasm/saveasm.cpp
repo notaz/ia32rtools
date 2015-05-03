@@ -374,14 +374,18 @@ static void idaapi run(int /*arg*/)
 
           if (cmd.Operands[o].type == o_mem) {
             tmp_ea = cmd.Operands[o].addr;
-            flags_t tmp_ea_flags = get_flags_novalue(tmp_ea);
-            // ..but base float is ok..
-            int is_flt = isDwrd(tmp_ea_flags) || isFloat(tmp_ea_flags);
-            if (!is_flt && !isUnknown(tmp_ea_flags))
+            flags_t tmp_flg = get_flags_novalue(tmp_ea);
+            buf[0] = 0;
+            if (isDouble(tmp_flg))
             {
-              buf[0] = 0;
               get_name(ea, tmp_ea, buf, sizeof(buf));
-              msg("%x: undefining %x '%s'\n", ea, tmp_ea, buf);
+              msg("%x: converting dbl %x '%s'\n", ea, tmp_ea, buf);
+              doQwrd(tmp_ea, 8);
+            }
+            if (isOwrd(tmp_flg) || isYwrd(tmp_flg) || isTbyt(tmp_flg))
+            {
+              get_name(ea, tmp_ea, buf, sizeof(buf));
+              msg("%x: undefining lrg %x '%s'\n", ea, tmp_ea, buf);
               do_unknown(tmp_ea, DOUNK_EXPAND);
             }
           }
@@ -452,8 +456,12 @@ static void idaapi run(int /*arg*/)
       }
 
       // IDA vs masm float/mmx/xmm type incompatibility
-      if (isDouble(ea_flags) || isTbyt(ea_flags)
-       || isPackReal(ea_flags))
+      if (isDouble(ea_flags))
+      {
+        msg("%x: converting double\n", ea);
+        doQwrd(ea, 8);
+      }
+      else if (isTbyt(ea_flags) || isPackReal(ea_flags))
       {
         do_undef = 1;
       }

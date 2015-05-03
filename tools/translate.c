@@ -157,6 +157,7 @@ enum op_op {
   OPP_ALLSHR,
   OPP_FTOL,
   OPP_CIPOW,
+  OPP_ABORT,
   // undefined
   OP_UD2,
 };
@@ -620,6 +621,9 @@ static int guess_lmod_from_name(struct parsed_opr *opr)
 static int guess_lmod_from_c_type(enum opr_lenmod *lmod,
   const struct parsed_type *c_type)
 {
+  static const char *qword_types[] = {
+    "uint64_t", "int64_t", "__int64",
+  };
   static const char *dword_types[] = {
     "uint32_t", "int", "_DWORD", "UINT_PTR", "DWORD",
     "WPARAM", "LPARAM", "UINT", "__int32",
@@ -664,6 +668,13 @@ static int guess_lmod_from_c_type(enum opr_lenmod *lmod,
   for (i = 0; i < ARRAY_SIZE(byte_types); i++) {
     if (IS(n, byte_types[i])) {
       *lmod = OPLM_BYTE;
+      return 1;
+    }
+  }
+
+  for (i = 0; i < ARRAY_SIZE(qword_types); i++) {
+    if (IS(n, qword_types[i])) {
+      *lmod = OPLM_QWORD;
       return 1;
     }
   }
@@ -2310,7 +2321,7 @@ static char *out_src_opr_float(char *buf, size_t buf_size,
       break;
     }
     out_src_opr(tmp, sizeof(tmp), po, popr, "", 1);
-    snprintf(buf, buf_size, "*((%s *)%s)", cast, tmp);
+    snprintf(buf, buf_size, "*(%s *)(%s)", cast, tmp);
     break;
 
   default:
@@ -5586,6 +5597,8 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
   reg_use_pass(0, opcnt, cbits, regmask_init, &regmask,
     0, &regmask_save, &regmask_init, regmask_arg);
 
+  need_float_stack = !!(regmask & mxST7_2);
+
   // pass7:
   // - find flag set ops for their users
   // - do unresolved calls
@@ -5793,10 +5806,13 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
     // this might need it's own pass...
     if (po->op != OP_FST && po->p_argnum > 0)
       save_arg_vars[po->p_arggrp] |= 1 << (po->p_argnum - 1);
+
+    // correct for "full stack" mode late enable
+    if ((po->flags & (OPF_PPUSH|OPF_FPOP)) && need_float_stack)
+      po->flags |= OPF_FSHIFT;
   }
 
   float_type = need_double ? "double" : "float";
-  need_float_stack = !!(regmask & mxST7_2);
   float_st0 = need_float_stack ? "f_st[f_stp & 7]" : "f_st0";
   float_st1 = need_float_stack ? "f_st[(f_stp + 1) & 7]" : "f_st1";
 
@@ -7446,9 +7462,13 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
         strcat(g_comment, " CIpow");
         break;
 
+      case OPP_ABORT:
+        fprintf(fout, "  do_skip_code_abort();");
+        break;
+
       // mmx
       case OP_EMMS:
-        strcpy(g_comment, " (emms)");
+        fprintf(fout, "  do_emms();");
         break;
 
       default:
@@ -8566,7 +8586,8 @@ int main(int argc, char *argv[])
   char *sctproto = NULL;
   int in_func = 0;
   int pending_endp = 0;
-  int skip_func = 0;
+  int skip_code = 0;
+  int skip_code_end = 0;
   int skip_warned = 0;
   int eq_alloc;
   int verbose = 0;
@@ -8632,6 +8653,8 @@ int main(int argc, char *argv[])
   memset(words, 0, sizeof(words));
 
   for (; arg < argc; arg++) {
+    int skip_func = 0;
+
     frlist = fopen(argv[arg], "r");
     my_assert_not(frlist, NULL);
 
@@ -8663,7 +8686,6 @@ int main(int argc, char *argv[])
       }
       rlist[rlist_len++] = strdup(words[0]);
     }
-    skip_func = 0;
 
     fclose(frlist);
     frlist = NULL;
@@ -8846,7 +8868,12 @@ parse_words:
     if (*p != 0 && *p != ';')
       aerr("too many words\n");
 
-    // alow asm patches in comments
+    if (skip_code_end) {
+      skip_code_end = 0;
+      skip_code = 0;
+    }
+
+    // allow asm patches in comments
     if (*p == ';') {
       if (IS_START(p, "; sctpatch:")) {
         p = sskip(p + 11);
@@ -8861,6 +8888,20 @@ parse_words:
         end = 1;
         if (!pending_endp)
           break;
+      }
+      else if (IS_START(p, "; sctskip_start")) {
+        if (in_func && !g_skip_func) {
+          if (!skip_code) {
+            ops[pi].op = OPP_ABORT;
+            ops[pi].asmln = asmln;
+            pi++;
+          }
+          skip_code = 1;
+        }
+      }
+      else if (IS_START(p, "; sctskip_end")) {
+        if (skip_code)
+          skip_code_end = 1;
       }
     }
 
@@ -9001,6 +9042,8 @@ do_pending_endp:
       if (!IS(g_func, words[0]))
         aerr("endp '%s' while in_func '%s'?\n",
           words[0], g_func);
+      if (skip_code)
+        aerr("endp '%s' while skipping code\n", words[0]);
 
       if ((g_ida_func_attr & IDAFA_THUNK) && pi == 1
         && ops[0].op == OP_JMP && ops[0].operand[0].had_ds)
@@ -9068,7 +9111,7 @@ do_pending_endp:
       continue;
     }
 
-    if (!in_func || g_skip_func) {
+    if (!in_func || g_skip_func || skip_code) {
       if (!skip_warned && !g_skip_func && g_labels[pi] != NULL) {
         if (verbose)
           anote("skipping from '%s'\n", g_labels[pi]);

@@ -195,7 +195,7 @@ static char *escape_string(char *s)
 
   for (; *s != 0; s++) {
     if (*s == '"') {
-      strcpy(t, "\\22");
+      strcpy(t, "\\x22");
       t += strlen(t);
       continue;
     }

@@ -6,7 +6,7 @@ double sub_test()
 
   sf.d[0] = 4;  // var_4
   f_st[--f_stp & 7] = (float)(s32)sf.d[0];  // var_4 fild
-  f_st[--f_stp & 7] = *((float *)(u32)&sf.d[0]);  // var_4 fld
+  f_st[--f_stp & 7] = *(float *)((u32)&sf.d[0]);  // var_4 fld
   f_st[--f_stp & 7] = (float)(s32)sf.d[0];  // var_4 fild
   f_st[--f_stp & 7] = 1.0;
   f_st[--f_stp & 7] = (float)(s32)sf.d[0];  // var_4 fild
@@ -22,7 +22,7 @@ double sub_test()
   f_st[f_stp & 7] = -f_st[f_stp & 7];
   f_st[(f_stp + 1) & 7] = atanf(f_st[(f_stp + 1) & 7] / f_st[f_stp & 7]); f_stp++;
   sf.d[0] = (s32)f_st[f_stp & 7];  // var_4 fist
-  *((float *)(u32)&sf.d[0]) = f_st[f_stp & 7];  f_stp++;  // var_4 fst
+  *(float *)((u32)&sf.d[0]) = f_st[f_stp & 7];  f_stp++;  // var_4 fst
   return f_st[f_stp & 7];
 }
 
