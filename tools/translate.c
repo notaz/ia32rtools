@@ -1735,14 +1735,12 @@ static struct parsed_equ *equ_find(struct parsed_op *po, const char *name,
   *extra_offs = 0;
   namelen = strlen(name);
 
-  p = strchr(name, '+');
+  p = strpbrk(name, "+-");
   if (p != NULL) {
     namelen = p - name;
     if (namelen <= 0)
       ferr(po, "equ parse failed for '%s'\n", name);
 
-    if (IS_START(p, "0x"))
-      p += 2;
     *extra_offs = strtol(p, &endp, 16);
     if (*endp != 0)
       ferr(po, "equ parse failed for '%s'\n", name);
@@ -1867,7 +1865,6 @@ static int stack_frame_access(struct parsed_op *po,
   int offset = 0;
   int retval = -1;
   int sf_ofs;
-  int lim;
 
   if (po->flags & OPF_EBP_S)
     ferr(po, "stack_frame_access while ebp is scratch\n");
@@ -1998,8 +1995,7 @@ static int stack_frame_access(struct parsed_op *po,
     g_stack_frame_used = 1;
 
     sf_ofs = g_stack_fsz + offset;
-    lim = (ofs_reg[0] != 0) ? -4 : 0;
-    if (offset > 0 || sf_ofs < lim)
+    if (ofs_reg[0] == 0 && (offset > 0 || sf_ofs < 0))
       ferr(po, "bp_stack offset %d/%d\n", offset, g_stack_fsz);
 
     if (is_lea)
