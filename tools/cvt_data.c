@@ -195,7 +195,7 @@ static char *escape_string(char *s)
 
   for (; *s != 0; s++) {
     if (*s == '"') {
-      strcpy(t, "\\x22");
+      strcpy(t, "\\\"");
       t += strlen(t);
       continue;
     }
@@ -206,7 +206,9 @@ static char *escape_string(char *s)
     }
     *t++ = *s;
   }
-  *t = *s;
+  *t++ = *s;
+  if (t - buf > sizeof(buf))
+    aerr("string is too long\n");
   return strcpy(s, buf);
 }
 
@@ -691,7 +693,9 @@ int main(int argc, char *argv[])
             val = parse_number(words[w]);
             if (val & ~0xff)
               aerr("bad string trailing byte?\n");
-            fprintf(fout, "\\x%02lx", val);
+            // unfortunately \xHH is unusable - gas interprets
+            // things like \x27b as 0x7b, so have to use octal here
+            fprintf(fout, "\\%03lo", val);
           }
         }
         fprintf(fout, "\"");
