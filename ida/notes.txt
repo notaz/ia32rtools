@@ -6,4 +6,6 @@ manual adjust:
      _[456][0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F]\+
 - get rid of function chunks where possible (they're usually tailcalls)
 - search for 'dword_xx+N', make byte/word, also word->byte
+     ptr [^\[ ].*\+[0-9A-F]
+     offset [^ ]*\+[0-9A-F]
 - convert ds:0[eax*4] -> [eax*4+0] (h hotkey)

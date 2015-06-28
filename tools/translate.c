@@ -4,6 +4,15 @@
  *
  * This work is licensed under the terms of 3-clause BSD license.
  * See COPYING file in the top-level directory.
+ *
+ * recognized asm hint comments:
+ * sctattr - function attributes (see code)
+ * sctend  - force end of function/chunk
+ * sctpatch: <p> - replace current asm line with <p>
+ * sctproto: <p> - prototype of ref'd function or struct
+ * sctref  - variable is referenced, make global
+ * sctskip_start - start of skipped code chunk (inclusive)
+ * sctskip_end   - end of skipped code chunk (inclusive)
  */
 
 #define _GNU_SOURCE
@@ -7958,7 +7967,7 @@ static void gen_hdr(const char *funcn, int opcnt)
       // noreturn OS functions
       break;
     }
-    if (ops[i].op != OP_NOP)
+    if (ops[i].op != OP_NOP && ops[i].op != OPP_ABORT)
       ferr(&ops[i], "unreachable code\n");
   }
 
@@ -8286,10 +8295,14 @@ static int ida_xrefs_show_need(FILE *fasm, char *p,
   long pos;
 
   p = strrchr(p, ';');
-  if (p != NULL && *p == ';' && IS_START(p + 2, "DATA XREF: ")) {
-    p += 13;
-    if (is_xref_needed(p, rlist, rlist_len))
+  if (p != NULL && *p == ';') {
+    if (IS_START(p + 2, "sctref"))
       return 1;
+    if (IS_START(p + 2, "DATA XREF: ")) {
+      p += 13;
+      if (is_xref_needed(p, rlist, rlist_len))
+        return 1;
+    }
   }
 
   pos = ftell(fasm);
@@ -8308,6 +8321,12 @@ static int ida_xrefs_show_need(FILE *fasm, char *p,
 
     p = strrchr(p, ';');
     p += 2;
+
+    if (IS_START(p, "sctref")) {
+      found_need = 1;
+      break;
+    }
+
     // it's printed once, but no harm to check again
     if (IS_START(p, "DATA XREF: "))
       p += 11;
@@ -8501,7 +8520,7 @@ static int cmp_chunks(const void *p1, const void *p2)
   return strcmp(c1->name, c2->name);
 }
 
-static void scan_ahead(FILE *fasm)
+static void scan_ahead_for_chunks(FILE *fasm)
 {
   char words[2][256];
   char line[256];
@@ -8842,7 +8861,7 @@ int main(int argc, char *argv[])
           if (addr > f_addr && !scanned_ahead) {
             //anote("scan_ahead caused by '%s', addr %lx\n",
             //  g_func, addr);
-            scan_ahead(fasm);
+            scan_ahead_for_chunks(fasm);
             scanned_ahead = 1;
             func_chunks_sorted = 0;
           }
