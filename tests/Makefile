@@ -1,5 +1,6 @@
 
-TESTS = reg_call1 reg_call2 reg_call3 reg_call_tail reg_save \
+TESTS = reg_call1 reg_call2 reg_call3 reg_call4 reg_call5 \
+	reg_call_tail reg_save \
 	varargs ops x87 x87_f x87_s deref
 
 all: $(addsuffix .ok,$(TESTS))

@@ -6955,7 +6955,7 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
               if (pp->arg[arg].type.is_retreg)
                 fprintf(fout, "&%s", pp->arg[arg].reg);
               else if (IS(pp->arg[arg].reg, "ebp")
-                    && !(po->flags & OPF_EBP_S))
+                    && g_bp_frame && !(po->flags & OPF_EBP_S))
               {
                 // rare special case
                 fprintf(fout, "%s(u32)&sf.b[sizeof(sf)]", cast);
@@ -7747,8 +7747,11 @@ static void gen_hdr_dep_pass(int i, int opcnt, unsigned char *cbits,
       po->regmask_dst |= 1 << xAX;
 
       dep = hg_fp_find_dep(fp, po->operand[0].name);
-      if (dep != NULL)
+      if (dep != NULL) {
         dep->regmask_live = regmask_save | regmask_dst;
+        if (g_bp_frame && !(po->flags & OPF_EBP_S))
+          dep->regmask_live |= 1 << xBP;
+      }
     }
     else if (po->op == OP_RET) {
       if (po->operand_cnt > 0) {
