@@ -2583,10 +2583,10 @@ static int scan_for_pop(int i, int opcnt, int magic, int reg,
         if (po->pp != NULL && po->pp->is_noreturn)
           seen_noreturn = 1;
         else
-          return -1;
+          goto out;
       }
       else
-        return -1; // deadend
+        goto out;
     }
 
     if (po->flags & (OPF_RMD|OPF_DONE|OPF_FARG))
@@ -2637,6 +2637,7 @@ static int scan_for_pop(int i, int opcnt, int magic, int reg,
     }
   }
 
+out:
   // for noreturn, assume msvc skipped stack cleanup
   return seen_noreturn ? 1 : -1;
 }
@@ -6704,10 +6705,11 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
           lmod_cast_s(po, po->operand[0].lmod), buf2);
         last_arith_dst = &po->operand[0];
         delayed_flag_op = NULL;
-        if (pfomask & (1 << PFO_C)) {
+        if (pfomask & PFOB_C) {
           fprintf(fout, "\n  cond_c = (%s != 0);", buf1);
-          pfomask &= ~(1 << PFO_C);
+          pfomask &= ~PFOB_C;
         }
+        output_std_flags(fout, po, &pfomask, buf1);
         break;
 
       case OP_IMUL:
