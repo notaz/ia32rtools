@@ -474,7 +474,7 @@ static int check_equiv(uint8_t *d_obj, uint8_t *d_exe, int maxlen)
 					break;
 
 			if ((jo == len && je != len) || (jo != len && je == len)) {
-				printf("invalid equiv_op #%ld\n", op - equiv_ops);
+				printf("invalid equiv_op #%td\n", op - equiv_ops);
 				return -1;
 			}
 			if (jo == len)

@@ -1,7 +1,3 @@
-#if __SIZEOF_LONG__ != 8
-#error fix ret/strtoul to do 64bit
-#endif
-
 static unsigned long parse_number(const char *number)
 {
   int len = strlen(number);
@@ -27,9 +23,16 @@ static unsigned long parse_number(const char *number)
   }
   if (bad)
     aerr("number parsing failed (%s)\n", number);
-  if (neg)
+#if __SIZEOF_LONG__ > 4
+  // if this happens, callers must be fixed too
+  if (ret > 0xfffffffful)
+    aerr("number too large? (%s)\n", number);
+#endif
+  if (neg) {
+    if (ret > 0x7fffffff)
+      aerr("too large negative? (%s)\n", number);
     ret = -ret;
+  }
   return ret;
 }
-
 
