@@ -10,6 +10,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
+#include <inttypes.h>
 
 #include "my_assert.h"
 #include "my_str.h"
@@ -388,6 +390,7 @@ int main(int argc, char *argv[])
   char last_sym[32];
   unsigned long val;
   unsigned long cnt;
+  uint64_t val64;
   const char *sym;
   enum dx_type type;
   char **pub_syms;
@@ -562,7 +565,7 @@ int main(int argc, char *argv[])
         if (header_mode)
           continue;
 
-        val = parse_number(words[1]);
+        val = parse_number(words[1], 0);
         fprintf(fout, "\t\t  .align %d", align_value(val));
         goto fin;
       }
@@ -690,7 +693,7 @@ int main(int argc, char *argv[])
             fprintf(fout, "%s", escape_string(word));
           }
           else {
-            val = parse_number(words[w]);
+            val = parse_number(words[w], 0);
             if (val & ~0xff)
               aerr("bad string trailing byte?\n");
             // unfortunately \xHH is unusable - gas interprets
@@ -704,7 +707,7 @@ int main(int argc, char *argv[])
 
       if (w == wordc - 2) {
         if (IS_START(words[w + 1], "dup(")) {
-          cnt = parse_number(words[w]);
+          cnt = parse_number(words[w], 0);
           p = words[w + 1] + 4;
           p2 = strchr(p, ')');
           if (p2 == NULL)
@@ -714,7 +717,7 @@ int main(int argc, char *argv[])
 
           val = 0;
           if (!IS(word, "?"))
-            val = parse_number(word);
+            val = parse_number(word, 0);
 
           fprintf(fout, ".fill 0x%02lx,%d,0x%02lx",
             cnt, type_size(type), val);
@@ -800,11 +803,11 @@ int main(int argc, char *argv[])
           }
         }
         else {
-          val = parse_number(words[w]);
-          if (val < 10)
-            fprintf(fout, "%ld", val);
+          val64 = parse_number(words[w], 1);
+          if (val64 < 10)
+            fprintf(fout, "%d", (int)val64);
           else
-            fprintf(fout, "0x%lx", val);
+            fprintf(fout, "0x%" PRIx64, val64);
         }
 
         first = 0;

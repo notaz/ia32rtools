@@ -19,6 +19,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
 
 #include "my_assert.h"
 #include "my_str.h"
@@ -491,7 +492,7 @@ static int parse_indmode(char *name, int *regmask, int need_c_cvt)
     }
 
     if ('0' <= w[0] && w[0] <= '9') {
-      number = parse_number(w);
+      number = parse_number(w, 0);
       printf_number(d, sizeof(cvtbuf) - (d - cvtbuf), number);
       continue;
     }
@@ -587,8 +588,9 @@ static const char *parse_stack_el(const char *name, char *extra_reg,
     if (len < sizeof(buf) - 1) {
       strncpy(buf, s, len);
       buf[len] = 0;
+      errno = 0;
       val = strtol(buf, &endp, 16);
-      if (val == 0 || *endp != 0) {
+      if (val == 0 || *endp != 0 || errno != 0) {
         aerr("%s num parse fail for '%s'\n", __func__, buf);
         return NULL;
       }
@@ -874,7 +876,7 @@ static int parse_operand(struct parsed_opr *opr,
   else if (('0' <= words[w][0] && words[w][0] <= '9')
     || words[w][0] == '-')
   {
-    number = parse_number(words[w]);
+    number = parse_number(words[w], 0);
     opr->type = OPT_CONST;
     opr->val = number;
     printf_number(opr->name, sizeof(opr->name), number);
@@ -1750,8 +1752,9 @@ static struct parsed_equ *equ_find(struct parsed_op *po, const char *name,
     if (namelen <= 0)
       ferr(po, "equ parse failed for '%s'\n", name);
 
+    errno = 0;
     *extra_offs = strtol(p, &endp, 16);
-    if (*endp != 0)
+    if (*endp != 0 || errno != 0)
       ferr(po, "equ parse failed for '%s'\n", name);
   }
 
@@ -1795,10 +1798,11 @@ static void parse_stack_access(struct parsed_op *po,
     p = name + 4;
     if (IS_START(p, "0x"))
       p += 2;
+    errno = 0;
     offset = strtoul(p, &endp, 16);
     if (name[3] == '-')
       offset = -offset;
-    if (*endp != 0)
+    if (*endp != 0 || errno != 0)
       ferr(po, "ebp- parse of '%s' failed\n", name);
   }
   else {
@@ -1843,8 +1847,9 @@ static int parse_stack_esp_offset(struct parsed_op *po,
     // just plain offset?
     if (!IS_START(name, "esp+"))
       return -1;
+    errno = 0;
     offset = strtol(name + 4, &endp, 0);
-    if (endp == NULL || *endp != 0)
+    if (endp == NULL || *endp != 0 || errno != 0)
       return -1;
     *offset_out = offset;
     return 0;
@@ -8991,7 +8996,7 @@ do_pending_endp:
           if (pd->type == OPT_OFFSET)
             pd->d[pd->count].u.label = strdup(words[i]);
           else
-            pd->d[pd->count].u.val = parse_number(words[i]);
+            pd->d[pd->count].u.val = parse_number(words[i], 0);
           pd->d[pd->count].bt_i = -1;
           pd->count++;
         }
@@ -9170,7 +9175,7 @@ do_pending_endp:
       else
         aerr("bad lmod: '%s'\n", words[2]);
 
-      g_eqs[g_eqcnt].offset = parse_number(words[4]);
+      g_eqs[g_eqcnt].offset = parse_number(words[4], 0);
       g_eqcnt++;
       continue;
     }
