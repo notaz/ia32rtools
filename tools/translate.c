@@ -2694,8 +2694,9 @@ static int scan_for_rsave_pop_reg(int i, int magic, int reg, int set_flags)
       return -1;
   }
 
-  // nothing interesting on this path
-  return 0;
+  // nothing interesting on this path,
+  // still return ret for something recursive calls could find
+  return ret;
 }
 
 static void find_reachable_exits(int i, int opcnt, int magic,
@@ -2746,7 +2747,8 @@ static int scan_for_pop_ret(int i, int opcnt, int reg, int set_flags)
 {
   static int exits[MAX_EXITS];
   static int exit_count;
-  int j, ret;
+  int found = 0;
+  int e, j, ret;
 
   if (!set_flags) {
     exit_count = 0;
@@ -2756,13 +2758,23 @@ static int scan_for_pop_ret(int i, int opcnt, int reg, int set_flags)
   }
 
   for (j = 0; j < exit_count; j++) {
-    ret = scan_for_rsave_pop_reg(exits[j], i + opcnt * 16 + set_flags,
+    e = exits[j];
+    ret = scan_for_rsave_pop_reg(e, i + opcnt * 16 + set_flags,
             reg, set_flags);
-    if (ret == -1)
-      return -1;
+    if (ret != -1) {
+      found |= ret;
+      continue;
+    }
+    if (ops[e].op == OP_CALL && ops[e].pp != NULL
+      && ops[e].pp->is_noreturn)
+    {
+      // assume stack cleanup was skipped
+      continue;
+    }
+    return -1;
   }
 
-  return 1;
+  return found;
 }
 
 // scan for one or more pop of push <const>
@@ -3684,6 +3696,7 @@ static void resolve_branches_parse_calls(int opcnt)
   struct parsed_data *pd;
   struct parsed_op *po;
   const char *tmpname;
+  enum op_op prev_op;
   int i, l;
   int ret;
 
@@ -3747,8 +3760,10 @@ static void resolve_branches_parse_calls(int opcnt)
       if (pp != NULL) {
         if (pp->is_fptr)
           check_func_pp(po, pp, "fptr var call");
-        if (pp->is_noreturn)
+        if (pp->is_noreturn) {
           po->flags |= OPF_TAIL;
+          po->flags &= ~OPF_ATAIL; // most likely...
+        }
       }
       po->pp = pp;
       continue;
@@ -3793,8 +3808,14 @@ static void resolve_branches_parse_calls(int opcnt)
 tailcall:
     po->op = OP_CALL;
     po->flags |= OPF_TAIL;
-    if (i > 0 && ops[i - 1].op == OP_POP)
+    prev_op = i > 0 ? ops[i - 1].op : OP_UD2;
+    if (prev_op == OP_POP)
       po->flags |= OPF_ATAIL;
+    if (g_stack_fsz + g_bp_frame == 0 && prev_op != OP_PUSH
+      && (g_func_pp == NULL || g_func_pp->argc_stack > 0))
+    {
+      po->flags |= OPF_ATAIL;
+    }
     i--; // reprocess
   }
 }
@@ -4022,13 +4043,22 @@ static void scan_prologue_epilogue(int opcnt)
             l += ops[j].operand[1].val / 4 - 1;
           }
           else
-            ferr(&ops[j], "'pop ecx' expected\n");
+            break;
 
           ops[j].flags |= OPF_RMD | OPF_DONE | OPF_NOREGS;
           j--;
         }
-        if (l != ecx_push)
+        if (l != ecx_push) {
+          if (i < opcnt && ops[i].op == OP_CALL
+            && ops[i].pp != NULL && ops[i].pp->is_noreturn)
+          {
+            // noreturn tailcall with no epilogue
+            i++;
+            found = 1;
+            continue;
+          }
           ferr(&ops[j], "epilogue scan failed\n");
+        }
 
         found = 1;
       }
@@ -4039,11 +4069,12 @@ static void scan_prologue_epilogue(int opcnt)
             || ops[j].operand[1].type != OPT_CONST
             || ops[j].operand[1].val != g_stack_fsz)
         {
-          if (ops[i].op == OP_CALL && ops[i].pp != NULL
-            && ops[i].pp->is_noreturn)
+          if (i < opcnt && ops[i].op == OP_CALL
+            && ops[i].pp != NULL && ops[i].pp->is_noreturn)
           {
             // noreturn tailcall with no epilogue
             i++;
+            found = 1;
             continue;
           }
           ferr(&ops[j], "'add esp' expected\n");
@@ -4642,6 +4673,9 @@ static struct parsed_proto *process_call(int i, int opcnt)
         ferr(po, "too many args for '%s'\n", tmpname);
     }
     if (pp->argc_stack > adj / 4) {
+      if (pp->is_noreturn)
+        // assume no stack adjust was emited
+        goto out;
       fnote(po, "(this call)\n");
       ferr(&ops[ret], "stack tracking failed for '%s': %x %x\n",
         tmpname, pp->argc_stack * 4, adj);
@@ -4654,6 +4688,7 @@ static struct parsed_proto *process_call(int i, int opcnt)
     ferr(po, "missing esp_adjust for vararg func '%s'\n",
       pp->name);
 
+out:
   return pp;
 }
 
@@ -4904,8 +4939,8 @@ static int collect_call_args_r(struct parsed_op *po, int i,
 
       pp_tmp = ops[j].pp;
       if (pp_tmp == NULL)
-        ferr(po, "arg collect hit unparsed call '%s'\n",
-          ops[j].operand[0].name);
+        ferr(po, "arg collect %d/%d hit unparsed call '%s'\n",
+          arg, pp->argc, ops[j].operand[0].name);
       if (may_reuse && pp_tmp->argc_stack > 0)
         ferr(po, "arg collect %d/%d hit '%s' with %d stack args\n",
           arg, pp->argc, opr_name(&ops[j], 0), pp_tmp->argc_stack);
@@ -6920,10 +6955,13 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
           pp->has_structarg ? "_sa" : "");
 
         if (po->flags & OPF_ATAIL) {
-          if (pp->argc_stack != g_func_pp->argc_stack
-            || (pp->argc_stack > 0
-                && pp->is_stdcall != g_func_pp->is_stdcall))
-            ferr(po, "incompatible tailcall\n");
+          int check_compat =
+            g_func_pp->is_stdcall && g_func_pp->argc_stack > 0;
+          check_compat |= pp->argc_stack > 0;
+          if (check_compat
+           && (pp->argc_stack != g_func_pp->argc_stack
+               || pp->is_stdcall != g_func_pp->is_stdcall))
+            ferr(po, "incompatible arg-reuse tailcall\n");
           if (g_func_pp->has_retreg)
             ferr(po, "TODO: retreg+tailcall\n");
 
