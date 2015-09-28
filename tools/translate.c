@@ -4066,8 +4066,7 @@ static void scan_prologue_epilogue(int opcnt)
       if (esp_sub) {
         if (ops[j].op != OP_ADD
             || !IS(opr_name(&ops[j], 0), "esp")
-            || ops[j].operand[1].type != OPT_CONST
-            || ops[j].operand[1].val != g_stack_fsz)
+            || ops[j].operand[1].type != OPT_CONST)
         {
           if (i < opcnt && ops[i].op == OP_CALL
             && ops[i].pp != NULL && ops[i].pp->is_noreturn)
@@ -4080,8 +4079,12 @@ static void scan_prologue_epilogue(int opcnt)
           ferr(&ops[j], "'add esp' expected\n");
         }
 
-        ops[j].flags |= OPF_RMD | OPF_DONE | OPF_NOREGS;
-        ops[j].operand[1].val = 0; // hack for stack arg scanner
+        if (ops[j].operand[1].val < g_stack_fsz)
+          ferr(&ops[j], "esp adj is too low (need %d)\n", g_stack_fsz);
+
+        ops[j].operand[1].val -= g_stack_fsz; // for stack arg scanner
+        if (ops[j].operand[1].val == 0)
+          ops[j].flags |= OPF_RMD | OPF_DONE | OPF_NOREGS;
         found = 1;
       }
 
@@ -4719,8 +4722,10 @@ static int collect_call_args_no_push(int i, struct parsed_proto *pp,
       ret = parse_stack_esp_offset(po, po->operand[0].name, &offset);
       if (ret != 0)
         continue;
-      if (offset < 0 || offset >= pp->argc_stack * 4 || (offset & 3))
-        ferr(po, "bad offset %d (%d args)\n", offset, pp->argc_stack);
+      if (offset < 0 || offset >= pp->argc_stack * 4 || (offset & 3)) {
+        //ferr(po, "offset %d, %d args\n", offset, pp->argc_stack);
+        continue;
+      }
 
       arg = base_arg + offset / 4;
       po->p_argnext = -1;
