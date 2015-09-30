@@ -17,10 +17,6 @@
 #include "my_str.h"
 #include "common.h"
 
-#define ARRAY_SIZE(x) (sizeof(x) / sizeof(x[0]))
-#define IS(w, y) !strcmp(w, y)
-#define IS_START(w, y) !strncmp(w, y, strlen(y))
-
 #include "protoparse.h"
 
 static const char *asmfn;

@@ -12,6 +12,7 @@
 
 #include "my_assert.h"
 #include "my_str.h"
+#include "common.h"
 
 struct sl_item {
 	char *name;
@@ -109,7 +110,6 @@ const char *sym_use(const struct sl_item *sym, int is_rm)
 	return buf;
 }
 
-#define IS(w, y) !strcasecmp(w, y)
 #define IS_OR2(w, x, y) (IS(w, x) || IS(w, y))
 #define IS_OR3(w, x, y, z) (IS(w, x) || IS(w, y) || IS(w, z))
 

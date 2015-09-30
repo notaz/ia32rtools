@@ -12,10 +12,7 @@
 
 #include "my_assert.h"
 #include "my_str.h"
-
-#define ARRAY_SIZE(x) (sizeof(x) / sizeof(x[0]))
-#define IS(w, y) !strcmp(w, y)
-#define IS_START(w, y) !strncmp(w, y, strlen(y))
+#include "common.h"
 
 #include "protoparse.h"
 

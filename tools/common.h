@@ -1,5 +1,10 @@
+
+#define ARRAY_SIZE(x) (sizeof(x) / sizeof(x[0]))
+#define IS(w, y) !strcmp(w, y)
+#define IS_START(w, y) !strncmp(w, y, strlen(y))
+
 // read a line, truncating it if it doesn't fit
-static char *my_fgets(char *s, size_t size, FILE *stream)
+static inline char *my_fgets(char *s, size_t size, FILE *stream)
 {
   char *ret, *ret2;
   char buf[64];
