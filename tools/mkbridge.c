@@ -183,7 +183,21 @@ static void out_fromasm_x86(FILE *f, const char *sym,
 	  pp->is_fastcall ? "__fastcall" :
 	  (pp->is_stdcall ? "__stdcall" : "__cdecl"));
 	if (ret64)
-		 fprintf(f, " ret64");
+		fprintf(f, " ret64");
+	if (!pp->is_fastcall && pp->argc_reg != 0)
+		fprintf(f, " +reg");
+
+	if (pp->is_stdcall && !pp->is_fastcall && pp->argc_reg != 0
+	    && !IS_START(sym, "sub_") && !IS_START(sym, "f_"))
+	{
+		// alias for possible .def export
+		char sym2[256];
+
+		snprintf(sym2, sizeof(sym2), "_%s@%d",
+			 sym, pp->argc * 4);
+		fprintf(f, "\n.global %s # for .def\n", sym2);
+		fprintf(f, "%s:", sym2);
+	}
 	fprintf(f, "\n.global %s\n", sym);
 	fprintf(f, "%s:\n", sym);
 
@@ -316,7 +330,7 @@ int main(int argc, char *argv[])
 	my_assert_not(fout, NULL);
 
 	fprintf(fout, ".text\n\n");
-	fprintf(fout, "# to asm\n\n");
+	fprintf(fout, "# C -> asm\n\n");
 
 	while (fgets(line, sizeof(line), fsyms_to))
 	{
@@ -337,7 +351,7 @@ int main(int argc, char *argv[])
 		out_toasm_x86(fout, sym_noat, pp);
 	}
 
-	fprintf(fout, "# from asm\n\n");
+	fprintf(fout, "# asm -> C\n\n");
 
 	while (fgets(line, sizeof(line), fsyms_from))
 	{
