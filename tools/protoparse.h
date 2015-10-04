@@ -15,6 +15,7 @@ struct parsed_type {
 	unsigned int is_struct:1; // split for args
 	unsigned int is_retreg:1; // register to return to caller
 	unsigned int is_va_list:1;
+	unsigned int is_64bit:1;
 };
 
 struct parsed_proto_arg {
@@ -670,11 +671,13 @@ static int parse_protostr(char *protostr, struct parsed_proto *pp)
 		if (!arg->type.is_ptr && (strstr(arg->type.name, "int64")
 		      || IS(arg->type.name, "double")))
 		{
+			arg->type.is_64bit = 1;
 			// hack..
-			free(arg->type.name);
-			arg->type.name = strdup("int");
 			pp_copy_arg(&pp->arg[xarg], arg);
+			arg = &pp->arg[xarg];
 			xarg++;
+			free(arg->type.name);
+			arg->type.name = strdup("dummy");
 		}
 
 		ret = check_struct_arg(arg);

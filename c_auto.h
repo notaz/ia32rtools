@@ -45,6 +45,16 @@ static inline BOOL PtInRect_sa(LPCRECT r, int x, int y)
   return PtInRect(r, p);
 }
 
+static inline int do_parity(unsigned int v)
+{
+  v ^= v >> 4;
+  v ^= v >> 2;
+  v ^= v >> 1;
+  return (v ^ 1) & 1;
+}
+
 #define do_skip_code_abort() \
   printf("%s:%d: skip_code_abort\n", __FILE__, __LINE__); \
   *(volatile int *)0 = 1
+
+// vim:ts=2:sw=2:expandtab

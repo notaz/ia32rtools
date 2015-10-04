@@ -69,6 +69,7 @@ enum op_flags {
   OPF_FPUSH  = (1 << 22), /* pushes x87 stack */
   OPF_FPOP   = (1 << 23), /* pops x87 stack */
   OPF_FSHIFT = (1 << 24), /* x87 stack shift is actually needed */
+  OPF_FINT   = (1 << 25), /* integer float op arg */
 };
 
 enum op_op {
@@ -1071,14 +1072,14 @@ static const struct {
   { "setnle", OP_SCC,  1, 1, OPF_DATA|OPF_CC, PFO_LE, 1 },
   // x87
   { "fld",    OP_FLD,    1, 1, OPF_FPUSH },
-  { "fild",   OP_FILD,   1, 1, OPF_FPUSH },
+  { "fild",   OP_FILD,   1, 1, OPF_FPUSH|OPF_FINT },
   { "fld1",   OP_FLDc,   0, 0, OPF_FPUSH },
   { "fldln2", OP_FLDc,   0, 0, OPF_FPUSH },
   { "fldz",   OP_FLDc,   0, 0, OPF_FPUSH },
   { "fst",    OP_FST,    1, 1, 0 },
   { "fstp",   OP_FST,    1, 1, OPF_FPOP },
-  { "fist",   OP_FIST,   1, 1, 0 },
-  { "fistp",  OP_FIST,   1, 1, OPF_FPOP },
+  { "fist",   OP_FIST,   1, 1, OPF_FINT },
+  { "fistp",  OP_FIST,   1, 1, OPF_FPOP|OPF_FINT },
   { "fadd",   OP_FADD,   0, 2, 0 },
   { "faddp",  OP_FADD,   0, 2, OPF_FPOP },
   { "fdiv",   OP_FDIV,   0, 2, 0 },
@@ -1091,12 +1092,12 @@ static const struct {
   { "fdivrp", OP_FDIVR,  0, 2, OPF_FPOP },
   { "fsubr",  OP_FSUBR,  0, 2, 0 },
   { "fsubrp", OP_FSUBR,  0, 2, OPF_FPOP },
-  { "fiadd",  OP_FIADD,  1, 1, 0 },
-  { "fidiv",  OP_FIDIV,  1, 1, 0 },
-  { "fimul",  OP_FIMUL,  1, 1, 0 },
-  { "fisub",  OP_FISUB,  1, 1, 0 },
-  { "fidivr", OP_FIDIVR, 1, 1, 0 },
-  { "fisubr", OP_FISUBR, 1, 1, 0 },
+  { "fiadd",  OP_FIADD,  1, 1, OPF_FINT },
+  { "fidiv",  OP_FIDIV,  1, 1, OPF_FINT },
+  { "fimul",  OP_FIMUL,  1, 1, OPF_FINT },
+  { "fisub",  OP_FISUB,  1, 1, OPF_FINT },
+  { "fidivr", OP_FIDIVR, 1, 1, OPF_FINT },
+  { "fisubr", OP_FISUBR, 1, 1, OPF_FINT },
   { "fcom",   OP_FCOM,   0, 1, 0 },
   { "fcomp",  OP_FCOM,   0, 1, OPF_FPOP },
   { "fnstsw", OP_FNSTSW, 1, 1, OPF_DATA },
@@ -1116,6 +1117,7 @@ static const struct {
   { "_allshr",OPP_ALLSHR },
   { "_ftol",  OPP_FTOL },
   { "_CIpow", OPP_CIPOW },
+  { "abort",  OPP_ABORT },
   // must be last
   { "ud2",    OP_UD2 },
 };
@@ -1981,6 +1983,14 @@ static int stack_frame_access(struct parsed_op *po,
       }
       break;
 
+    case OPLM_QWORD:
+      ferr_assert(po, !(offset & 7));
+      if (cast[0])
+        prefix = cast;
+      snprintf(buf, buf_size, "%s%sa%d",
+        prefix, is_lea ? "&" : "", i + 1);
+      break;
+
     default:
       ferr(po, "bp_arg bad lmod: %d\n", popr->lmod);
     }
@@ -2054,10 +2064,9 @@ static int stack_frame_access(struct parsed_op *po,
       ferr_assert(po, !(sf_ofs & 7));
       ferr_assert(po, ofs_reg[0] == 0);
       // only used for x87 int64/float, float sets is_lea
-      if (is_lea)
-        snprintf(buf, buf_size, "%ssf.q[%d]", prefix, sf_ofs / 8);
-      else
-        snprintf(buf, buf_size, "*(s64 *)&sf.q[%d]", sf_ofs / 8);
+      if (!is_lea && (po->flags & OPF_FINT))
+        prefix = "*(s64 *)&";
+      snprintf(buf, buf_size, "%ssf.q[%d]", prefix, sf_ofs / 8);
       break;
 
     default:
@@ -2294,8 +2303,9 @@ static char *out_src_opr_u32(char *buf, size_t buf_size,
   return out_src_opr(buf, buf_size, po, popr, NULL, 0);
 }
 
-static char *out_src_opr_float(char *buf, size_t buf_size,
-  struct parsed_op *po, struct parsed_opr *popr, int need_float_stack)
+static char *out_opr_float(char *buf, size_t buf_size,
+  struct parsed_op *po, struct parsed_opr *popr, int is_src,
+  int need_float_stack)
 {
   const char *cast = NULL;
   char tmp[256];
@@ -2317,6 +2327,12 @@ static char *out_src_opr_float(char *buf, size_t buf_size,
     break;
 
   case OPT_REGMEM:
+    if (popr->lmod == OPLM_QWORD && is_stack_access(po, popr)) {
+      stack_frame_access(po, popr, buf, buf_size,
+        popr->name, "", is_src, 0);
+      break;
+    }
+    // fallthrough
   case OPT_LABEL:
   case OPT_OFFSET:
     switch (popr->lmod) {
@@ -2341,11 +2357,16 @@ static char *out_src_opr_float(char *buf, size_t buf_size,
   return buf;
 }
 
+static char *out_src_opr_float(char *buf, size_t buf_size,
+  struct parsed_op *po, struct parsed_opr *popr, int need_float_stack)
+{
+  return out_opr_float(buf, buf_size, po, popr, 1, need_float_stack);
+}
+
 static char *out_dst_opr_float(char *buf, size_t buf_size,
   struct parsed_op *po, struct parsed_opr *popr, int need_float_stack)
 {
-  // same?
-  return out_src_opr_float(buf, buf_size, po, popr, need_float_stack);
+  return out_opr_float(buf, buf_size, po, popr, 0, need_float_stack);
 }
 
 static void out_test_for_cc(char *buf, size_t buf_size,
@@ -2378,6 +2399,11 @@ static void out_test_for_cc(char *buf, size_t buf_size,
   case PFO_C: // CF=0
   case PFO_O: // OF=0
     snprintf(buf, buf_size, "(%d)", !!is_inv);
+    break;
+
+  case PFO_P: // PF==1
+    snprintf(buf, buf_size, "(%sdo_parity(%s))",
+      is_inv ? "!" : "", expr);
     break;
 
   default:
@@ -5455,6 +5481,9 @@ static void output_pp(FILE *fout, const struct parsed_proto *pp,
       if (!pp->is_fptr)
         fprintf(fout, " a%d", i + 1);
     }
+
+    if (pp->arg[i].type.is_64bit)
+      i++;
   }
   if (pp->is_vararg) {
     if (i > 0)
@@ -5499,6 +5528,7 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
   int label_pending = 0;
   int need_double = 0;
   int stack_align = 0;
+  int stack_fsz_adj = 0;
   int regmask_save = 0; // used regs saved/restored in this func
   int regmask_arg;      // regs from this function args (fastcall, etc)
   int regmask_ret;      // regs needed on ret
@@ -5536,6 +5566,20 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
   // pass2:
   // - handle ebp/esp frame, remove ops related to it
   scan_prologue_epilogue(opcnt, &stack_align);
+
+  // handle a case where sf size is unalignment, but is
+  // placed in a way that elements are still aligned
+  if (g_stack_fsz & 4) {
+    for (i = 0; i < g_eqcnt; i++) {
+      if (g_eqs[i].lmod != OPLM_QWORD)
+        continue;
+      if (!(g_eqs[i].offset & 4)) {
+        g_stack_fsz += 4;
+        stack_fsz_adj = 4;
+      }
+      break;
+    }
+  }
 
   // pass3:
   // - remove dead labels
@@ -5978,6 +6022,9 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
 
   // declare stack frame, va_arg
   if (g_stack_fsz) {
+    if (stack_fsz_adj)
+      fprintf(fout, "  // stack_fsz_adj %d\n", stack_fsz_adj);
+
     fprintf(fout, "  union { u32 d[%d];", (g_stack_fsz + 3) / 4);
     if (g_func_lmods & (1 << OPLM_WORD))
       fprintf(fout, " u16 w[%d];", (g_stack_fsz + 1) / 2);
@@ -5985,6 +6032,7 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
       fprintf(fout, " u8 b[%d];", g_stack_fsz);
     if (g_func_lmods & (1 << OPLM_QWORD))
       fprintf(fout, " double q[%d];", (g_stack_fsz + 7) / 8);
+
     if (stack_align > 8)
       ferr(ops, "unhandled stack align of %d\n", stack_align);
     else if (stack_align == 8)
@@ -7435,7 +7483,7 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
         z_check = ((long)po->datap >> 16) & 1;
         out_src_opr_float(buf1, sizeof(buf1), po, &po->operand[0],
           need_float_stack);
-        if (mask == 0x0100) { // C0 -> <
+        if (mask == 0x0100 || mask == 0x0500) { // C0 -> <
           fprintf(fout, "  f_sw = %s < %s ? 0x0100 : 0;",
             float_st0, buf1);
         }
@@ -7608,7 +7656,8 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
         last_arith_dst = NULL;
     }
 
-    label_pending = 0;
+    if (!no_output)
+      label_pending = 0;
   }
 
   if (g_stack_fsz && !g_stack_frame_used)
