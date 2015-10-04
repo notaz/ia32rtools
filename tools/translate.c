@@ -113,6 +113,7 @@ enum op_op {
 	OP_ADC,
 	OP_SBB,
 	OP_BSF,
+	OP_BSR,
 	OP_INC,
 	OP_DEC,
 	OP_NEG,
@@ -356,6 +357,7 @@ enum x86_regs {
 #define mxAX     (1 << xAX)
 #define mxCX     (1 << xCX)
 #define mxDX     (1 << xDX)
+#define mxSP     (1 << xSP)
 #define mxST0    (1 << xST0)
 #define mxST1    (1 << xST1)
 #define mxST1_0  (mxST1 | mxST0)
@@ -994,6 +996,7 @@ static const struct {
   { "adc",  OP_ADC,    2, 2, OPF_DATA|OPF_FLAGS|OPF_CC, PFO_C },
   { "sbb",  OP_SBB,    2, 2, OPF_DATA|OPF_FLAGS|OPF_CC, PFO_C },
   { "bsf",  OP_BSF,    2, 2, OPF_DATA|OPF_FLAGS },
+  { "bsr",  OP_BSR,    2, 2, OPF_DATA|OPF_FLAGS },
   { "inc",  OP_INC,    1, 1, OPF_DATA|OPF_FLAGS },
   { "dec",  OP_DEC,    1, 1, OPF_DATA|OPF_FLAGS },
   { "neg",  OP_NEG,    1, 1, OPF_DATA|OPF_FLAGS },
@@ -1876,7 +1879,8 @@ static int stack_frame_access(struct parsed_op *po,
   int retval = -1;
   int sf_ofs;
 
-  if (po->flags & OPF_EBP_S)
+  if (g_bp_frame && (po->flags & OPF_EBP_S)
+      && !(po->regmask_src & mxSP))
     ferr(po, "stack_frame_access while ebp is scratch\n");
 
   parse_stack_access(po, name, ofs_reg, &offset,
@@ -3534,7 +3538,7 @@ static void scan_for_call_type(int i, const struct parsed_opr *opr,
   if (*pp_found != NULL && pp != NULL && *pp_found != pp) {
     if (!IS((*pp_found)->ret_type.name, pp->ret_type.name)
       || (*pp_found)->is_stdcall != pp->is_stdcall
-      || (*pp_found)->is_fptr != pp->is_fptr
+      //|| (*pp_found)->is_fptr != pp->is_fptr
       || (*pp_found)->argc != pp->argc
       || (*pp_found)->argc_reg != pp->argc_reg
       || (*pp_found)->argc_stack != pp->argc_stack)
@@ -3685,6 +3689,8 @@ static void resolve_branches_parse_calls(int opcnt)
     { "__allshl", OPP_ALLSHL, OPF_DATA, mxAX|mxDX|mxCX, mxAX|mxDX },
     { "__allshr", OPP_ALLSHR, OPF_DATA, mxAX|mxDX|mxCX, mxAX|mxDX },
     { "__ftol",   OPP_FTOL,   OPF_FPOP, mxST0, mxAX | mxDX },
+    // more precise? Wine gets away with just __ftol handler
+    { "__ftol2",  OPP_FTOL,   OPF_FPOP, mxST0, mxAX | mxDX },
     { "__CIpow",  OPP_CIPOW,  OPF_FPOP, mxST0|mxST1, mxST0 },
   };
   const struct parsed_proto *pp_c;
@@ -3816,7 +3822,7 @@ tailcall:
   }
 }
 
-static void scan_prologue_epilogue(int opcnt)
+static void scan_prologue_epilogue(int opcnt, int *stack_align)
 {
   int ecx_push = 0, esp_sub = 0, pusha = 0;
   int sandard_epilogue;
@@ -3836,6 +3842,19 @@ static void scan_prologue_epilogue(int opcnt)
     if (ops[i].op == OP_PUSHA) {
       ops[i].flags |= OPF_RMD | OPF_DONE | OPF_NOREGS;
       pusha = 1;
+      i++;
+    }
+
+    if (ops[i].op == OP_AND && ops[i].operand[0].reg == xSP
+        && ops[i].operand[1].type == OPT_CONST)
+    {
+      l = ops[i].operand[1].val;
+      j = ffs(l) - 1;
+      if (j == -1 || (l >> j) != -1)
+        ferr(&ops[i], "unhandled esp align: %x\n", l);
+      if (stack_align != NULL)
+        *stack_align = 1 << j;
+      ops[i].flags |= OPF_RMD | OPF_DONE | OPF_NOREGS;
       i++;
     }
 
@@ -5353,7 +5372,7 @@ static void pp_insert_reg_arg(struct parsed_proto *pp, const char *reg)
   pp->argc_reg++;
 }
 
-static void output_std_flags(FILE *fout, struct parsed_op *po,
+static void output_std_flag_z(FILE *fout, struct parsed_op *po,
   int *pfomask, const char *dst_opr_text)
 {
   if (*pfomask & (1 << PFO_Z)) {
@@ -5361,11 +5380,23 @@ static void output_std_flags(FILE *fout, struct parsed_op *po,
       lmod_cast_u(po, po->operand[0].lmod), dst_opr_text);
     *pfomask &= ~(1 << PFO_Z);
   }
+}
+
+static void output_std_flag_s(FILE *fout, struct parsed_op *po,
+  int *pfomask, const char *dst_opr_text)
+{
   if (*pfomask & (1 << PFO_S)) {
     fprintf(fout, "\n  cond_s = (%s%s < 0);",
       lmod_cast_s(po, po->operand[0].lmod), dst_opr_text);
     *pfomask &= ~(1 << PFO_S);
   }
+}
+
+static void output_std_flags(FILE *fout, struct parsed_op *po,
+  int *pfomask, const char *dst_opr_text)
+{
+  output_std_flag_z(fout, po, pfomask, dst_opr_text);
+  output_std_flag_s(fout, po, pfomask, dst_opr_text);
 }
 
 enum {
@@ -5467,6 +5498,7 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
   int had_decl = 0;
   int label_pending = 0;
   int need_double = 0;
+  int stack_align = 0;
   int regmask_save = 0; // used regs saved/restored in this func
   int regmask_arg;      // regs from this function args (fastcall, etc)
   int regmask_ret;      // regs needed on ret
@@ -5503,7 +5535,7 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
 
   // pass2:
   // - handle ebp/esp frame, remove ops related to it
-  scan_prologue_epilogue(opcnt);
+  scan_prologue_epilogue(opcnt, &stack_align);
 
   // pass3:
   // - remove dead labels
@@ -5953,6 +5985,10 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
       fprintf(fout, " u8 b[%d];", g_stack_fsz);
     if (g_func_lmods & (1 << OPLM_QWORD))
       fprintf(fout, " double q[%d];", (g_stack_fsz + 7) / 8);
+    if (stack_align > 8)
+      ferr(ops, "unhandled stack align of %d\n", stack_align);
+    else if (stack_align == 8)
+      fprintf(fout, " u64 align;");
     fprintf(fout, " } sf;\n");
     had_decl = 1;
   }
@@ -6693,15 +6729,20 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
         break;
 
       case OP_BSF:
+      case OP_BSR:
+        // on SKL, if src is 0, dst is left unchanged
         assert_operand_cnt(2);
+        out_dst_opr(buf1, sizeof(buf1), po, &po->operand[0]);
         out_src_opr_u32(buf2, sizeof(buf2), po, &po->operand[1]);
-        fprintf(fout, "  %s = %s ? __builtin_ffs(%s) - 1 : 0;",
-          out_dst_opr(buf1, sizeof(buf1), po, &po->operand[0]),
-          buf2, buf2);
-        output_std_flags(fout, po, &pfomask, buf1);
+        output_std_flag_z(fout, po, &pfomask, buf2);
+        if (po->op == OP_BSF)
+          snprintf(buf3, sizeof(buf3), "__builtin_ffs(%s) - 1", buf2);
+        else
+          snprintf(buf3, sizeof(buf3), "31 - __builtin_clz(%s)", buf2);
+        fprintf(fout, "  if (%s) %s = %s;", buf2, buf1, buf3);
         last_arith_dst = &po->operand[0];
         delayed_flag_op = NULL;
-        strcat(g_comment, " bsf");
+        strcat(g_comment, po->op == OP_BSF ? " bsf" : " bsr");
         break;
 
       case OP_DEC:
@@ -7889,7 +7930,7 @@ static void gen_hdr(const char *funcn, int opcnt)
 
   // pass2:
   // - handle ebp/esp frame, remove ops related to it
-  scan_prologue_epilogue(opcnt);
+  scan_prologue_epilogue(opcnt, NULL);
 
   // pass3:
   // - remove dead labels

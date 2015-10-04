@@ -224,6 +224,8 @@ static const char *known_ptr_types[] = {
 	"PLONG",
 	"PMEMORY_BASIC_INFORMATION",
 	"PUINT",
+	"PULARGE_INTEGER",
+	"PULONG_PTR",
 	"PVOID",
 	"PCVOID",
 	"PWORD",
@@ -665,8 +667,8 @@ static int parse_protostr(char *protostr, struct parsed_proto *pp)
 			pp->has_retreg |= is_retreg;
 		}
 
-		if (strstr(arg->type.name, "int64")
-		    || IS(arg->type.name, "double"))
+		if (!arg->type.is_ptr && (strstr(arg->type.name, "int64")
+		      || IS(arg->type.name, "double")))
 		{
 			// hack..
 			free(arg->type.name);
@@ -867,7 +869,8 @@ static const struct parsed_proto *proto_parse(FILE *fhdr, const char *sym,
 	if (pp_cache == NULL)
 		build_caches(fhdr);
 
-	if (sym[0] == '_') // && strncmp(fname, "stdc", 4) == 0)
+	// ugh...
+	if (sym[0] == '_' && !IS_START(sym, "__W"))
 		sym++;
 
 	strcpy(pp_search.name, sym);

@@ -33,7 +33,7 @@ loop:
   *(u16 *)edi = eax; edi -= 2;  // stos
   *(u32 *)edi = eax; edi -= 4;  // stos
   edx = (s32)eax >> 31;  // cdq
-  eax = ecx ? __builtin_ffs(ecx) - 1 : 0;  // bsf
+  if (ecx) eax = __builtin_ffs(ecx) - 1;  // bsf
   tmp64 = ((u64)edx << 32) | eax;
   tmp64 = (s64)tmp64 << LOBYTE(ecx);
   edx = tmp64 >> 32; eax = tmp64;  // allshl
