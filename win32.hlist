@@ -1836,7 +1836,9 @@ int PASCAL getpeername(SOCKET,struct sockaddr*,int*);
 int PASCAL getsockname(SOCKET,struct sockaddr*,int*);
 int PASCAL getsockopt(SOCKET,int,int,char*,int*);
 unsigned long PASCAL inet_addr(const char*);
-// char * PASCAL inet_ntoa(struct in_addr);
+// char * __stdcall inet_ntoa(struct in_addr);
+// hack: for now this will need a wrapper
+char * __stdcall inet_ntoa(int in_addr);
 int PASCAL listen(SOCKET,int);
 int PASCAL recv(SOCKET,char*,int,int);
 int PASCAL recvfrom(SOCKET,char*,int,int,struct sockaddr*,int*);
@@ -1869,6 +1871,7 @@ HANDLE PASCAL WSAAsyncGetHostByName(HWND,u_int,const char*,char*,int);
 HANDLE PASCAL WSAAsyncGetHostByAddr(HWND,u_int,const char*,int,int,char*,int);
 int PASCAL WSACancelAsyncRequest(HANDLE);
 int PASCAL WSAAsyncSelect(SOCKET,HWND,u_int,long);
+int PASCAL __WSAFDIsSet(SOCKET,fd_set*);
 
 // ole32 objbase.h
 DWORD __stdcall CoBuildVersion(void);

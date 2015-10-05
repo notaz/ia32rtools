@@ -17,10 +17,17 @@ _strncmp
 _strpbrk
 _atol
 _getenv
+_isalnum
 _isalpha
+_iscntrl
 _isdigit
-_isspace
+_isgraph
+_islower
 _isprint
+_ispunct
+_isspace
+_isupper
+_isxdigit
 _tolower
 #_strncnt
 #_findenv
@@ -54,7 +61,9 @@ _fopen
 _fclose
 _setvbuf
 _fread
+__fread_nolock
 _fwrite
+__fwrite_nolock
 _fseek
 _fgetc
 _fgets
@@ -69,6 +78,7 @@ __strnicmp
 __strupr
 _sprintf
 _vsprintf
+_fprintf
 __strlwr
 __fullpath
 _toupper
@@ -117,6 +127,7 @@ __controlfp
 # __ftol - x87 state
 # __ftol2 - x87 state
 _ceil
+_floor
 _sqrt
 _pow
 __rotl
@@ -130,6 +141,7 @@ __endthreadex
 __lock
 __unlock
 __isctype
+__CIpow
 
 # not in mingw
 _memcpy_0

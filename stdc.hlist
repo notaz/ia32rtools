@@ -278,6 +278,7 @@ double __cdecl sqrt(double x);
 double __cdecl pow(double x, double y);
 unsigned int __cdecl _rotl(unsigned int num, int shift);
 unsigned int __cdecl _rotr(unsigned int num, int shift);
+double __cdecl _CIpow(void);
 
 // msvcrt
 unsigned long __cdecl _beginthread (void (__cdecl *)(void *), unsigned, void*);
@@ -288,3 +289,5 @@ DECLSPEC_NORETURN void __cdecl _endthreadex (unsigned int);
 void __cdecl _lock(int locknum);
 void __cdecl _unlock(int locknum);
 size_t __cdecl strncnt(const char*, size_t);
+
+void * __cdecl _getptd(void);

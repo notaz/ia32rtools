@@ -566,6 +566,11 @@ int main(int argc, char *argv[])
         goto fin;
       }
 
+      if (IS(words[0], "public")) {
+        // skip, sym should appear in header anyway
+        continue;
+      }
+
       w = 1;
       type = parse_dx_directive(words[0]);
       if (type == DXT_UNSPEC) {
