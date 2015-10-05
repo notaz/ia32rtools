@@ -205,7 +205,7 @@ struct parsed_opr {
   unsigned int type_from_var:1; // .. in header, sometimes wrong
   unsigned int size_mismatch:1; // type override differs from C
   unsigned int size_lt:1;  // type override is larger than C
-  unsigned int had_ds:1;   // had ds: prefix
+  unsigned int segment:7;  // had segment override (enum segment)
   const struct parsed_proto *pp; // for OPT_LABEL
   unsigned int val;
   char name[NAMELEN];
@@ -291,6 +291,15 @@ enum x87_const {
   X87_CONST_Z,
 };
 
+enum segment {
+  SEG_CS = 1,
+  SEG_DS,
+  SEG_SS,
+  SEG_ES,
+  SEG_FS,
+  SEG_GS,
+};
+
 // note: limited to 32k due to p_argnext
 #define MAX_OPS     4096
 #define MAX_ARG_GRP 2
@@ -310,6 +319,8 @@ static int g_bp_frame;
 static int g_sp_frame;
 static int g_stack_frame_used;
 static int g_stack_fsz;
+static int g_seh_found;
+static int g_seh_size;
 static int g_ida_func_attr;
 static int g_sct_func_attr;
 static int g_stack_clear_start; // in dwords
@@ -410,12 +421,12 @@ static int check_segment_prefix(const char *s)
     return 0;
 
   switch (s[0]) {
-  case 'c': return 1;
-  case 'd': return 2;
-  case 's': return 3;
-  case 'e': return 4;
-  case 'f': return 5;
-  case 'g': return 6;
+  case 'c': return SEG_CS;
+  case 'd': return SEG_DS;
+  case 's': return SEG_SS;
+  case 'e': return SEG_ES;
+  case 'f': return SEG_FS;
+  case 'g': return SEG_GS;
   default:  return 0;
   }
 }
@@ -783,9 +794,7 @@ static int parse_operand(struct parsed_opr *opr,
       opr->type = OPT_LABEL;
       ret = check_segment_prefix(label);
       if (ret != 0) {
-        if (ret >= 5)
-          aerr("fs/gs used\n");
-        opr->had_ds = 1;
+        opr->segment = ret;
         label += 3;
       }
       strcpy(opr->name, label);
@@ -834,10 +843,10 @@ static int parse_operand(struct parsed_opr *opr,
 
   ret = check_segment_prefix(words[w]);
   if (ret != 0) {
-    if (ret >= 5)
-      aerr("fs/gs used\n");
-    opr->had_ds = 1;
+    opr->segment = ret;
     memmove(words[w], words[w] + 3, strlen(words[w]) - 2);
+    if (ret == SEG_FS && IS(words[w], "0"))
+      g_seh_found = 1;
   }
   strcpy(opr->name, words[w]);
 
@@ -2122,6 +2131,14 @@ static const char *check_label_read_ref(struct parsed_op *po,
   return pp->name;
 }
 
+static void check_opr(struct parsed_op *po, struct parsed_opr *popr)
+{
+  if (popr->segment == SEG_FS)
+    ferr(po, "fs: used\n");
+  if (popr->segment == SEG_GS)
+    ferr(po, "gs: used\n");
+}
+
 static char *out_src_opr(char *buf, size_t buf_size,
   struct parsed_op *po, struct parsed_opr *popr, const char *cast,
   int is_lea)
@@ -2131,6 +2148,8 @@ static char *out_src_opr(char *buf, size_t buf_size,
   const char *name;
   char *p;
   int ret;
+
+  check_opr(po, popr);
 
   if (cast == NULL)
     cast = "";
@@ -2246,6 +2265,8 @@ static char *out_src_opr(char *buf, size_t buf_size,
 static char *out_dst_opr(char *buf, size_t buf_size,
 	struct parsed_op *po, struct parsed_opr *popr)
 {
+  check_opr(po, popr);
+
   switch (popr->type) {
   case OPT_REG:
     switch (popr->lmod) {
@@ -3848,12 +3869,85 @@ tailcall:
   }
 }
 
+static int resolve_origin(int i, const struct parsed_opr *opr,
+  int magic, int *op_i, int *is_caller);
+
+static void eliminate_seh(int opcnt)
+{
+  int i, j, k, ret;
+
+  for (i = 0; i < opcnt; i++) {
+    if (ops[i].op != OP_MOV)
+      continue;
+    if (ops[i].operand[0].segment != SEG_FS)
+      continue;
+    if (!IS(opr_name(&ops[i], 0), "0"))
+      continue;
+
+    ops[i].flags |= OPF_RMD | OPF_DONE | OPF_NOREGS;
+    if (ops[i].operand[1].reg == xSP) {
+      for (j = i - 1; j >= 0; j--) {
+        if (ops[j].op != OP_PUSH)
+          continue;
+        ops[j].flags |= OPF_RMD | OPF_DONE | OPF_NOREGS;
+        g_seh_size += 4;
+        if (ops[j].operand[0].val == ~0)
+          break;
+        if (ops[j].operand[0].type == OPT_REG) {
+          k = -1;
+          ret = resolve_origin(j, &ops[j].operand[0],
+                  j + opcnt * 22, &k, NULL);
+          if (ret == 1)
+            ops[k].flags |= OPF_RMD | OPF_DONE | OPF_NOREGS;
+        }
+      }
+      if (j < 0)
+        ferr(ops, "missing seh terminator\n");
+    }
+    else {
+      k = -1;
+      ret = resolve_origin(i, &ops[i].operand[1],
+              i + opcnt * 23, &k, NULL);
+      if (ret == 1)
+        ops[k].flags |= OPF_RMD | OPF_DONE | OPF_NOREGS;
+    }
+  }
+
+  // assume all sf writes above g_seh_size to be seh related
+  // (probably unsafe but oh well)
+  for (i = 0; i < opcnt; i++) {
+    const struct parsed_opr *opr;
+    char ofs_reg[16];
+    int offset = 0;
+
+    if (ops[i].op != OP_MOV)
+      continue;
+    opr = &ops[i].operand[0];
+    if (opr->type != OPT_REGMEM)
+      continue;
+    if (!is_stack_access(&ops[i], opr))
+      continue;
+
+    parse_stack_access(&ops[i], opr->name, ofs_reg, &offset,
+      NULL, NULL, 0);
+    if (offset < 0 && offset >= -g_seh_size)
+      ops[i].flags |= OPF_RMD | OPF_DONE | OPF_NOREGS;
+  }
+}
+
 static void scan_prologue_epilogue(int opcnt, int *stack_align)
 {
   int ecx_push = 0, esp_sub = 0, pusha = 0;
   int sandard_epilogue;
   int found;
   int i, j, l;
+
+  if (g_seh_found) {
+    eliminate_seh(opcnt);
+    // ida treats seh as part of sf
+    g_stack_fsz = g_seh_size;
+    esp_sub = 1;
+  }
 
   if (ops[0].op == OP_PUSH && IS(opr_name(&ops[0], 0), "ebp")
       && ops[1].op == OP_MOV
@@ -3863,7 +3957,10 @@ static void scan_prologue_epilogue(int opcnt, int *stack_align)
     g_bp_frame = 1;
     ops[0].flags |= OPF_RMD | OPF_DONE | OPF_NOREGS;
     ops[1].flags |= OPF_RMD | OPF_DONE | OPF_NOREGS;
-    i = 2;
+
+    for (i = 2; i < opcnt; i++)
+      if (!(ops[i].flags & OPF_DONE))
+        break;
 
     if (ops[i].op == OP_PUSHA) {
       ops[i].flags |= OPF_RMD | OPF_DONE | OPF_NOREGS;
@@ -3885,7 +3982,7 @@ static void scan_prologue_epilogue(int opcnt, int *stack_align)
     }
 
     if (ops[i].op == OP_SUB && IS(opr_name(&ops[i], 0), "esp")) {
-      g_stack_fsz = opr_const(&ops[i], 1);
+      g_stack_fsz += opr_const(&ops[i], 1);
       ops[i].flags |= OPF_RMD | OPF_DONE | OPF_NOREGS;
       i++;
     }
@@ -3898,7 +3995,7 @@ static void scan_prologue_epilogue(int opcnt, int *stack_align)
         i++;
       }
       // and another way..
-      if (i == 2 && ops[i].op == OP_MOV && ops[i].operand[0].reg == xAX
+      if (ops[i].op == OP_MOV && ops[i].operand[0].reg == xAX
           && ops[i].operand[1].type == OPT_CONST
           && ops[i + 1].op == OP_CALL
           && IS(opr_name(&ops[i + 1], 0), "__alloca_probe"))
@@ -3987,7 +4084,10 @@ static void scan_prologue_epilogue(int opcnt, int *stack_align)
   }
 
   // non-bp frame
-  i = 0;
+  for (i = 0; i < opcnt; i++)
+    if (!(ops[i].flags & OPF_DONE))
+      break;
+
   while (ops[i].op == OP_PUSH && IS(opr_name(&ops[i], 0), "ecx")) {
     ops[i].flags |= OPF_RMD | OPF_DONE | OPF_NOREGS;
     g_stack_fsz += 4;
@@ -4001,7 +4101,7 @@ static void scan_prologue_epilogue(int opcnt, int *stack_align)
     if (ops[i].op == OP_SUB && ops[i].operand[0].reg == xSP
       && ops[i].operand[1].type == OPT_CONST)
     {
-      g_stack_fsz = ops[i].operand[1].val;
+      g_stack_fsz += ops[i].operand[1].val;
       ops[i].flags |= OPF_RMD | OPF_DONE | OPF_NOREGS;
       i++;
       esp_sub = 1;
@@ -4043,7 +4143,8 @@ static void scan_prologue_epilogue(int opcnt, int *stack_align)
         ferr(&ops[i], "unhandled prologue\n");
 
       // recheck
-      i = g_stack_fsz = ecx_push = 0;
+      i = ecx_push = 0;
+      g_stack_fsz = g_seh_size;
       while (ops[i].op == OP_PUSH && IS(opr_name(&ops[i], 0), "ecx")) {
         if (!(ops[i].flags & OPF_RMD))
           break;
@@ -4072,7 +4173,7 @@ static void scan_prologue_epilogue(int opcnt, int *stack_align)
         j--;
       }
 
-      if (ecx_push > 0) {
+      if (ecx_push > 0 && !esp_sub) {
         for (l = 0; l < ecx_push; l++) {
           if (ops[j].op == OP_POP && IS(opr_name(&ops[j], 0), "ecx"))
             /* pop ecx */;
@@ -5548,6 +5649,7 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
 
   g_bp_frame = g_sp_frame = g_stack_fsz = 0;
   g_stack_frame_used = 0;
+  g_seh_size = 0;
   if (g_sct_func_attr & SCTFA_CLEAR_REGS)
     regmask_init = g_regmask_init;
 
@@ -5940,6 +6042,9 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
   float_st1 = need_float_stack ? "f_st[(f_stp + 1) & 7]" : "f_st1";
 
   // output starts here
+
+  if (g_seh_found)
+    fprintf(fout, "// had SEH\n");
 
   // define userstack size
   if (g_func_pp->is_userstack) {
@@ -7971,6 +8076,7 @@ static void gen_hdr(const char *funcn, int opcnt)
 
   g_bp_frame = g_sp_frame = g_stack_fsz = 0;
   g_stack_frame_used = 0;
+  g_seh_size = 0;
 
   // pass1:
   // - resolve all branches
@@ -9149,6 +9255,7 @@ do_pending_endp:
       skip_warned = 0;
       g_skip_func = 0;
       g_func[0] = 0;
+      g_seh_found = 0;
       func_chunks_used = 0;
       func_chunk_i = -1;
       if (pi != 0) {
@@ -9200,7 +9307,7 @@ do_pending_endp:
         aerr("endp '%s' while skipping code\n", words[0]);
 
       if ((g_ida_func_attr & IDAFA_THUNK) && pi == 1
-        && ops[0].op == OP_JMP && ops[0].operand[0].had_ds)
+        && ops[0].op == OP_JMP && ops[0].operand[0].segment)
       {
         // import jump
         g_skip_func = 1;
