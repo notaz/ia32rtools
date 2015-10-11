@@ -68,8 +68,9 @@ enum op_flags {
   OPF_NOREGS = (1 << 21), /* don't track regs of this op */
   OPF_FPUSH  = (1 << 22), /* pushes x87 stack */
   OPF_FPOP   = (1 << 23), /* pops x87 stack */
-  OPF_FSHIFT = (1 << 24), /* x87 stack shift is actually needed */
-  OPF_FINT   = (1 << 25), /* integer float op arg */
+  OPF_FPOPP  = (1 << 24), /* pops x87 stack twice */
+  OPF_FSHIFT = (1 << 25), /* x87 stack shift is actually needed */
+  OPF_FINT   = (1 << 26), /* integer float op arg */
 };
 
 enum op_op {
@@ -1109,6 +1110,10 @@ static const struct {
   { "fisubr", OP_FISUBR, 1, 1, OPF_FINT },
   { "fcom",   OP_FCOM,   0, 1, 0 },
   { "fcomp",  OP_FCOM,   0, 1, OPF_FPOP },
+  { "fcompp", OP_FCOM,   0, 0, OPF_FPOPP },
+  { "fucom",  OP_FCOM,   0, 1, 0 },
+  { "fucomp", OP_FCOM,   0, 1, OPF_FPOP },
+  { "fucompp",OP_FCOM,   0, 0, OPF_FPOPP },
   { "fnstsw", OP_FNSTSW, 1, 1, OPF_DATA },
   { "fchs",   OP_FCHS,   0, 0, 0 },
   { "fcos",   OP_FCOS,   0, 0, 0 },
@@ -1474,6 +1479,13 @@ static void parse_op(struct parsed_op *op, char words[16][256], int wordc)
 
   case OP_FCOM:
     op->regmask_src |= mxST0;
+    if (op->operand_cnt == 0) {
+      op->operand_cnt = 1;
+      op->operand[0].type = OPT_REG;
+      op->operand[0].lmod = OPLM_QWORD;
+      op->operand[0].reg = xST1;
+      op->regmask_src |= mxST1;
+    }
     break;
 
   default:
@@ -5509,7 +5521,15 @@ static void reg_use_pass(int i, int opcnt, unsigned char *cbits,
     *regmask |= regmask_now;
 
     // released regs
-    if (po->flags & OPF_FPOP) {
+    if (po->flags & OPF_FPOPP) {
+      if ((regmask_now & mxSTa) == 0)
+        ferr(po, "float pop on empty stack?\n");
+      if (regmask_now & mxST7_2)
+        po->flags |= OPF_FSHIFT;
+      if (!(regmask_now & mxST7_2))
+        regmask_now &= ~mxST1_0;
+    }
+    else if (po->flags & OPF_FPOP) {
       if ((regmask_now & mxSTa) == 0)
         ferr(po, "float pop on empty stack?\n");
       if (regmask_now & (mxST7_2 | mxST1))
@@ -6090,7 +6110,8 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
       save_arg_vars[po->p_arggrp] |= 1 << (po->p_argnum - 1);
 
     // correct for "full stack" mode late enable
-    if ((po->flags & (OPF_PPUSH|OPF_FPOP)) && need_float_stack)
+    if ((po->flags & (OPF_PPUSH|OPF_FPOP|OPF_FPOPP))
+        && need_float_stack)
       po->flags |= OPF_FSHIFT;
   }
 
@@ -7649,7 +7670,7 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
           fprintf(fout, "  f_sw = %s < %s ? 0x0100 : 0;",
             float_st0, buf1);
         }
-        else if (mask == 0x4000) { // C3 -> =
+        else if (mask == 0x4000 || mask == 0x4400) { // C3 -> =
           fprintf(fout, "  f_sw = %s == %s ? 0x4000 : 0;",
             float_st0, buf1);
         }
@@ -7668,10 +7689,16 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
         else
           ferr(po, "unhandled sw mask: %x\n", mask);
         if (po->flags & OPF_FSHIFT) {
-          if (need_float_stack)
-            fprintf(fout, " f_stp++;");
-          else
+          if (need_float_stack) {
+            if (po->flags & OPF_FPOPP)
+              fprintf(fout, " f_stp += 2;");
+            else
+              fprintf(fout, " f_stp++;");
+          }
+          else {
+            ferr_assert(po, !(po->flags & OPF_FPOPP));
             fprintf(fout, " f_st0 = f_st1;");
+          }
         }
         break;
       }
