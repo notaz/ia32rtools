@@ -3779,6 +3779,13 @@ static void resolve_branches_parse_calls(int opcnt)
           ferr(po, "call to loc_*\n");
         if (IS(tmpname, "__alloca_probe"))
           continue;
+        if (IS(tmpname, "__SEH_prolog")) {
+          ferr_assert(po, g_seh_found == 0);
+          g_seh_found = 2;
+          continue;
+        }
+        if (IS(tmpname, "__SEH_epilog"))
+          continue;
 
         // convert some calls to pseudo-ops
         for (l = 0; l < ARRAY_SIZE(pseudo_ops); l++) {
@@ -3872,6 +3879,32 @@ tailcall:
 static int resolve_origin(int i, const struct parsed_opr *opr,
   int magic, int *op_i, int *is_caller);
 
+static void eliminate_seh_writes(int opcnt)
+{
+  const struct parsed_opr *opr;
+  char ofs_reg[16];
+  int offset;
+  int i;
+
+  // assume all sf writes above g_seh_size to be seh related
+  // (probably unsafe but oh well)
+  for (i = 0; i < opcnt; i++) {
+    if (ops[i].op != OP_MOV)
+      continue;
+    opr = &ops[i].operand[0];
+    if (opr->type != OPT_REGMEM)
+      continue;
+    if (!is_stack_access(&ops[i], opr))
+      continue;
+
+    offset = 0;
+    parse_stack_access(&ops[i], opr->name, ofs_reg, &offset,
+      NULL, NULL, 0);
+    if (offset < 0 && offset >= -g_seh_size)
+      ops[i].flags |= OPF_RMD | OPF_DONE | OPF_NOREGS;
+  }
+}
+
 static void eliminate_seh(int opcnt)
 {
   int i, j, k, ret;
@@ -3913,26 +3946,96 @@ static void eliminate_seh(int opcnt)
     }
   }
 
-  // assume all sf writes above g_seh_size to be seh related
-  // (probably unsafe but oh well)
-  for (i = 0; i < opcnt; i++) {
-    const struct parsed_opr *opr;
-    char ofs_reg[16];
-    int offset = 0;
+  eliminate_seh_writes(opcnt);
+}
 
-    if (ops[i].op != OP_MOV)
+static void eliminate_seh_calls(int opcnt)
+{
+  int epilog_found = 0;
+  int i;
+
+  g_bp_frame = 1;
+  g_seh_size = 0x10;
+
+  i = 0;
+  ferr_assert(&ops[i], ops[i].op == OP_PUSH
+               && ops[i].operand[0].type == OPT_CONST);
+  g_stack_fsz = g_seh_size + ops[i].operand[0].val;
+  ops[i].flags |= OPF_RMD | OPF_DONE | OPF_NOREGS;
+
+  i++;
+  ferr_assert(&ops[i], ops[i].op == OP_PUSH
+               && ops[i].operand[0].type == OPT_OFFSET);
+  ops[i].flags |= OPF_RMD | OPF_DONE | OPF_NOREGS;
+
+  i++;
+  ferr_assert(&ops[i], ops[i].op == OP_CALL
+               && IS(opr_name(&ops[i], 0), "__SEH_prolog"));
+  ops[i].flags |= OPF_RMD | OPF_DONE | OPF_NOREGS;
+
+  for (i++; i < opcnt; i++) {
+    if (ops[i].op != OP_CALL)
       continue;
-    opr = &ops[i].operand[0];
-    if (opr->type != OPT_REGMEM)
-      continue;
-    if (!is_stack_access(&ops[i], opr))
+    if (!IS(opr_name(&ops[i], 0), "__SEH_epilog"))
       continue;
 
-    parse_stack_access(&ops[i], opr->name, ofs_reg, &offset,
-      NULL, NULL, 0);
-    if (offset < 0 && offset >= -g_seh_size)
-      ops[i].flags |= OPF_RMD | OPF_DONE | OPF_NOREGS;
+    ops[i].flags |= OPF_RMD | OPF_DONE | OPF_NOREGS;
+    epilog_found = 1;
   }
+  ferr_assert(ops, epilog_found);
+
+  eliminate_seh_writes(opcnt);
+}
+
+static int scan_prologue(int i, int opcnt, int *ecx_push, int *esp_sub)
+{
+  int j;
+
+  for (; i < opcnt; i++)
+    if (!(ops[i].flags & OPF_DONE))
+      break;
+
+  while (ops[i].op == OP_PUSH && IS(opr_name(&ops[i], 0), "ecx")) {
+    ops[i].flags |= OPF_RMD | OPF_DONE | OPF_NOREGS;
+    g_stack_fsz += 4;
+    (*ecx_push)++;
+    i++;
+  }
+
+  for (; i < opcnt; i++) {
+    if (i > 0 && g_labels[i] != NULL)
+      break;
+    if (ops[i].op == OP_PUSH || (ops[i].flags & (OPF_JMP|OPF_TAIL)))
+      break;
+    if (ops[i].op == OP_SUB && ops[i].operand[0].reg == xSP
+      && ops[i].operand[1].type == OPT_CONST)
+    {
+      g_stack_fsz += opr_const(&ops[i], 1);
+      ops[i].flags |= OPF_RMD | OPF_DONE | OPF_NOREGS;
+      i++;
+      *esp_sub = 1;
+      break;
+    }
+    if (ops[i].op == OP_MOV && ops[i].operand[0].reg == xAX
+        && ops[i].operand[1].type == OPT_CONST)
+    {
+      for (j = i + 1; j < opcnt; j++)
+        if (!(ops[j].flags & OPF_DONE))
+          break;
+      if (ops[j].op == OP_CALL
+        && IS(opr_name(&ops[j], 0), "__alloca_probe"))
+      {
+        g_stack_fsz += opr_const(&ops[i], 1);
+        ops[i].flags |= OPF_RMD | OPF_DONE | OPF_NOREGS;
+        ops[j].flags |= OPF_RMD | OPF_DONE | OPF_NOREGS;
+        i = j + 1;
+        *esp_sub = 1;
+      }
+      break;
+    }
+  }
+
+  return i;
 }
 
 static void scan_prologue_epilogue(int opcnt, int *stack_align)
@@ -3942,6 +4045,10 @@ static void scan_prologue_epilogue(int opcnt, int *stack_align)
   int found;
   int i, j, l;
 
+  if (g_seh_found == 2) {
+    eliminate_seh_calls(opcnt);
+    return;
+  }
   if (g_seh_found) {
     eliminate_seh(opcnt);
     // ida treats seh as part of sf
@@ -3981,32 +4088,7 @@ static void scan_prologue_epilogue(int opcnt, int *stack_align)
       i++;
     }
 
-    if (ops[i].op == OP_SUB && IS(opr_name(&ops[i], 0), "esp")) {
-      g_stack_fsz += opr_const(&ops[i], 1);
-      ops[i].flags |= OPF_RMD | OPF_DONE | OPF_NOREGS;
-      i++;
-    }
-    else {
-      // another way msvc builds stack frame..
-      while (ops[i].op == OP_PUSH && IS(opr_name(&ops[i], 0), "ecx")) {
-        g_stack_fsz += 4;
-        ops[i].flags |= OPF_RMD | OPF_DONE | OPF_NOREGS;
-        ecx_push++;
-        i++;
-      }
-      // and another way..
-      if (ops[i].op == OP_MOV && ops[i].operand[0].reg == xAX
-          && ops[i].operand[1].type == OPT_CONST
-          && ops[i + 1].op == OP_CALL
-          && IS(opr_name(&ops[i + 1], 0), "__alloca_probe"))
-      {
-        g_stack_fsz += ops[i].operand[1].val;
-        ops[i].flags |= OPF_RMD | OPF_DONE | OPF_NOREGS;
-        i++;
-        ops[i].flags |= OPF_RMD | OPF_DONE | OPF_NOREGS;
-        i++;
-      }
-    }
+    i = scan_prologue(i, opcnt, &ecx_push, &esp_sub);
 
     found = 0;
     do {
@@ -4084,43 +4166,7 @@ static void scan_prologue_epilogue(int opcnt, int *stack_align)
   }
 
   // non-bp frame
-  for (i = 0; i < opcnt; i++)
-    if (!(ops[i].flags & OPF_DONE))
-      break;
-
-  while (ops[i].op == OP_PUSH && IS(opr_name(&ops[i], 0), "ecx")) {
-    ops[i].flags |= OPF_RMD | OPF_DONE | OPF_NOREGS;
-    g_stack_fsz += 4;
-    ecx_push++;
-    i++;
-  }
-
-  for (; i < opcnt; i++) {
-    if (ops[i].op == OP_PUSH || (ops[i].flags & (OPF_JMP|OPF_TAIL)))
-      break;
-    if (ops[i].op == OP_SUB && ops[i].operand[0].reg == xSP
-      && ops[i].operand[1].type == OPT_CONST)
-    {
-      g_stack_fsz += ops[i].operand[1].val;
-      ops[i].flags |= OPF_RMD | OPF_DONE | OPF_NOREGS;
-      i++;
-      esp_sub = 1;
-      break;
-    }
-    else if (ops[i].op == OP_MOV && ops[i].operand[0].reg == xAX
-          && ops[i].operand[1].type == OPT_CONST
-          && ops[i + 1].op == OP_CALL
-          && IS(opr_name(&ops[i + 1], 0), "__alloca_probe"))
-    {
-      g_stack_fsz += ops[i].operand[1].val;
-      ops[i].flags |= OPF_RMD | OPF_DONE | OPF_NOREGS;
-      i++;
-      ops[i].flags |= OPF_RMD | OPF_DONE | OPF_NOREGS;
-      i++;
-      esp_sub = 1;
-      break;
-    }
-  }
+  i = scan_prologue(0, opcnt, &ecx_push, &esp_sub);
 
   if (ecx_push && !esp_sub) {
     // could actually be args for a call..
@@ -4172,9 +4218,20 @@ static void scan_prologue_epilogue(int opcnt, int *stack_align)
         i--;
         j--;
       }
+      else if (i < opcnt && (ops[i].flags & OPF_ATAIL)) {
+        // skip arg updates for arg-reuse tailcall
+        for (; j >= 0; j--) {
+          if (ops[j].op != OP_MOV)
+            break;
+          if (ops[j].operand[0].type != OPT_REGMEM)
+            break;
+          if (strstr(ops[j].operand[0].name, "arg_") == NULL)
+            break;
+        }
+      }
 
       if (ecx_push > 0 && !esp_sub) {
-        for (l = 0; l < ecx_push; l++) {
+        for (l = 0; l < ecx_push && j >= 0; l++) {
           if (ops[j].op == OP_POP && IS(opr_name(&ops[j], 0), "ecx"))
             /* pop ecx */;
           else if (ops[j].op == OP_ADD
@@ -7109,7 +7166,7 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
           fprintf(fout, "%s%s = %s;\n", buf3, pp->name,
             out_src_opr(buf1, sizeof(buf1), po, &po->operand[0],
               "(void *)", 0));
-          if (pp->is_unresolved)
+          if (pp->is_unresolved || IS_START(pp->name, "i_guess"))
             fprintf(fout, "%sunresolved_call(\"%s:%d\", %s);\n",
               buf3, asmfn, po->asmln, pp->name);
         }
