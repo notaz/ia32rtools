@@ -5,7 +5,8 @@
 # $2 - .in_c
 outf=$3
 
-grep '@' $1 | grep -v '\<DATA\>' | awk '{print $1}' > ${outf}_explist
+grep '@' $1 | grep -v '\<DATA\>' | grep -v '=' | \
+  awk '{print $1}' > ${outf}_explist
 
 echo ".text" > $outf
 echo ".align 4" >> $outf

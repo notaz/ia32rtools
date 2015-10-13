@@ -48,6 +48,8 @@ __ismbcspace
 __mbsrchr
 _shortsort
 _qsort
+_system
+_bsearch
 __mbspbrk
 __mbsstr
 _localtime
@@ -138,6 +140,9 @@ __beginthread
 __endthread
 __beginthreadex
 __endthreadex
+__atoi64
+__i64toa
+__ui64toa
 __lock
 __unlock
 __isctype

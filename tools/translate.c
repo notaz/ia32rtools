@@ -7297,6 +7297,19 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
               if (tmp_op->operand[0].lmod == OPLM_QWORD)
                 arg++;
             }
+            else if (pp->arg[arg].type.is_64bit) {
+              ferr_assert(po, tmp_op->p_argpass == 0);
+              ferr_assert(po, !pp->arg[arg].is_saved);
+              ferr_assert(po, cast[0] == 0);
+              out_src_opr(buf1, sizeof(buf1),
+                tmp_op, &tmp_op->operand[0], cast, 0);
+              tmp_op = pp->arg[++arg].datap;
+              ferr_assert(po, tmp_op != NULL);
+              out_src_opr(buf2, sizeof(buf2),
+                tmp_op, &tmp_op->operand[0], cast, 0);
+              fprintf(fout, "((u64)(%s) << 32) | (%s)",
+                buf2, buf1);
+            }
             else if (tmp_op->p_argpass != 0) {
               fprintf(fout, "a%d", tmp_op->p_argpass);
             }
