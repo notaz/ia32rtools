@@ -240,6 +240,7 @@ static void idaapi run(int /*arg*/)
   char buf[MAXSTR];
   char buf2[MAXSTR];
   const char *name;
+  const char *cp;
   struc_t *frame;
   func_t *func;
   ea_t ui_ea_block = 0, ea_size;
@@ -524,8 +525,16 @@ static void idaapi run(int /*arg*/)
     // rename vars with '?@' (funcs are ok)
     int change_qat = 0;
     ea_flags = get_flags_novalue(ea);
-    if (!isCode(ea_flags) && strpbrk(name, "?@"))
-      change_qat = 1;
+    if (!isCode(ea_flags)) {
+      if (strchr(name, '?'))
+        change_qat = 1;
+      else if ((cp = strchr(name, '@'))) {
+        char *endp = NULL;
+        strtol(cp + 1, &endp, 10);
+        if (endp == NULL || *endp != 0)
+          change_qat = 1;
+      }
+    }
 
     if (need_rename || change_qat) {
       msg("%x: renaming name '%s'\n", ea, name);
