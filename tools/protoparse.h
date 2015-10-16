@@ -16,6 +16,7 @@ struct parsed_type {
 	unsigned int is_retreg:1; // register to return to caller
 	unsigned int is_va_list:1;
 	unsigned int is_64bit:1;
+	unsigned int is_float:1;  // float, double
 };
 
 struct parsed_proto_arg {
@@ -215,8 +216,10 @@ static const char *known_ptr_types[] = {
 	"HMENU",
 	"HWAVEOUT",
 	"HWND",
+	"PAPPBARDATA",
 	"PBYTE",
 	"PCRITICAL_SECTION",
+	"PDEVMODEA",
 	"PDWORD",
 	"PFILETIME",
 	"PLARGE_INTEGER",
@@ -666,6 +669,12 @@ static int parse_protostr(char *protostr, struct parsed_proto *pp)
 			arg->reg = strdup(map_reg(regparm));
 			arg->type.is_retreg = is_retreg;
 			pp->has_retreg |= is_retreg;
+		}
+
+		if (IS(arg->type.name, "float")
+		      || IS(arg->type.name, "double"))
+		{
+			arg->type.is_float = 1;
 		}
 
 		if (!arg->type.is_ptr && (strstr(arg->type.name, "int64")

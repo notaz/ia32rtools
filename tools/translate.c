@@ -19,6 +19,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 #include <errno.h>
 
 #include "my_assert.h"
@@ -284,8 +285,8 @@ enum sct_func_attr {
 
 enum x87_const {
   X87_CONST_1 = 1,
-  X87_CONST_2T,
-  X87_CONST_2E,
+  X87_CONST_L2T,
+  X87_CONST_L2E,
   X87_CONST_PI,
   X87_CONST_LG2,
   X87_CONST_LN2,
@@ -1084,6 +1085,10 @@ static const struct {
   { "fld",    OP_FLD,    1, 1, OPF_FPUSH },
   { "fild",   OP_FILD,   1, 1, OPF_FPUSH|OPF_FINT },
   { "fld1",   OP_FLDc,   0, 0, OPF_FPUSH },
+  { "fldl2t", OP_FLDc,   0, 0, OPF_FPUSH },
+  { "fldl2e", OP_FLDc,   0, 0, OPF_FPUSH },
+  { "fldpi",  OP_FLDc,   0, 0, OPF_FPUSH },
+  { "fldlg2", OP_FLDc,   0, 0, OPF_FPUSH },
   { "fldln2", OP_FLDc,   0, 0, OPF_FPUSH },
   { "fldz",   OP_FLDc,   0, 0, OPF_FPUSH },
   { "fst",    OP_FST,    1, 1, 0 },
@@ -1418,12 +1423,20 @@ static void parse_op(struct parsed_op *op, char words[16][256], int wordc)
     op->regmask_dst |= mxST0;
     if      (IS(words[op_w] + 3, "1"))
       op->operand[0].val = X87_CONST_1;
+    else if (IS(words[op_w] + 3, "l2t"))
+      op->operand[0].val = X87_CONST_L2T;
+    else if (IS(words[op_w] + 3, "l2e"))
+      op->operand[0].val = X87_CONST_L2E;
+    else if (IS(words[op_w] + 3, "pi"))
+      op->operand[0].val = X87_CONST_PI;
+    else if (IS(words[op_w] + 3, "lg2"))
+      op->operand[0].val = X87_CONST_LG2;
     else if (IS(words[op_w] + 3, "ln2"))
       op->operand[0].val = X87_CONST_LN2;
     else if (IS(words[op_w] + 3, "z"))
       op->operand[0].val = X87_CONST_Z;
     else
-      aerr("TODO\n");
+      aerr("fld what?\n");
     break;
 
   case OP_FST:
@@ -2342,11 +2355,20 @@ static char *out_opr_float(char *buf, size_t buf_size,
 {
   const char *cast = NULL;
   char tmp[256];
+  union {
+    float f;
+    int i;
+  } u;
 
   switch (popr->type) {
   case OPT_REG:
-    if (popr->reg < xST0 || popr->reg > xST7)
-      ferr(po, "bad reg: %d\n", popr->reg);
+    if (popr->reg < xST0 || popr->reg > xST7) {
+      // func arg
+      ferr_assert(po, po->op == OP_PUSH);
+      ferr_assert(po, popr->lmod == OPLM_DWORD);
+      snprintf(buf, buf_size, "*(float *)&%s", opr_reg_p(po, popr));
+      break;
+    }
 
     if (need_float_stack) {
       if (popr->reg == xST0)
@@ -2381,6 +2403,16 @@ static char *out_opr_float(char *buf, size_t buf_size,
     }
     out_src_opr(tmp, sizeof(tmp), po, popr, "", 1);
     snprintf(buf, buf_size, "*(%s *)(%s)", cast, tmp);
+    break;
+
+  case OPT_CONST:
+    // only for func float args pushes
+    ferr_assert(po, po->op == OP_PUSH);
+    u.i = po->operand[0].val;
+    if (ceilf(u.f) == u.f)
+      snprintf(buf, buf_size, "%.1ff", u.f);
+    else
+      snprintf(buf, buf_size, "%.8ff", u.f);
     break;
 
   default:
@@ -4906,6 +4938,37 @@ out:
   return pp;
 }
 
+static void mark_float_arg(struct parsed_op *po,
+  struct parsed_proto *pp, int arg, int *regmask_ffca)
+{
+  po->p_argnext = -1;
+  po->p_argnum = arg + 1;
+  ferr_assert(po, pp->arg[arg].datap == NULL);
+  pp->arg[arg].datap = po;
+  po->flags |= OPF_DONE | OPF_FARGNR | OPF_FARG;
+  if (regmask_ffca != NULL)
+    *regmask_ffca |= 1 << arg;
+}
+
+static int check_for_stp(int i, int i_to)
+{
+  struct parsed_op *po;
+
+  for (; i < i_to; i++) {
+    po = &ops[i];
+    if (po->op == OP_FST)
+      return i;
+    if (g_labels[i] != NULL || (po->flags & OPF_JMP))
+      return -1;
+    if (po->op == OP_CALL || po->op == OP_PUSH || po->op == OP_POP)
+      return -1;
+    if (po->op == OP_ADD && po->operand[0].reg == xSP)
+      return -1;
+  }
+
+  return -1;
+}
+
 static int collect_call_args_no_push(int i, struct parsed_proto *pp,
   int *regmask_ffca)
 {
@@ -4939,13 +5002,7 @@ static int collect_call_args_no_push(int i, struct parsed_proto *pp,
       }
 
       arg = base_arg + offset / 4;
-      po->p_argnext = -1;
-      po->p_argnum = arg + 1;
-      ferr_assert(po, pp->arg[arg].datap == NULL);
-      pp->arg[arg].datap = po;
-      po->flags |= OPF_DONE | OPF_FARGNR | OPF_FARG;
-      if (regmask_ffca != NULL)
-        *regmask_ffca |= 1 << arg;
+      mark_float_arg(po, pp, arg, regmask_ffca);
     }
     else if (po->op == OP_SUB && po->operand[0].reg == xSP
       && po->operand[1].type == OPT_CONST)
@@ -4972,7 +5029,8 @@ static int collect_call_args_early(int i, struct parsed_proto *pp,
 {
   struct parsed_op *po;
   int arg, ret;
-  int j;
+  int offset;
+  int j, k;
 
   for (arg = 0; arg < pp->argc; arg++)
     if (pp->arg[arg].reg == NULL)
@@ -5040,10 +5098,24 @@ static int collect_call_args_early(int i, struct parsed_proto *pp,
     {
       ops[j].p_argnext = -1;
       ferr_assert(&ops[j], pp->arg[arg].datap == NULL);
-      pp->arg[arg].datap = &ops[j];
 
-      if (regmask != NULL && ops[j].operand[0].type == OPT_REG)
-        *regmask |= 1 << ops[j].operand[0].reg;
+      k = check_for_stp(j + 1, i);
+      if (k != -1) {
+        // push ecx; fstp dword ptr [esp]
+        ret = parse_stack_esp_offset(&ops[k],
+                ops[k].operand[0].name, &offset);
+        if (ret == 0 && offset == 0) {
+          if (!pp->arg[arg].type.is_float)
+            ferr(&ops[i], "arg %d should be float\n", arg + 1);
+          mark_float_arg(&ops[k], pp, arg, regmask_ffca);
+        }
+      }
+
+      if (pp->arg[arg].datap == NULL) {
+        pp->arg[arg].datap = &ops[j];
+        if (regmask != NULL && ops[j].operand[0].type == OPT_REG)
+          *regmask |= 1 << ops[j].operand[0].reg;
+      }
 
       ops[j].flags |= OPF_RMD | OPF_DONE | OPF_FARGNR | OPF_FARG;
       ops[j].flags &= ~OPF_RSAVE;
@@ -7300,6 +7372,7 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
             else if (pp->arg[arg].type.is_64bit) {
               ferr_assert(po, tmp_op->p_argpass == 0);
               ferr_assert(po, !pp->arg[arg].is_saved);
+              ferr_assert(po, !pp->arg[arg].type.is_float);
               ferr_assert(po, cast[0] == 0);
               out_src_opr(buf1, sizeof(buf1),
                 tmp_op, &tmp_op->operand[0], cast, 0);
@@ -7311,13 +7384,21 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
                 buf2, buf1);
             }
             else if (tmp_op->p_argpass != 0) {
+              ferr_assert(po, !pp->arg[arg].type.is_float);
               fprintf(fout, "a%d", tmp_op->p_argpass);
             }
             else if (pp->arg[arg].is_saved) {
               ferr_assert(po, tmp_op->p_argnum > 0);
+              ferr_assert(po, !pp->arg[arg].type.is_float);
               fprintf(fout, "%s%s", cast,
                 saved_arg_name(buf1, sizeof(buf1),
                   tmp_op->p_arggrp, tmp_op->p_argnum));
+            }
+            else if (pp->arg[arg].type.is_float) {
+              ferr_assert(po, !pp->arg[arg].type.is_64bit);
+              fprintf(fout, "%s",
+                out_src_opr_float(buf1, sizeof(buf1),
+                  tmp_op, &tmp_op->operand[0], need_float_stack));
             }
             else {
               fprintf(fout, "%s",
@@ -7533,9 +7614,13 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
         }
         switch (po->operand[0].val) {
         case X87_CONST_1:   fprintf(fout, "1.0;"); break;
-        case X87_CONST_LN2: fprintf(fout, "0.693147180559945;"); break;
+        case X87_CONST_L2T: fprintf(fout, "3.321928094887362;"); break;
+        case X87_CONST_L2E: fprintf(fout, "M_LOG2E;"); break;
+        case X87_CONST_PI:  fprintf(fout, "M_PI;"); break;
+        case X87_CONST_LG2: fprintf(fout, "0.301029995663981;"); break;
+        case X87_CONST_LN2: fprintf(fout, "M_LN2;"); break;
         case X87_CONST_Z:   fprintf(fout, "0.0;"); break;
-        default: ferr(po, "TODO\n"); break;
+        default: ferr_assert(po, 0); break;
         }
         break;
 

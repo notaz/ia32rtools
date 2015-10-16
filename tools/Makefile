@@ -16,3 +16,5 @@ cvt_data: cvt_data.o
 mkdef_ord: mkdef_ord.o
 mkbridge.o translate.o cvt_data.o mkdef_ord.o: \
  protoparse.h my_assert.h my_str.h
+
+translate: LDLIBS += -lm

@@ -11,7 +11,7 @@ double sub_test()
   f_st[--f_stp & 7] = 1.0;
   f_st[--f_stp & 7] = (float)(s32)sf.d[0];  // var_4 fild
   f_st[--f_stp & 7] = 0.0;
-  f_st[--f_stp & 7] = 0.693147180559945;
+  f_st[--f_stp & 7] = M_LN2;
   f_st[--f_stp & 7] = (float)(s32)sf.d[0];  // var_4 fild
   f_stp++;
   f_st[(f_stp + 5) & 7] /= f_st[f_stp & 7];  f_stp++;
