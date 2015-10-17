@@ -234,6 +234,7 @@ static const char *known_ptr_types[] = {
 	"PCVOID",
 	"PWORD",
 	"REFCLSID",
+	"REFGUID",
 	"REFIID",
 	"HOOKPROC",
 	"DLGPROC",

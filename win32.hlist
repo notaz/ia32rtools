@@ -2009,6 +2009,17 @@ DWORD WINAPI lineTranslateDialogA(HLINEAPP,DWORD,DWORD,HWND,LPCSTR);
 DWORD WINAPI lineUnhold(HCALL);
 DWORD WINAPI lineUnparkA(HLINE,DWORD,LPHCALL,LPCSTR);
 
+// ddraw.h dsound.h
+HRESULT WINAPI DirectDrawCreate(GUID *driver_guid, IDirectDraw **ddraw, IUnknown *outer);
+HRESULT WINAPI DirectDrawCreateEx(GUID *driver_guid, void **ddraw, REFIID interface_iid, IUnknown *outer);
+HRESULT WINAPI DirectDrawCreateClipper(DWORD flags, IDirectDrawClipper **clipper, IUnknown *outer);
+
+HRESULT WINAPI DirectSoundCreate(LPCGUID lpGUID,LPDIRECTSOUND *ppDS,LPUNKNOWN pUnkOuter);
+HRESULT WINAPI DirectSoundEnumerateA(LPDSENUMCALLBACKA, LPVOID);
+HRESULT WINAPI DirectSoundEnumerateW(LPDSENUMCALLBACKW, LPVOID);
+HRESULT WINAPI DirectSoundCreate8(LPCGUID lpGUID,LPDIRECTSOUND8 *ppDS8,LPUNKNOWN pUnkOuter);
+HRESULT WINAPI GetDeviceID(LPCGUID lpGuidSrc, LPGUID lpGuidDest);
+
 struct IUnknown {
 /*00*/    HRESULT (WINAPI *QueryInterface)(void *this, REFIID riid, void** ppvObject);
 /*04*/    ULONG (WINAPI *AddRef)(void *this);
@@ -2171,21 +2182,45 @@ struct IDirectSoundBuffer {
 /*50*/    int (WINAPI *Restore)(void *this);
 };
 
-//    sctproto: int (__stdcall *Direct*Create)(void *, void *, void *)
-// 08 sctproto: int (WINAPI *dx_Release)(void *iface)
-// IDirectSound8
-// 0C sctproto: int (WINAPI *dsound_CreateSoundBuffer)(void *iface, void *dsbd, void **ppdsb, void *lpunk)
-// 18 sctproto: int (WINAPI *dsound_SetCooperativeLevel)(void *iface, HWND hwnd, DWORD level)
-// IDirectSoundBuffer8
-// 10 sctproto: int (WINAPI *dsndbuf_GetCurrentPosition)(void *iface, DWORD *playpos, DWORD *writepos)
-// 14 sctproto: int (WINAPI *dsndbuf_GetFormat)(void *iface, void *lpwf, DWORD wfsize, DWORD *wfwritten)
-// 18 sctproto: int (WINAPI *dsndbuf_GetVolume)(void *iface, LONG *vol)
-// 1C sctproto: int (WINAPI *dsndbuf_GetPan)(void *iface, LONG *pan)
-// 2C sctproto: int (WINAPI *dsndbuf_Lock)(void *iface, DWORD, void **, DWORD *, void *, void **, DWORD *, DWORD)
-// 30 sctproto: int (WINAPI *dsndbuf_Play)(void *iface, DWORD, DWORD, DWORD flags)
-// 34 sctproto: int (WINAPI *dsndbuf_SetCurrentPosition)(void *iface, DWORD newpos)
-// 38 sctproto: int (WINAPI *dsndbuf_SetFormat)(void *iface, void *wfex)
-// 3C sctproto: int (WINAPI *dsndbuf_SetVolume)(void *iface, LONG vol)
-// 40 sctproto: int (WINAPI *dsndbuf_SetPan)(void *iface, LONG pan)
-// 48 sctproto: int (WINAPI *dsndbuf_Stop)(void *iface)
-// 4C sctproto: int (WINAPI *dsndbuf_Unlock)(void *iface, void *p1, DWORD x1, void *p2, DWORD x2)
+// 0x279AFA86,0x4981,0x11CE,0xA5,0x21,0x00,0x20,0xAF,0x0B,0xE5,0x60
+struct IDirectSound3DBuffer {
+          // IUnknown methods
+/*00*/    HRESULT (WINAPI *QueryInterface)(void *this, REFIID riid, void** ppvObject);
+/*04*/    ULONG (WINAPI *AddRef)(void *this);
+/*08*/    ULONG (WINAPI *Release)(void *this);
+          // IDirectSound3DBuffer methods
+/*0c*/    int (WINAPI *GetAllParameters)(void *this, LPDS3DBUFFER lpDs3dBuffer);
+/*10*/    int (WINAPI *GetConeAngles)(void *this, LPDWORD lpdwInsideConeAngle, LPDWORD lpdwOutsideConeAngle);
+/*14*/    int (WINAPI *GetConeOrientation)(void *this, LPD3DVECTOR lpvOrientation);
+/*18*/    int (WINAPI *GetConeOutsideVolume)(void *this, LPLONG lplConeOutsideVolume);
+/*1c*/    int (WINAPI *GetMaxDistance)(void *this, LPD3DVALUE lpflMaxDistance);
+/*20*/    int (WINAPI *GetMinDistance)(void *this, LPD3DVALUE lpflMinDistance);
+/*24*/    int (WINAPI *GetMode)(void *this, LPDWORD lpwdMode);
+/*28*/    int (WINAPI *GetPosition)(void *this, LPD3DVECTOR lpvPosition);
+/*2c*/    int (WINAPI *GetVelocity)(void *this, LPD3DVECTOR lpvVelocity);
+/*30*/    int (WINAPI *SetAllParameters)(void *this, LPCDS3DBUFFER lpcDs3dBuffer, DWORD dwApply);
+/*34*/    int (WINAPI *SetConeAngles)(void *this, DWORD dwInsideConeAngle, DWORD dwOutsideConeAngle, DWORD dwApply);
+/*38*/    int (WINAPI *SetConeOrientation)(void *this, float x, float y, float z, DWORD dwApply);
+/*3c*/    int (WINAPI *SetConeOutsideVolume)(void *this, LONG lConeOutsideVolume, DWORD dwApply);
+/*40*/    int (WINAPI *SetMaxDistance)(void *this, float flMaxDistance, DWORD dwApply);
+/*44*/    int (WINAPI *SetMinDistance)(void *this, float flMinDistance, DWORD dwApply);
+/*48*/    int (WINAPI *SetMode)(void *this, DWORD dwMode, DWORD dwApply);
+/*4c*/    int (WINAPI *SetPosition)(void *this, float x, float y, float z, DWORD dwApply);
+/*50*/    int (WINAPI *SetVelocity)(void *this, float x, float y, float z, DWORD dwApply);
+};
+
+// 0x31EFAC30,0x515C,0x11D0,0xA9,0xAA,0x00,0xAA,0x00,0x61,0xBE,0x93
+struct IKsPropertySet {
+          // IUnknown methods
+/*00*/    HRESULT (WINAPI *QueryInterface)(void *this, REFIID riid, void** ppvObject);
+/*04*/    ULONG (WINAPI *AddRef)(void *this);
+/*08*/    ULONG (WINAPI *Release)(void *this);
+          // IKsPropertySet methods
+/*0c*/    int (WINAPI *Get_iks)(void *this, REFGUID rgid,ULONG x1,LPVOID p1,ULONG x2,LPVOID p2,ULONG x3,ULONG *px4);
+/*10*/    int (WINAPI *Set_iks)(void *this, REFGUID rgid,ULONG x1,LPVOID p1,ULONG x2,LPVOID p2,ULONG x3);
+/*14*/    int (WINAPI *QuerySupport_iks)(void *this, REFGUID rgid,ULONG x1,ULONG *px2);
+};
+
+// %s/ PURE;/;/
+// %s/STDMETHOD(\(.*\))(THIS_ /int (WINAPI *\1)(void *this, /
+// %s/\<D3DVALUE\>/float/g
