@@ -3819,8 +3819,12 @@ static void resolve_branches_parse_calls(int opcnt)
       else if (po->operand[0].type == OPT_LABEL)
       {
         tmpname = opr_name(po, 0);
-        if (IS_START(tmpname, "loc_"))
-          ferr(po, "call to loc_*\n");
+        if (IS_START(tmpname, "loc_")) {
+          if (!g_seh_found)
+            ferr(po, "call to loc_*\n");
+          // eliminate_seh() must take care of it
+          continue;
+        }
         if (IS(tmpname, "__alloca_probe"))
           continue;
         if (IS(tmpname, "__SEH_prolog")) {
@@ -3922,6 +3926,7 @@ tailcall:
 
 static int resolve_origin(int i, const struct parsed_opr *opr,
   int magic, int *op_i, int *is_caller);
+static void set_label(int i, const char *name);
 
 static void eliminate_seh_writes(int opcnt)
 {
@@ -3946,6 +3951,87 @@ static void eliminate_seh_writes(int opcnt)
       NULL, NULL, 0);
     if (offset < 0 && offset >= -g_seh_size)
       ops[i].flags |= OPF_RMD | OPF_DONE | OPF_NOREGS;
+  }
+}
+
+static void eliminate_seh_finally(int opcnt)
+{
+  const char *target_name = NULL;
+  const char *return_name = NULL;
+  int exits[MAX_EXITS];
+  int exit_count = 0;
+  int call_i = -1;
+  int target_i = -1;
+  int return_i = -1;
+  int tgend_i = -1;
+  int i;
+
+  for (i = 0; i < opcnt; i++) {
+    if (ops[i].op != OP_CALL)
+      continue;
+    if (!IS_START(opr_name(&ops[i], 0), "loc_"))
+      continue;
+    if (target_name != NULL)
+      ferr(&ops[i], "multiple finally calls? (last was %s)\n",
+        target_name);
+    target_name = opr_name(&ops[i], 0);
+    call_i = i;
+
+    if (g_labels[i + 1] == NULL)
+      set_label(i + 1, "seh_fin_done");
+    return_name = g_labels[i + 1];
+    return_i = i + 1;
+  }
+
+  if (call_i == -1)
+    // no finally block
+    return;
+
+  // find finally code (bt_i is not set because it's call)
+  for (i = 0; i < opcnt; i++) {
+    if (g_labels[i] == NULL)
+      continue;
+    if (!IS(g_labels[i], target_name))
+      continue;
+
+    ferr_assert(&ops[i], target_i == -1);
+    target_i = i;
+  }
+  ferr_assert(&ops[0], target_i != -1);
+
+  find_reachable_exits(target_i, opcnt, target_i + opcnt * 24,
+    exits, &exit_count);
+  ferr_assert(&ops[target_i], exit_count == 1);
+  ferr_assert(&ops[target_i], ops[exits[0]].op == OP_RET);
+  tgend_i = exits[0];
+
+  // convert to jumps, link
+  ops[call_i].op = OP_JMP;
+  ops[call_i].bt_i = target_i;
+  add_label_ref(&g_label_refs[target_i], call_i);
+
+  ops[tgend_i].op = OP_JMP;
+  ops[tgend_i].flags &= ~OPF_TAIL;
+  ops[tgend_i].flags |= OPF_JMP;
+  ops[tgend_i].bt_i = return_i;
+  ops[tgend_i].operand_cnt = 1;
+  ops[tgend_i].operand[0].type = OPT_LABEL;
+  snprintf(ops[tgend_i].operand[0].name, NAMELEN, "%s", return_name);
+  add_label_ref(&g_label_refs[return_i], tgend_i);
+
+  // rm seh finally entry code
+  for (i = target_i - 1; i >= 0; i--) {
+    if (g_labels[i] != NULL && g_label_refs[i].i != -1)
+      return;
+    if (ops[i].flags & OPF_CJMP)
+      return;
+    if (ops[i].flags & (OPF_JMP | OPF_TAIL))
+      break;
+  }
+  for (i = target_i - 1; i >= 0; i--) {
+    if (ops[i].flags & (OPF_JMP | OPF_TAIL))
+      break;
+    ops[i].flags |= OPF_RMD | OPF_DONE | OPF_NOREGS;
   }
 }
 
@@ -3991,6 +4077,7 @@ static void eliminate_seh(int opcnt)
   }
 
   eliminate_seh_writes(opcnt);
+  eliminate_seh_finally(opcnt);
 }
 
 static void eliminate_seh_calls(int opcnt)
@@ -4029,6 +4116,7 @@ static void eliminate_seh_calls(int opcnt)
   ferr_assert(ops, epilog_found);
 
   eliminate_seh_writes(opcnt);
+  eliminate_seh_finally(opcnt);
 }
 
 static int scan_prologue(int i, int opcnt, int *ecx_push, int *esp_sub)
@@ -8394,8 +8482,11 @@ static void gen_hdr(const char *funcn, int opcnt)
       // noreturn OS functions
       break;
     }
-    if (ops[i].op != OP_NOP && ops[i].op != OPP_ABORT)
+    if (!(ops[i].flags & OPF_RMD)
+        && ops[i].op != OP_NOP && ops[i].op != OPP_ABORT)
+    {
       ferr(&ops[i], "unreachable code\n");
+    }
   }
 
   for (i = 0; i < g_eqcnt; i++) {
