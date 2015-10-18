@@ -35,6 +35,12 @@ typedef struct {
 #define BYTE2(x)    (*((u8*)&(x)+2))
 #define BYTE3(x)    (*((u8*)&(x)+3))
 
+#ifndef __WINE__
+#define DECL_IMPORT __declspec(dllimport)
+#else
+#define DECL_IMPORT
+#endif
+
 #define memcpy_0 memcpy
 
 #define noreturn __attribute__((noreturn))

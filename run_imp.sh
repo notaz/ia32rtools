@@ -37,8 +37,14 @@ cat $implist | while read i; do
     done
   sym=`cat $tmpsym`
   if test -z "$sym"; then
-    echo "$target_s: no file/sym for $i"
-    exit 1
+    # could be a data import
+    if test -n "$data_symf" && grep -q "$si" $data_symf; then
+      continue
+    else
+      echo "$target_s: no file/sym for $i"
+      rm $target_s
+      exit 1
+    fi
   fi
 
   echo ".globl $i" >> $target_s

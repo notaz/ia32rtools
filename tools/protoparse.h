@@ -42,8 +42,10 @@ struct parsed_proto {
 	unsigned int is_fastcall:1;
 	unsigned int is_vararg:1;     // vararg func
 	unsigned int is_fptr:1;
+	unsigned int is_import:1;     // data import
 	unsigned int is_noreturn:1;
 	unsigned int is_unresolved:1;
+	unsigned int is_guessed:1;    // for extra checking
 	unsigned int is_userstack:1;
 	unsigned int is_include:1;    // not from top-level header
 	unsigned int is_osinc:1;      // OS/system library func
@@ -402,6 +404,9 @@ static int parse_arg(char **p_, struct parsed_proto_arg *arg, int xarg)
 	if (ret < 0)
 		return -1;
 
+	if (IS_START(arg->pp->name, "guess"))
+		arg->pp->is_guessed = 1;
+
 	// we don't use actual names right now...
 	snprintf(arg->pp->name, sizeof(arg->pp->name), "a%d", xarg);
 
@@ -460,6 +465,11 @@ static int parse_protostr(char *protostr, struct parsed_proto *pp)
 		l = strlen(ignored_keywords[i]);
 		if (!strncmp(p, ignored_keywords[i], l) && my_isblank(p[l]))
 			p = sskip(p + l + 1);
+	}
+
+	if (IS_START(p, "DECL_IMPORT ")) {
+		pp->is_import = 1;
+		p = sskip(p + 12);
 	}
 
 	ret = check_type(p, &pp->ret_type);

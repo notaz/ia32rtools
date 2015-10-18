@@ -2142,7 +2142,7 @@ static void check_func_pp(struct parsed_op *po,
 }
 
 static const char *check_label_read_ref(struct parsed_op *po,
-  const char *name)
+  const char *name, int *is_import)
 {
   const struct parsed_proto *pp;
 
@@ -2152,6 +2152,9 @@ static const char *check_label_read_ref(struct parsed_op *po,
 
   if (pp->is_func)
     check_func_pp(po, pp, "ref");
+
+  if (is_import != NULL)
+    *is_import = pp->is_import;
 
   return pp->name;
 }
@@ -2171,6 +2174,7 @@ static char *out_src_opr(char *buf, size_t buf_size,
   char tmp1[256], tmp2[256];
   char expr[256];
   const char *name;
+  int is_import = 0;
   char *p;
   int ret;
 
@@ -2243,7 +2247,11 @@ static char *out_src_opr(char *buf, size_t buf_size,
     break;
 
   case OPT_LABEL:
-    name = check_label_read_ref(po, popr->name);
+    name = check_label_read_ref(po, popr->name, &is_import);
+    if (is_import)
+      // for imported data, asm is loading the offset
+      goto do_offset;
+
     if (cast[0] == 0 && popr->is_ptr)
       cast = "(u32)";
 
@@ -2259,7 +2267,8 @@ static char *out_src_opr(char *buf, size_t buf_size,
     break;
 
   case OPT_OFFSET:
-    name = check_label_read_ref(po, popr->name);
+  do_offset:
+    name = check_label_read_ref(po, popr->name, NULL);
     if (cast[0] == 0)
       cast = "(u32)";
     if (is_lea)
@@ -6310,6 +6319,9 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
 
       if (pp->is_fptr && !(pp->name[0] != 0 && pp->is_arg)) {
         if (pp->name[0] != 0) {
+          if (IS_START(pp->name, "guess"))
+            pp->is_guessed = 1;
+
           memmove(pp->name + 2, pp->name, strlen(pp->name) + 1);
           memcpy(pp->name, "i_", 2);
 
@@ -7347,9 +7359,10 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
           fprintf(fout, "%s%s = %s;\n", buf3, pp->name,
             out_src_opr(buf1, sizeof(buf1), po, &po->operand[0],
               "(void *)", 0));
-          if (pp->is_unresolved || IS_START(pp->name, "i_guess"))
-            fprintf(fout, "%sunresolved_call(\"%s:%d\", %s);\n",
-              buf3, asmfn, po->asmln, pp->name);
+        }
+        if (pp->is_fptr && (pp->is_unresolved || pp->is_guessed)) {
+          fprintf(fout, "%sunresolved_call(\"%s:%d\", %s);\n",
+            buf3, asmfn, po->asmln, pp->name);
         }
 
         fprintf(fout, "%s", buf3);
