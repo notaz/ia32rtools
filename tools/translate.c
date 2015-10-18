@@ -328,6 +328,7 @@ static int g_sct_func_attr;
 static int g_stack_clear_start; // in dwords
 static int g_stack_clear_len;
 static int g_regmask_init;
+static int g_regmask_rm;
 static int g_skip_func;
 static int g_allow_regfunc;
 static int g_allow_user_icall;
@@ -6440,7 +6441,7 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
   }
 
   // declare normal registers
-  regmask_now = regmask & ~regmask_arg;
+  regmask_now = regmask & ~regmask_arg & ~g_regmask_rm;
   regmask_now &= ~(1 << xSP);
   if (regmask_now & 0x00ff) {
     for (reg = 0; reg < 8; reg++) {
@@ -9328,6 +9329,7 @@ int main(int argc, char *argv[])
         static const char *attrs[] = {
           "clear_sf",
           "clear_regmask",
+          "rm_regmask",
         };
 
         // parse manual attribute-list comment
@@ -9351,6 +9353,9 @@ int main(int argc, char *argv[])
             else if (i == 1)
               // clear_regmask=<mask>
               ret = sscanf(p, "=%x%n", &g_regmask_init, &j) + 1;
+            else if (i == 2)
+              // rm_regmask=<mask>
+              ret = sscanf(p, "=%x%n", &g_regmask_rm, &j) + 1;
             if (ret < 2) {
               anote("unparsed attr value: %s\n", p);
               break;
@@ -9559,6 +9564,7 @@ do_pending_endp:
       g_stack_clear_start = 0;
       g_stack_clear_len = 0;
       g_regmask_init = 0;
+      g_regmask_rm = 0;
       skip_warned = 0;
       g_skip_func = 0;
       g_func[0] = 0;
