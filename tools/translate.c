@@ -61,7 +61,7 @@ enum op_flags {
   OPF_EBP_S  = (1 << 13), /* ebp used as scratch here, not BP */
   OPF_DF     = (1 << 14), /* DF flag set */
   OPF_ATAIL  = (1 << 15), /* tail call with reused arg frame */
-  OPF_32BIT  = (1 << 16), /* 32bit division */
+  OPF_32BIT  = (1 << 16), /* enough to do 32bit for this op */
   OPF_LOCK   = (1 << 17), /* op has lock prefix */
   OPF_VAPUSH = (1 << 18), /* vararg ptr push (as call arg) */
   OPF_DONE   = (1 << 19), /* already fully handled by analysis */
@@ -1337,20 +1337,26 @@ static void parse_op(struct parsed_op *op, char words[16][256], int wordc)
     // fallthrough
   case OP_MUL:
     // singleop mul
-    op->regmask_src |= op->regmask_dst;
-    op->regmask_dst = (1 << xDX) | (1 << xAX);
     if (op->operand[0].lmod == OPLM_UNSPEC)
       op->operand[0].lmod = OPLM_DWORD;
+    op->regmask_src = mxAX | op->regmask_dst;
+    op->regmask_dst = mxAX;
+    if (op->operand[0].lmod != OPLM_BYTE)
+      op->regmask_dst |= mxDX;
     break;
 
   case OP_DIV:
   case OP_IDIV:
     // we could set up operands for edx:eax, but there is no real need to
     // (see is_opr_modified())
-    op->regmask_src |= op->regmask_dst;
-    op->regmask_dst = (1 << xDX) | (1 << xAX);
     if (op->operand[0].lmod == OPLM_UNSPEC)
       op->operand[0].lmod = OPLM_DWORD;
+    op->regmask_src = mxAX | op->regmask_dst;
+    op->regmask_dst = mxAX;
+    if (op->operand[0].lmod != OPLM_BYTE) {
+      op->regmask_src |= mxDX;
+      op->regmask_dst |= mxDX;
+    }
     break;
 
   case OP_SHL:
@@ -1405,6 +1411,8 @@ static void parse_op(struct parsed_op *op, char words[16][256], int wordc)
     break;
 
   case OP_CALL:
+    // needed because of OPF_DATA
+    op->regmask_src = op->regmask_dst;
     // trashed regs must be explicitly detected later
     op->regmask_dst = 0;
     break;
@@ -8090,6 +8098,7 @@ struct func_prototype {
   int has_ret:3;                 // -1, 0, 1: unresolved, no, yes
   unsigned int dep_resolved:1;
   unsigned int is_stdcall:1;
+  unsigned int eax_pass:1;       // returns without touching eax
   struct func_proto_dep *dep_func;
   int dep_func_cnt;
   const struct parsed_proto *pp; // seed pp, if any
@@ -8304,6 +8313,7 @@ static void gen_hdr_dep_pass(int i, int opcnt, unsigned char *cbits,
       if (ret != 1 && from_caller) {
         // unresolved eax - probably void func
         *has_ret = 0;
+        fp->eax_pass = 1;
       }
       else {
         if (j >= 0 && ops[j].op == OP_CALL) {
@@ -8720,6 +8730,12 @@ static void output_hdr(FILE *fout)
 
   // adjust functions referenced from data segment
   do_func_refs_from_data();
+
+  // final adjustments
+  for (i = 0; i < hg_fp_cnt; i++) {
+    if (hg_fp[i].eax_pass && (hg_fp[i].regmask_dep & mxAX))
+      hg_fp[i].has_ret = 1;
+  }
 
   // note: messes up .proto ptr, don't use
   //qsort(hg_fp, hg_fp_cnt, sizeof(hg_fp[0]), hg_fp_cmp_id);
@@ -9144,7 +9160,7 @@ int main(int argc, char *argv[])
   int pi = 0;
   int i, j;
   int ret, len;
-  char *p;
+  char *p, *p2;
   int wordc;
 
   for (arg = 1; arg < argc; arg++) {
@@ -9421,6 +9437,11 @@ parse_words:
 
     // allow asm patches in comments
     if (*p == ';') {
+      // skip IDA's forced non-removable comment
+      if (!IS_START(p, "; sct") && (p2 = strchr(p + 1, ';')))
+        p = p2;
+    }
+    if (*p == ';' && IS_START(p, "; sct")) {
       if (IS_START(p, "; sctpatch:")) {
         p = sskip(p + 11);
         if (*p == 0 || *p == ';')
