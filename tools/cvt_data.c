@@ -305,10 +305,17 @@ check_sym:
   }
 
   if (pp_cmp_func(pp, pp_sym)) {
-    pp_print(fp_sym, sizeof(fp_sym), pp_sym);
-    anote("var: %s\n", fp_var);
-    anote("sym: %s\n", fp_sym);
-    awarn("^ mismatch\n");
+    if (pp_sym->argc_stack == 0 && pp_sym->is_fastcall
+        && pp->argc_stack == 0
+        && (pp->is_fastcall || pp->argc_reg == 0)
+        && pp_sym->argc_reg > pp->argc_reg)
+      ; /* fascall compatible func doesn't use all args -> ok */
+    else {
+      pp_print(fp_sym, sizeof(fp_sym), pp_sym);
+      anote("var: %s\n", fp_var);
+      anote("sym: %s\n", fp_sym);
+      awarn("^ mismatch\n");
+    }
   }
 
   return pp;
