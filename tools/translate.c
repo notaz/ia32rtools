@@ -278,9 +278,12 @@ enum ida_func_attr {
   IDAFA_FPD      = (1 << 5),
 };
 
+// sctattr
 enum sct_func_attr {
   SCTFA_CLEAR_SF   = (1 << 0), // clear stack frame
   SCTFA_CLEAR_REGS = (1 << 1), // clear registers (mask)
+  SCTFA_RM_REGS    = (1 << 2), // don't emit regs
+  SCTFA_NOWARN     = (1 << 3), // don't try to detect problems
 };
 
 enum x87_const {
@@ -348,6 +351,9 @@ static int g_header_mode;
 #define ferr_assert(op_, cond) do { \
   if (!(cond)) ferr(op_, "assertion '%s' failed\n", #cond); \
 } while (0)
+
+#define IS_OP_INDIRECT_CALL(op_) \
+  ((op_)->op == OP_CALL && (op_)->operand[0].type != OPT_LABEL)
 
 const char *regs_r32[] = {
   "eax", "ebx", "ecx", "edx", "esi", "edi", "ebp", "esp",
@@ -4641,6 +4647,15 @@ static int find_next_read(int i, int opcnt,
   return 0;
 }
 
+static int find_next_read_reg(int i, int opcnt, int reg,
+  enum opr_lenmod lmod, int magic, int *op_i)
+{
+  struct parsed_opr opr = OPR_INIT(OPT_REG, lmod, reg);
+
+  *op_i = -1;
+  return find_next_read(i, opcnt, &opr, magic, op_i);
+}
+
 // find next instruction that reads opr
 // *op_i must be set to -1 by the caller
 // on return, *op_i is set to first flag user insn
@@ -5635,9 +5650,8 @@ static void reg_use_pass(int i, int opcnt, unsigned char *cbits,
           // don't need eax, will do "return f();" or "f(); return;"
           po->regmask_dst &= ~(1 << xAX);
         else {
-          struct parsed_opr opr = OPR_INIT(OPT_REG, OPLM_DWORD, xAX);
-          j = -1;
-          find_next_read(i + 1, opcnt, &opr, i + opcnt * 17, &j);
+          find_next_read_reg(i + 1, opcnt, xAX, OPLM_DWORD,
+            i + opcnt * 17, &j);
           if (j == -1)
             // not used
             po->regmask_dst &= ~(1 << xAX);
@@ -6210,6 +6224,44 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
         if (pp->argc_stack > 0)
           pp->is_stdcall = 1;
       }
+      if (!(po->flags & OPF_TAIL)
+          && !(g_sct_func_attr & SCTFA_NOWARN))
+      {
+        // treat al write as overwrite to avoid many false positives
+        if (IS(pp->ret_type.name, "void") || pp->ret_type.is_float) {
+          find_next_read_reg(i + 1, opcnt, xAX, OPLM_BYTE,
+            i + opcnt * 25, &j);
+          if (j != -1) {
+            fnote(po, "eax used after void/float ret call\n");
+            fnote(&ops[j], "(used here)\n");
+          }
+        }
+        if (!strstr(pp->ret_type.name, "int64")) {
+          find_next_read_reg(i + 1, opcnt, xDX, OPLM_BYTE,
+            i + opcnt * 26, &j);
+          // indirect calls are often guessed, don't warn
+          if (j != -1 && !IS_OP_INDIRECT_CALL(&ops[j])) {
+            fnote(po, "edx used after 32bit ret call\n");
+            fnote(&ops[j], "(used here)\n");
+          }
+        }
+        j = 1;
+        // msvc often relies on callee not modifying 'this'
+        for (arg = 0; arg < pp->argc; arg++) {
+          if (pp->arg[arg].reg && IS(pp->arg[arg].reg, "ecx")) {
+            j = 0;
+            break;
+          }
+        }
+        if (j != 0) {
+          find_next_read_reg(i + 1, opcnt, xCX, OPLM_BYTE,
+            i + opcnt * 27, &j);
+          if (j != -1 && !IS_OP_INDIRECT_CALL(&ops[j])) {
+            fnote(po, "ecx used after call\n");
+            fnote(&ops[j], "(used here)\n");
+          }
+        }
+      }
       break;
 
     case OP_MOV:
@@ -6270,14 +6322,12 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
       need_tmp64 = 1;
       break;
 
-    case OPP_FTOL: {
-      struct parsed_opr opr = OPR_INIT(OPT_REG, OPLM_DWORD, xDX);
-      j = -1;
-      find_next_read(i + 1, opcnt, &opr, i + opcnt * 18, &j);
+    case OPP_FTOL:
+      find_next_read_reg(i + 1, opcnt, xDX, OPLM_DWORD,
+        i + opcnt * 18, &j);
       if (j == -1)
         po->flags |= OPF_32BIT;
       break;
-    }
 
     default:
       break;
@@ -8095,8 +8145,10 @@ struct func_prototype {
   char name[NAMELEN];
   int id;
   int argc_stack;
-  int regmask_dep;
+  int regmask_dep;               // likely register args
+  int regmask_use;               // used registers
   int has_ret:3;                 // -1, 0, 1: unresolved, no, yes
+  unsigned int has_ret64:1;
   unsigned int dep_resolved:1;
   unsigned int is_stdcall:1;
   unsigned int eax_pass:1;       // returns without touching eax
@@ -8110,6 +8162,8 @@ struct func_proto_dep {
   struct func_prototype *proto;
   int regmask_live;             // .. at the time of call
   unsigned int ret_dep:1;       // return from this is caller's return
+  unsigned int has_ret:1;       // found from eax use after return
+  unsigned int has_ret64:1;
 };
 
 static struct func_prototype *hg_fp;
@@ -8211,7 +8265,7 @@ static void hg_ref_add(const char *name)
 // - calculate reg deps
 static void gen_hdr_dep_pass(int i, int opcnt, unsigned char *cbits,
   struct func_prototype *fp, int regmask_save, int regmask_dst,
-  int *regmask_dep, int *has_ret)
+  int *regmask_dep, int *regmask_use, int *has_ret)
 {
   struct func_proto_dep *dep;
   struct parsed_op *po;
@@ -8237,7 +8291,8 @@ static void gen_hdr_dep_pass(int i, int opcnt, unsigned char *cbits,
         for (j = 0; j < po->btj->count; j++) {
           check_i(po, po->btj->d[j].bt_i);
           gen_hdr_dep_pass(po->btj->d[j].bt_i, opcnt, cbits, fp,
-            regmask_save, regmask_dst, regmask_dep, has_ret);
+            regmask_save, regmask_dst, regmask_dep, regmask_use,
+            has_ret);
         }
         return;
       }
@@ -8245,7 +8300,8 @@ static void gen_hdr_dep_pass(int i, int opcnt, unsigned char *cbits,
       check_i(po, po->bt_i);
       if (po->flags & OPF_CJMP) {
         gen_hdr_dep_pass(po->bt_i, opcnt, cbits, fp,
-          regmask_save, regmask_dst, regmask_dep, has_ret);
+          regmask_save, regmask_dst, regmask_dep, regmask_use,
+          has_ret);
       }
       else {
         i = po->bt_i - 1;
@@ -8297,9 +8353,7 @@ static void gen_hdr_dep_pass(int i, int opcnt, unsigned char *cbits,
       }
     }
 
-    // if has_ret is 0, there is uninitialized eax path,
-    // which means it's most likely void func
-    if (*has_ret != 0 && (po->flags & OPF_TAIL)) {
+    if (!fp->eax_pass && (po->flags & OPF_TAIL)) {
       if (po->op == OP_CALL) {
         j = i;
         ret = 1;
@@ -8318,11 +8372,23 @@ static void gen_hdr_dep_pass(int i, int opcnt, unsigned char *cbits,
       }
       else {
         if (j >= 0 && ops[j].op == OP_CALL) {
-          dep = hg_fp_find_dep(fp, ops[j].operand[0].name);
-          if (dep != NULL)
-            dep->ret_dep = 1;
-          else
-            *has_ret = 1;
+          if (ops[j].pp != NULL && !ops[j].pp->is_unresolved) {
+            int call_has_ret = !IS(ops[j].pp->ret_type.name, "void");
+            if (ops[j].pp->is_noreturn) {
+              // could be some fail path
+              if (*has_ret == -1)
+                *has_ret = call_has_ret;
+            }
+            else
+              *has_ret = call_has_ret;
+          }
+          else {
+            dep = hg_fp_find_dep(fp, ops[j].operand[0].name);
+            if (dep != NULL)
+              dep->ret_dep = 1;
+            else
+              *has_ret = 1;
+          }
         }
         else
           *has_ret = 1;
@@ -8340,6 +8406,8 @@ static void gen_hdr_dep_pass(int i, int opcnt, unsigned char *cbits,
         l, regmask_dst, regmask_save, po->flags);
 #endif
     *regmask_dep |= l;
+    *regmask_use |= (po->regmask_src | po->regmask_dst)
+                  & ~regmask_save;
     regmask_dst |= po->regmask_dst;
 
     if (po->flags & OPF_TAIL)
@@ -8353,9 +8421,11 @@ static void gen_hdr(const char *funcn, int opcnt)
   const struct parsed_proto *pp_c;
   struct parsed_proto *pp;
   struct func_prototype *fp;
+  struct func_proto_dep *dep;
   struct parsed_op *po;
   int regmask_dummy = 0;
   int regmask_dep;
+  int regmask_use;
   int max_bp_offset = 0;
   int has_ret;
   int i, j, l;
@@ -8477,15 +8547,31 @@ static void gen_hdr(const char *funcn, int opcnt)
         ret = collect_call_args(po, i, pp, &regmask_dummy,
                 i + opcnt * 1);
       }
+      if (!(po->flags & OPF_TAIL)
+          && po->operand[0].type == OPT_LABEL)
+      {
+        dep = hg_fp_find_dep(fp, opr_name(po, 0));
+        ferr_assert(po, dep != NULL);
+        // treat al write as overwrite to avoid many false positives
+        find_next_read_reg(i + 1, opcnt, xAX, OPLM_BYTE,
+          i + opcnt * 25, &j);
+        if (j != -1)
+          dep->has_ret = 1;
+        find_next_read_reg(i + 1, opcnt, xDX, OPLM_BYTE,
+          i + opcnt * 26, &j);
+        if (j != -1 && !IS_OP_INDIRECT_CALL(&ops[j]))
+          dep->has_ret64 = 1;
+      }
     }
   }
 
   // pass7
   memset(cbits, 0, sizeof(cbits));
-  regmask_dep = 0;
+  regmask_dep = regmask_use = 0;
   has_ret = -1;
 
-  gen_hdr_dep_pass(0, opcnt, cbits, fp, 0, 0, &regmask_dep, &has_ret);
+  gen_hdr_dep_pass(0, opcnt, cbits, fp, 0, 0,
+    &regmask_dep, &regmask_use, &has_ret);
 
   // find unreachable code - must be fixed in IDA
   for (i = 0; i < opcnt; i++)
@@ -8520,6 +8606,7 @@ static void gen_hdr(const char *funcn, int opcnt)
   }
 
   fp->regmask_dep = regmask_dep & ~((1 << xSP) | mxSTa);
+  fp->regmask_use = regmask_use;
   fp->has_ret = has_ret;
 #if 0
   printf("// has_ret %d, regmask_dep %x\n",
@@ -8534,28 +8621,35 @@ static void gen_hdr(const char *funcn, int opcnt)
 static void hg_fp_resolve_deps(struct func_prototype *fp)
 {
   struct func_prototype fp_s;
-  int dep;
+  struct func_proto_dep *dep;
+  int regmask_dep;
   int i;
 
   // this thing is recursive, so mark first..
   fp->dep_resolved = 1;
 
   for (i = 0; i < fp->dep_func_cnt; i++) {
-    strcpy(fp_s.name, fp->dep_func[i].name);
-    fp->dep_func[i].proto = bsearch(&fp_s, hg_fp, hg_fp_cnt,
+    dep = &fp->dep_func[i];
+
+    strcpy(fp_s.name, dep->name);
+    dep->proto = bsearch(&fp_s, hg_fp, hg_fp_cnt,
       sizeof(hg_fp[0]), hg_fp_cmp_name);
-    if (fp->dep_func[i].proto != NULL) {
-      if (!fp->dep_func[i].proto->dep_resolved)
-        hg_fp_resolve_deps(fp->dep_func[i].proto);
+    if (dep->proto != NULL) {
+      if (!dep->proto->dep_resolved)
+        hg_fp_resolve_deps(dep->proto);
 
-      dep = ~fp->dep_func[i].regmask_live
-           & fp->dep_func[i].proto->regmask_dep;
-      fp->regmask_dep |= dep;
+      regmask_dep = ~dep->regmask_live
+                   & dep->proto->regmask_dep;
+      fp->regmask_dep |= regmask_dep;
       // printf("dep %s %s |= %x\n", fp->name,
-      //   fp->dep_func[i].name, dep);
+      //   fp->dep_func[i].name, regmask_dep);
 
-      if (fp->has_ret == -1 && fp->dep_func[i].ret_dep)
-        fp->has_ret = fp->dep_func[i].proto->has_ret;
+      if (dep->has_ret && (dep->proto->regmask_use & mxAX))
+        dep->proto->has_ret = 1;
+      if (dep->has_ret64 && (dep->proto->regmask_use & mxDX))
+        dep->proto->has_ret64 = 1;
+      if (fp->has_ret == -1 && dep->ret_dep)
+        fp->has_ret = dep->proto->has_ret;
     }
   }
 }
@@ -8625,8 +8719,10 @@ static void output_hdr_fp(FILE *fout, const struct func_prototype *fp,
     regmask_dep = fp->regmask_dep;
     argc_normal = fp->argc_stack;
 
-    fprintf(fout, "%-5s", fp->pp ? fp->pp->ret_type.name :
-      (fp->has_ret ? "int" : "void"));
+    fprintf(fout, "%-5s",
+      fp->pp ? fp->pp->ret_type.name :
+      fp->has_ret64 ? "__int64" :
+      fp->has_ret ? "int" : "void");
     if (regmask_dep && (fp->is_stdcall || fp->argc_stack > 0)
       && (regmask_dep & ~mxCX) == 0)
     {
@@ -9325,6 +9421,7 @@ int main(int argc, char *argv[])
           "clear_sf",
           "clear_regmask",
           "rm_regmask",
+          "nowarn",
         };
 
         // parse manual attribute-list comment
