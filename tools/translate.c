@@ -8404,15 +8404,9 @@ static void gen_hdr(const char *funcn, int opcnt)
   }
 
   // pass4:
-  // - remove dead labels
   // - handle push <const>/pop pairs
   for (i = 0; i < opcnt; i++)
   {
-    if (g_labels[i] != NULL && g_label_refs[i].i == -1) {
-      free(g_labels[i]);
-      g_labels[i] = NULL;
-    }
-
     po = &ops[i];
     if (po->flags & (OPF_RMD|OPF_DONE))
       continue;
