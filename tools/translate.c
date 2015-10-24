@@ -8634,8 +8634,9 @@ static void output_hdr_fp(FILE *fout, const struct func_prototype *fp,
       argc_normal++;
       regmask_dep = 0;
     }
-    else if (regmask_dep && (fp->is_stdcall || fp->argc_stack == 0)
-      && (regmask_dep & ~(mxCX | mxDX)) == 0)
+    else if ((regmask_dep == (mxCX | mxDX)
+              && (fp->is_stdcall || fp->argc_stack == 0))
+      || (regmask_dep == mxCX && fp->argc_stack == 0))
     {
       fprintf(fout, "  __fastcall    ");
       if (!(regmask_dep & (1 << xDX)) && fp->argc_stack == 0)
