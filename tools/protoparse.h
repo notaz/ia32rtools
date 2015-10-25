@@ -239,6 +239,8 @@ static const char *known_ptr_types[] = {
 	"REFCLSID",
 	"REFGUID",
 	"REFIID",
+	"SC_HANDLE",
+	"SERVICE_STATUS_HANDLE",
 	"HOOKPROC",
 	"DLGPROC",
 	"TIMERPROC",

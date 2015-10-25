@@ -81,6 +81,7 @@ __strupr
 _sprintf
 _vsprintf
 _fprintf
+_printf
 __strlwr
 __fullpath
 _toupper

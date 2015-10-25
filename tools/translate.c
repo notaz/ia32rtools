@@ -597,24 +597,27 @@ static const char *parse_stack_el(const char *name, char *extra_reg,
       if (p == NULL)
         aerr("%s IDA stackvar not set?\n", __func__);
     }
-    if (!('0' <= *s && *s <= '9')) {
-      aerr("%s IDA stackvar offset not set?\n", __func__);
-      return NULL;
-    }
-    if (s[0] == '0' && s[1] == 'x')
-      s += 2;
-    len = p - s;
-    if (len < sizeof(buf) - 1) {
-      strncpy(buf, s, len);
-      buf[len] = 0;
-      errno = 0;
-      val = strtol(buf, &endp, 16);
-      if (val == 0 || *endp != 0 || errno != 0) {
-        aerr("%s num parse fail for '%s'\n", __func__, buf);
-        return NULL;
+    if ('0' <= *s && *s <= '9') {
+      if (s[0] == '0' && s[1] == 'x')
+        s += 2;
+      len = p - s;
+      if (len < sizeof(buf) - 1) {
+        strncpy(buf, s, len);
+        buf[len] = 0;
+        errno = 0;
+        val = strtol(buf, &endp, 16);
+        if (val == 0 || *endp != 0 || errno != 0) {
+          aerr("%s num parse fail for '%s'\n", __func__, buf);
+          return NULL;
+        }
       }
+      p++;
     }
-    p++;
+    else {
+      // probably something like [esp+arg_4+2]
+      p = s;
+      val = 0;
+    }
   }
   else
     p = name + 4;
@@ -1419,7 +1422,7 @@ static void parse_op(struct parsed_op *op, char words[16][256], int wordc)
 
   case OP_CALL:
     // needed because of OPF_DATA
-    op->regmask_src = op->regmask_dst;
+    op->regmask_src |= op->regmask_dst;
     // trashed regs must be explicitly detected later
     op->regmask_dst = 0;
     break;
@@ -8410,8 +8413,10 @@ static void gen_hdr_dep_pass(int i, int opcnt, unsigned char *cbits,
                   & ~regmask_save;
     regmask_dst |= po->regmask_dst;
 
-    if (po->flags & OPF_TAIL)
-      return;
+    if (po->flags & OPF_TAIL) {
+      if (!(po->flags & OPF_CC)) // not cond. tailcall
+        return;
+    }
   }
 }
 
@@ -8566,7 +8571,7 @@ static void gen_hdr(const char *funcn, int opcnt)
   }
 
   // pass7
-  memset(cbits, 0, sizeof(cbits));
+  memset(cbits, 0, (opcnt + 7) / 8);
   regmask_dep = regmask_use = 0;
   has_ret = -1;
 
