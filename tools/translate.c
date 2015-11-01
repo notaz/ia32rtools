@@ -1956,7 +1956,7 @@ static int stack_frame_access(struct parsed_op *po,
         snprintf(buf, buf_size, "%sap", cast);
         return -1;
       }
-      ferr(po, "offset %d (%s,%d) doesn't map to any arg\n",
+      ferr(po, "offset 0x%x (%s,%d) doesn't map to any arg\n",
         offset, bp_arg, arg_i);
     }
     if (ofs_reg[0] != 0)
@@ -4146,9 +4146,72 @@ static void eliminate_seh_calls(int opcnt)
   eliminate_seh_finally(opcnt);
 }
 
+// check for prologue of many pushes and epilogue with pops
+static void check_simple_sequence(int opcnt, int *fsz)
+{
+  int found = 0;
+  int seq_len;
+  int seq_p;
+  int seq[4];
+  int reg;
+  int i, j;
+
+  for (i = 0; i < opcnt && i < ARRAY_SIZE(seq); i++) {
+    if (ops[i].op != OP_PUSH || ops[i].operand[0].type != OPT_REG)
+      break;
+    reg = ops[i].operand[0].reg;
+    if (reg != xBX && reg != xSI && reg != xDI && reg != xBP)
+      break;
+    for (j = 0; j < i; j++)
+      if (seq[j] == reg)
+        break;
+    if (j != i)
+      // probably something else is going on here
+      break;
+    seq[i] = reg;
+  }
+  seq_len = i;
+  if (seq_len == 0)
+    return;
+
+  for (; i < opcnt && seq_len > 0; i++) {
+    if (!(ops[i].flags & OPF_TAIL))
+      continue;
+
+    for (j = i - 1, seq_p = 0; j >= 0 && seq_p < seq_len; j--) {
+      if (ops[j].op != OP_POP || ops[j].operand[0].type != OPT_REG)
+        break;
+      if (ops[j].operand[0].reg != seq[seq_p])
+        break;
+      seq_p++;
+    }
+    found = seq_len = seq_p;
+  }
+  if (!found)
+    return;
+
+  for (i = 0; i < seq_len; i++)
+    ops[i].flags |= OPF_RMD | OPF_DONE | OPF_NOREGS;
+
+  for (; i < opcnt && seq_len > 0; i++) {
+    if (!(ops[i].flags & OPF_TAIL))
+      continue;
+
+    for (j = i - 1, seq_p = 0; j >= 0 && seq_p < seq_len; j--) {
+      ops[j].flags |= OPF_RMD | OPF_DONE | OPF_NOREGS;
+      seq_p++;
+    }
+  }
+
+  // unlike pushes after sub esp,
+  // IDA treats pushed like this as part of var area
+  *fsz += seq_len * 4;
+}
+
 static int scan_prologue(int i, int opcnt, int *ecx_push, int *esp_sub)
 {
-  int j;
+  const char *name;
+  int j, len, ret;
 
   for (; i < opcnt; i++)
     if (!(ops[i].flags & OPF_DONE))
@@ -4170,6 +4233,19 @@ static int scan_prologue(int i, int opcnt, int *ecx_push, int *esp_sub)
       && ops[i].operand[1].type == OPT_CONST)
     {
       g_stack_fsz += opr_const(&ops[i], 1);
+      ops[i].flags |= OPF_RMD | OPF_DONE | OPF_NOREGS;
+      i++;
+      *esp_sub = 1;
+      break;
+    }
+    if (ops[i].op == OP_LEA && ops[i].operand[0].reg == xSP
+      && ops[i].operand[1].type == OPT_REGMEM
+      && IS_START(ops[i].operand[1].name, "esp-"))
+    {
+      name = ops[i].operand[1].name;
+      ret = sscanf(name, "esp-%x%n", &j, &len);
+      ferr_assert(&ops[i], ret == 1 && len == strlen(name));
+      g_stack_fsz += j;
       ops[i].flags |= OPF_RMD | OPF_DONE | OPF_NOREGS;
       i++;
       *esp_sub = 1;
@@ -4201,7 +4277,8 @@ static void scan_prologue_epilogue(int opcnt, int *stack_align)
 {
   int ecx_push = 0, esp_sub = 0, pusha = 0;
   int sandard_epilogue;
-  int found;
+  int found, ret, len;
+  int push_fsz = 0;
   int i, j, l;
 
   if (g_seh_found == 2) {
@@ -4325,6 +4402,7 @@ static void scan_prologue_epilogue(int opcnt, int *stack_align)
   }
 
   // non-bp frame
+  check_simple_sequence(opcnt, &push_fsz);
   i = scan_prologue(0, opcnt, &ecx_push, &esp_sub);
 
   if (ecx_push && !esp_sub) {
@@ -4389,6 +4467,12 @@ static void scan_prologue_epilogue(int opcnt, int *stack_align)
         }
       }
 
+      for (; j >= 0; j--) {
+        if ((ops[j].flags & (OPF_RMD | OPF_DONE | OPF_NOREGS)) !=
+            (OPF_RMD | OPF_DONE | OPF_NOREGS))
+          break;
+      }
+
       if (ecx_push > 0 && !esp_sub) {
         for (l = 0; l < ecx_push && j >= 0; l++) {
           if (ops[j].op == OP_POP && IS(opr_name(&ops[j], 0), "ecx"))
@@ -4422,28 +4506,37 @@ static void scan_prologue_epilogue(int opcnt, int *stack_align)
       }
 
       if (esp_sub) {
-        if (ops[j].op != OP_ADD
-            || !IS(opr_name(&ops[j], 0), "esp")
-            || ops[j].operand[1].type != OPT_CONST)
+        if (ops[j].op == OP_ADD
+            && IS(opr_name(&ops[j], 0), "esp")
+            && ops[j].operand[1].type == OPT_CONST)
         {
-          if (i < opcnt && ops[i].op == OP_CALL
-            && ops[i].pp != NULL && ops[i].pp->is_noreturn)
-          {
-            // noreturn tailcall with no epilogue
-            i++;
-            found = 1;
-            continue;
-          }
-          ferr(&ops[j], "'add esp' expected\n");
+          if (ops[j].operand[1].val < g_stack_fsz)
+            ferr(&ops[j], "esp adj is too low (need %d)\n", g_stack_fsz);
+
+          ops[j].operand[1].val -= g_stack_fsz; // for stack arg scanner
+          if (ops[j].operand[1].val == 0)
+            ops[j].flags |= OPF_RMD | OPF_DONE | OPF_NOREGS;
+          found = 1;
         }
-
-        if (ops[j].operand[1].val < g_stack_fsz)
-          ferr(&ops[j], "esp adj is too low (need %d)\n", g_stack_fsz);
-
-        ops[j].operand[1].val -= g_stack_fsz; // for stack arg scanner
-        if (ops[j].operand[1].val == 0)
+        else if (ops[j].op == OP_LEA && ops[j].operand[0].reg == xSP
+          && ops[j].operand[1].type == OPT_REGMEM
+          && IS_START(ops[j].operand[1].name, "esp+"))
+        {
+          const char *name = ops[j].operand[1].name;
+          ret = sscanf(name, "esp+%x%n", &l, &len);
+          ferr_assert(&ops[j], ret == 1 && len == strlen(name));
+          ferr_assert(&ops[j], l <= g_stack_fsz);
           ops[j].flags |= OPF_RMD | OPF_DONE | OPF_NOREGS;
-        found = 1;
+          found = 1;
+        }
+        else if (i < opcnt && ops[i].op == OP_CALL
+          && ops[i].pp != NULL && ops[i].pp->is_noreturn)
+        {
+          // noreturn tailcall with no epilogue
+          found = 1;
+        }
+        else
+          ferr(&ops[j], "'add esp' expected\n");
       }
 
       i++;
@@ -4452,6 +4545,10 @@ static void scan_prologue_epilogue(int opcnt, int *stack_align)
     if (!found)
       ferr(ops, "missing esp epilogue\n");
   }
+
+  if (g_stack_fsz != 0)
+    // see check_simple_sequence
+    g_stack_fsz += push_fsz;
 }
 
 // find an instruction that changed opr before i op
