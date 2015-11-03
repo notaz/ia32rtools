@@ -96,6 +96,8 @@ enum op_op {
 	OP_MOVS,
 	OP_CMPS,
 	OP_SCAS,
+	OP_RDTSC,
+	OP_CPUID,
 	OP_STD,
 	OP_CLD,
 	OP_RET,
@@ -282,8 +284,9 @@ enum ida_func_attr {
 enum sct_func_attr {
   SCTFA_CLEAR_SF   = (1 << 0), // clear stack frame
   SCTFA_CLEAR_REGS = (1 << 1), // clear registers (mask)
-  SCTFA_RM_REGS    = (1 << 2), // don't emit regs
+  SCTFA_RM_REGS    = (1 << 2), // don't emit regs (mask)
   SCTFA_NOWARN     = (1 << 3), // don't try to detect problems
+  SCTFA_ARGFRAME   = (1 << 4), // copy all args to a struct, in order
 };
 
 enum x87_const {
@@ -376,6 +379,7 @@ enum x86_regs {
 };
 
 #define mxAX     (1 << xAX)
+#define mxBX     (1 << xBX)
 #define mxCX     (1 << xCX)
 #define mxDX     (1 << xDX)
 #define mxSP     (1 << xSP)
@@ -954,7 +958,7 @@ static const struct {
   { "repz",   OPF_REP|OPF_REPZ },
   { "repne",  OPF_REP|OPF_REPNZ },
   { "repnz",  OPF_REP|OPF_REPNZ },
-  { "lock",   OPF_LOCK }, // ignored for now..
+  { "lock",   OPF_LOCK },
 };
 
 #define OPF_CJMP_CC (OPF_JMP|OPF_CJMP|OPF_CC)
@@ -998,6 +1002,8 @@ static const struct {
   { "scasb",OP_SCAS,   0, 0, OPF_DATA|OPF_FLAGS },
   { "scasw",OP_SCAS,   0, 0, OPF_DATA|OPF_FLAGS },
   { "scasd",OP_SCAS,   0, 0, OPF_DATA|OPF_FLAGS },
+  { "rdtsc",OP_RDTSC,  0, 0, OPF_DATA },
+  { "cpuid",OP_CPUID,  0, 0, OPF_DATA },
   { "std",  OP_STD,    0, 0, OPF_DATA }, // special flag
   { "cld",  OP_CLD,    0, 0, OPF_DATA },
   { "add",  OP_ADD,    2, 2, OPF_DATA|OPF_FLAGS },
@@ -1323,6 +1329,16 @@ static void parse_op(struct parsed_op *op, char words[16][256], int wordc)
       setup_reg_opr(&op->operand[j++], xCX, OPLM_DWORD, &op->regmask_src);
     op->operand_cnt = j;
     op->regmask_dst = op->regmask_src;
+    break;
+
+  case OP_RDTSC:
+    op->regmask_dst = mxAX | mxDX;
+    break;
+
+  case OP_CPUID:
+    // for now, ignore ecx dep for eax={4,7,b,d}
+    op->regmask_src = mxAX;
+    op->regmask_dst = mxAX | mxBX | mxCX | mxDX;
     break;
 
   case OP_LOOP:
@@ -1926,6 +1942,7 @@ static int stack_frame_access(struct parsed_op *po,
   const char *prefix = "";
   const char *bp_arg = NULL;
   char ofs_reg[16] = { 0, };
+  char argname[8];
   int i, arg_i, arg_s;
   int unaligned = 0;
   int stack_ra = 0;
@@ -1975,17 +1992,20 @@ static int stack_frame_access(struct parsed_op *po,
     popr->is_ptr = g_func_pp->arg[i].type.is_ptr;
     retval = i;
 
+    snprintf(argname, sizeof(argname), "%sa%d",
+      g_sct_func_attr & SCTFA_ARGFRAME ? "af." : "", i + 1);
+
     switch (popr->lmod)
     {
     case OPLM_BYTE:
       if (is_lea)
         ferr(po, "lea/byte to arg?\n");
       if (is_src && (offset & 3) == 0)
-        snprintf(buf, buf_size, "%sa%d",
-          simplify_cast(cast, "(u8)"), i + 1);
+        snprintf(buf, buf_size, "%s%s",
+          simplify_cast(cast, "(u8)"), argname);
       else
-        snprintf(buf, buf_size, "%sBYTE%d(a%d)",
-          cast, offset & 3, i + 1);
+        snprintf(buf, buf_size, "%sBYTE%d(%s)",
+          cast, offset & 3, argname);
       break;
 
     case OPLM_WORD:
@@ -1996,18 +2016,18 @@ static int stack_frame_access(struct parsed_op *po,
         if (!is_src) {
           if (offset & 2)
             ferr(po, "problematic arg store\n");
-          snprintf(buf, buf_size, "%s((char *)&a%d + 1)",
-            simplify_cast(cast, "*(u16 *)"), i + 1);
+          snprintf(buf, buf_size, "%s((char *)&%s + 1)",
+            simplify_cast(cast, "*(u16 *)"), argname);
         }
         else
           ferr(po, "unaligned arg word load\n");
       }
       else if (is_src && (offset & 2) == 0)
-        snprintf(buf, buf_size, "%sa%d",
-          simplify_cast(cast, "(u16)"), i + 1);
+        snprintf(buf, buf_size, "%s%s",
+          simplify_cast(cast, "(u16)"), argname);
       else
-        snprintf(buf, buf_size, "%s%sWORD(a%d)",
-          cast, (offset & 2) ? "HI" : "LO", i + 1);
+        snprintf(buf, buf_size, "%s%sWORD(%s)",
+          cast, (offset & 2) ? "HI" : "LO", argname);
       break;
 
     case OPLM_DWORD:
@@ -2019,19 +2039,19 @@ static int stack_frame_access(struct parsed_op *po,
       if (offset & 3) {
         unaligned = 1;
         if (is_lea)
-          snprintf(buf, buf_size, "(u32)&a%d + %d",
-            i + 1, offset & 3);
+          snprintf(buf, buf_size, "(u32)&%s + %d",
+            argname, offset & 3);
         else if (!is_src)
           ferr(po, "unaligned arg store\n");
         else {
           // mov edx, [ebp+arg_4+2]; movsx ecx, dx
-          snprintf(buf, buf_size, "%s(a%d >> %d)",
-            prefix, i + 1, (offset & 3) * 8);
+          snprintf(buf, buf_size, "%s(%s >> %d)",
+            prefix, argname, (offset & 3) * 8);
         }
       }
       else {
-        snprintf(buf, buf_size, "%s%sa%d",
-          prefix, is_lea ? "&" : "", i + 1);
+        snprintf(buf, buf_size, "%s%s%s",
+          prefix, is_lea ? "&" : "", argname);
       }
       break;
 
@@ -2039,8 +2059,8 @@ static int stack_frame_access(struct parsed_op *po,
       ferr_assert(po, !(offset & 7));
       if (cast[0])
         prefix = cast;
-      snprintf(buf, buf_size, "%s%sa%d",
-        prefix, is_lea ? "&" : "", i + 1);
+      snprintf(buf, buf_size, "%s%s%s",
+        prefix, is_lea ? "&" : "", argname);
       break;
 
     default:
@@ -3524,6 +3544,11 @@ static const struct parsed_proto *try_recover_pp(
   const struct parsed_proto *pp = NULL;
   char buf[256];
   char *p;
+
+  if (po->pp != NULL && (po->flags & OPF_DATA)) {
+    // hint given in asm
+    return po->pp;
+  }
 
   // maybe an arg of g_func?
   if (opr->type == OPT_REGMEM && is_stack_access(po, opr))
@@ -5999,6 +6024,7 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
   int need_double = 0;
   int stack_align = 0;
   int stack_fsz_adj = 0;
+  int lock_handled = 0;
   int regmask_save = 0; // used regs saved/restored in this func
   int regmask_arg;      // regs from this function args (fastcall, etc)
   int regmask_ret;      // regs needed on ret
@@ -6417,6 +6443,7 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
         need_double = 1;
       break;
 
+    case OP_RDTSC:
     case OPP_ALLSHL:
     case OPP_ALLSHR:
       need_tmp64 = 1;
@@ -6553,6 +6580,28 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
       fprintf(fout, " u64 align;");
     fprintf(fout, " } sf;\n");
     had_decl = 1;
+  }
+
+  if ((g_sct_func_attr & SCTFA_ARGFRAME) && g_func_pp->argc_stack) {
+    fprintf(fout, "  struct { u32 ");
+    for (i = j = 0; i < g_func_pp->argc; i++) {
+      if (g_func_pp->arg[i].reg != NULL)
+        continue;
+      if (j++ != 0)
+        fprintf(fout, ", ");
+      fprintf(fout, "a%d", i + 1);
+    }
+    fprintf(fout, "; } af = {\n    ");
+    for (i = j = 0; i < g_func_pp->argc; i++) {
+      if (g_func_pp->arg[i].reg != NULL)
+        continue;
+      if (j++ != 0)
+        fprintf(fout, ", ");
+        if (g_func_pp->arg[i].type.is_ptr)
+          fprintf(fout, "(u32)");
+      fprintf(fout, "a%d", i + 1);
+    }
+    fprintf(fout, "\n  };\n");
   }
 
   if (g_func_pp->is_userstack) {
@@ -6742,6 +6791,7 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
     if (po->flags & OPF_RMD)
       continue;
 
+    lock_handled = 0;
     no_output = 0;
 
     #define assert_operand_cnt(n_) \
@@ -6919,9 +6969,10 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
           fprintf(fout, "  for (; ecx != 0; ecx--, edi %c= %d)\n",
             (po->flags & OPF_DF) ? '-' : '+',
             lmod_bytes(po, po->operand[1].lmod));
-          fprintf(fout, "    %sedi = eax;",
+          fprintf(fout, "    %sedi = eax;\n",
             lmod_cast_u_ptr(po, po->operand[1].lmod));
-          strcpy(g_comment, "rep stos");
+          fprintf(fout, "  barrier();");
+          strcpy(g_comment, "^ rep stos");
         }
         else {
           assert_operand_cnt(2);
@@ -6943,8 +6994,10 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
             "  for (; ecx != 0; ecx--, edi %c= %d, esi %c= %d)\n",
             l, j, l, j);
           fprintf(fout,
-            "    %sedi = %sesi;", buf1, buf1);
-          strcpy(g_comment, "rep movs");
+            "    %sedi = %sesi;\n", buf1, buf1);
+          // this can overwrite many variables
+          fprintf(fout, "  barrier();");
+          strcpy(g_comment, "^ rep movs");
         }
         else {
           assert_operand_cnt(2);
@@ -7025,6 +7078,16 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
         pfomask &= ~(1 << PFO_Z);
         last_arith_dst = NULL;
         delayed_flag_op = NULL;
+        break;
+
+      case OP_RDTSC:
+        fprintf(fout, "  tmp64 = ext_rdtsc();\n");
+        fprintf(fout, "  edx = tmp64 >> 32;\n");
+        fprintf(fout, "  eax = tmp64;");
+        break;
+
+      case OP_CPUID:
+        fprintf(fout, "  ext_cpuid(&eax, &ebx, &ecx, &edx);");
         break;
 
       // arithmetic w/flags
@@ -7330,8 +7393,17 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
 
         out_dst_opr(buf1, sizeof(buf1), po, &po->operand[0]);
         if (po->operand[0].type == OPT_REG) {
+          ferr_assert(po, !(po->flags & OPF_LOCK));
           strcpy(buf2, po->op == OP_INC ? "++" : "--");
           fprintf(fout, "  %s%s;", buf1, buf2);
+        }
+        else if (po->flags & OPF_LOCK) {
+          out_src_opr(buf2, sizeof(buf2), po, &po->operand[0], "", 1);
+          fprintf(fout, "  __sync_fetch_and_%s((%s *)(%s), 1);",
+            po->op == OP_INC ? "add" : "sub",
+            lmod_type_u(po, po->operand[0].lmod), buf2);
+          strcat(g_comment, " lock");
+          lock_handled = 1;
         }
         else {
           strcpy(buf2, po->op == OP_INC ? "+" : "-");
@@ -8191,6 +8263,9 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
 
     if (pfomask != 0)
       ferr(po, "missed flag calc, pfomask=%x\n", pfomask);
+
+    if ((po->flags & OPF_LOCK) && !lock_handled)
+      ferr(po, "unhandled lock\n");
 
     // see is delayed flag stuff is still valid
     if (delayed_flag_op != NULL && delayed_flag_op != po) {
@@ -9524,6 +9599,7 @@ int main(int argc, char *argv[])
           "clear_regmask",
           "rm_regmask",
           "nowarn",
+          "argframe",
         };
 
         // parse manual attribute-list comment

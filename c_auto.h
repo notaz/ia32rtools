@@ -63,4 +63,7 @@ static inline int do_parity(unsigned int v)
   printf("%s:%d: skip_code_abort\n", __FILE__, __LINE__); \
   *(volatile int *)0 = 1
 
+#define barrier() \
+  asm volatile("" ::: "memory")
+
 // vim:ts=2:sw=2:expandtab
