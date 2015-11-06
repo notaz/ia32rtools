@@ -3942,8 +3942,10 @@ static void resolve_branches_parse_calls(int opcnt)
           && IS(po->operand[0].name, g_labels[l]))
       {
         if (l == i + 1 && po->op == OP_JMP) {
-          // yet another alignment type..
-          po->flags |= OPF_RMD|OPF_DONE;
+          // yet another alignment type...
+          po->flags |= OPF_RMD | OPF_DONE;
+          po->flags &= ~OPF_JMP;
+          po->op = OP_NOP;
           break;
         }
         add_label_ref(&g_label_refs[l], i);

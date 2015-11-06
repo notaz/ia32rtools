@@ -526,7 +526,11 @@ static void idaapi run(int /*arg*/)
     int change_qat = 0;
     ea_flags = get_flags_novalue(ea);
     if (!isCode(ea_flags)) {
-      if (strchr(name, '?'))
+      if (IS_START(name, "__imp_"))
+        /* some import */;
+      else if (name[0] == '?' && strstr(name, "@@"))
+        /* c++ import */;
+      else if (strchr(name, '?'))
         change_qat = 1;
       else if ((cp = strchr(name, '@'))) {
         char *endp = NULL;

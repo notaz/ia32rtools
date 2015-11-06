@@ -1,6 +1,6 @@
 /*
  * ia32rtools
- * (C) notaz, 2013,2014
+ * (C) notaz, 2013-2015
  *
  * This work is licensed under the terms of 3-clause BSD license.
  * See COPYING file in the top-level directory.
@@ -239,7 +239,7 @@ static void sprint_pp_short(const struct parsed_proto *pp, char *buf,
 }
 
 static const struct parsed_proto *check_var(FILE *fhdr,
-  const char *sym, const char *varname)
+  const char *sym, const char *varname, int is_export)
 {
   const struct parsed_proto *pp, *pp_sym;
   char fp_sym[256], fp_var[256], *p;
@@ -252,6 +252,8 @@ static const struct parsed_proto *check_var(FILE *fhdr,
     return NULL;
   }
 
+  if (is_export)
+    return NULL;
   if (!pp->is_func && !pp->is_fptr)
     return NULL;
 
@@ -386,6 +388,7 @@ int main(int argc, char *argv[])
   FILE *fout, *fasm, *fhdr = NULL, *frlist;
   const struct parsed_proto *pp;
   int no_decorations = 0;
+  int in_export_table = 0;
   char comment_char = '#';
   char words[20][256];
   char word[256];
@@ -467,7 +470,7 @@ int main(int argc, char *argv[])
 
     while (my_fgets(line, sizeof(line), frlist)) {
       p = sskip(line);
-      if (*p == 0 || *p == ';')
+      if (*p == 0 || *p == ';' || *p == '#')
         continue;
 
       p = next_word(words[0], sizeof(words[0]), p);
@@ -533,6 +536,10 @@ int main(int argc, char *argv[])
           if (i != 0 && !header_mode)
             fprintf(fout, "\t\t  .skip 0x%x\n", i);
         }
+        else if (IS_START(p, "; Export Address"))
+          in_export_table = 1;
+        else if (IS_START(p, "; Export"))
+          in_export_table = 0;
         continue;
       }
 
@@ -797,7 +804,7 @@ int main(int argc, char *argv[])
             snprintf(g_comment, sizeof(g_comment), "%s", p);
           }
           else {
-            pp = check_var(fhdr, sym, p);
+            pp = check_var(fhdr, sym, p, in_export_table);
             if (pp == NULL) {
               fprintf(fout, "%s%s",
                 (no_decorations || p[0] == '_') ? "" : "_", p);
