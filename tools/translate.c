@@ -9725,16 +9725,18 @@ parse_words:
           continue;
         goto parse_words; // lame
       }
-      if (IS_START(p, "; sctproto:")) {
-        sctproto = strdup(p + 11);
-      }
       else if (IS_START(p, "; sctend")) {
         end = 1;
         if (!pending_endp)
           break;
       }
+      else if (g_skip_func)
+        /* ignore remaining attrs */;
+      else if (IS_START(p, "; sctproto:")) {
+        sctproto = strdup(p + 11);
+      }
       else if (IS_START(p, "; sctskip_start")) {
-        if (in_func && !g_skip_func) {
+        if (in_func) {
           if (!skip_code) {
             ops[pi].op = OPP_ABORT;
             ops[pi].asmln = asmln;
