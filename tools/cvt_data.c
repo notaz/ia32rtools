@@ -389,6 +389,7 @@ int main(int argc, char *argv[])
   const struct parsed_proto *pp;
   int no_decorations = 0;
   int in_export_table = 0;
+  int rm_labels_lines = 0;
   char comment_char = '#';
   char words[20][256];
   char word[256];
@@ -632,6 +633,8 @@ int main(int argc, char *argv[])
         }
 
         snprintf(last_sym, sizeof(last_sym), "%s", sym);
+        if (IS_START(sym, "__IMPORT_DESCRIPTOR_"))
+          rm_labels_lines = 5;
 
         pp = proto_parse(fhdr, sym, 1);
         if (pp != NULL) {
@@ -797,6 +800,7 @@ int main(int argc, char *argv[])
           p = words[w];
           if (IS_START(p, "loc_") || IS_START(p, "__imp")
              || strchr(p, '?') || strchr(p, '@')
+             || rm_labels_lines > 0
              || bsearch(&p, rlist, rlist_cnt, sizeof(rlist[0]),
                   cmpstringp))
           {
@@ -829,6 +833,9 @@ int main(int argc, char *argv[])
       }
 
 fin:
+      if (rm_labels_lines > 0)
+        rm_labels_lines--;
+
       if (g_comment[0] != 0) {
         fprintf(fout, "\t\t%c %s", comment_char, g_comment);
         g_comment[0] = 0;
