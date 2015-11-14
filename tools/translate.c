@@ -338,6 +338,7 @@ static int g_regmask_rm;
 static int g_skip_func;
 static int g_allow_regfunc;
 static int g_allow_user_icall;
+static int g_nowarn_reguse;
 static int g_quiet_pp;
 static int g_header_mode;
 
@@ -6353,7 +6354,7 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
           pp->is_stdcall = 1;
       }
       if (!(po->flags & OPF_TAIL)
-          && !(g_sct_func_attr & SCTFA_NOWARN))
+          && !(g_sct_func_attr & SCTFA_NOWARN) && !g_nowarn_reguse)
       {
         // treat al write as overwrite to avoid many false positives
         if (IS(pp->ret_type.name, "void") || pp->ret_type.is_float) {
@@ -8329,6 +8330,7 @@ struct func_prototype {
   unsigned int dep_resolved:1;
   unsigned int is_stdcall:1;
   unsigned int eax_pass:1;       // returns without touching eax
+  unsigned int ptr_taken:1;      // pointer taken of this func
   struct func_proto_dep *dep_func;
   int dep_func_cnt;
   const struct parsed_proto *pp; // seed pp, if any
@@ -8341,6 +8343,7 @@ struct func_proto_dep {
   unsigned int ret_dep:1;       // return from this is caller's return
   unsigned int has_ret:1;       // found from eax use after return
   unsigned int has_ret64:1;
+  unsigned int ptr_taken:1;     // pointer taken, not a call
 };
 
 static struct func_prototype *hg_fp;
@@ -8392,10 +8395,14 @@ static struct func_proto_dep *hg_fp_find_dep(struct func_prototype *fp,
   return NULL;
 }
 
-static void hg_fp_add_dep(struct func_prototype *fp, const char *name)
+static void hg_fp_add_dep(struct func_prototype *fp, const char *name,
+  unsigned int ptr_taken)
 {
+  struct func_proto_dep * dep;
+
   // is it a dupe?
-  if (hg_fp_find_dep(fp, name))
+  dep = hg_fp_find_dep(fp, name);
+  if (dep != NULL && dep->ptr_taken == ptr_taken)
     return;
 
   if ((fp->dep_func_cnt & 0xff) == 0) {
@@ -8406,6 +8413,7 @@ static void hg_fp_add_dep(struct func_prototype *fp, const char *name)
       sizeof(fp->dep_func[0]) * 0x100);
   }
   fp->dep_func[fp->dep_func_cnt].name = strdup(name);
+  fp->dep_func[fp->dep_func_cnt].ptr_taken = ptr_taken;
   fp->dep_func_cnt++;
 }
 
@@ -8602,6 +8610,7 @@ static void gen_hdr(const char *funcn, int opcnt)
   struct func_prototype *fp;
   struct func_proto_dep *dep;
   struct parsed_op *po;
+  const char *tmpname;
   int regmask_dummy = 0;
   int regmask_dep;
   int regmask_use;
@@ -8633,6 +8642,7 @@ static void gen_hdr(const char *funcn, int opcnt)
   // pass3:
   // - remove dead labels
   // - collect calls
+  // - collect function ptr refs
   for (i = 0; i < opcnt; i++)
   {
     if (g_labels[i] != NULL && g_label_refs[i].i == -1) {
@@ -8646,9 +8656,19 @@ static void gen_hdr(const char *funcn, int opcnt)
 
     if (po->op == OP_CALL) {
       if (po->operand[0].type == OPT_LABEL)
-        hg_fp_add_dep(fp, opr_name(po, 0));
+        hg_fp_add_dep(fp, opr_name(po, 0), 0);
       else if (po->pp != NULL)
-        hg_fp_add_dep(fp, po->pp->name);
+        hg_fp_add_dep(fp, po->pp->name, 0);
+    }
+    else if (po->op == OP_MOV && po->operand[1].type == OPT_OFFSET) {
+      tmpname = opr_name(po, 1);
+      if (IS_START(tmpname, "p_") || IS_START(tmpname, "sub_"))
+        hg_fp_add_dep(fp, tmpname, 1);
+    }
+    else if (po->op == OP_PUSH && po->operand[0].type == OPT_OFFSET) {
+      tmpname = opr_name(po, 0);
+      if (IS_START(tmpname, "p_") || IS_START(tmpname, "sub_"))
+        hg_fp_add_dep(fp, tmpname, 1);
     }
   }
 
@@ -8814,6 +8834,11 @@ static void hg_fp_resolve_deps(struct func_prototype *fp)
     dep->proto = bsearch(&fp_s, hg_fp, hg_fp_cnt,
       sizeof(hg_fp[0]), hg_fp_cmp_name);
     if (dep->proto != NULL) {
+      if (dep->ptr_taken) {
+        dep->proto->ptr_taken = 1;
+        continue;
+      }
+
       if (!dep->proto->dep_resolved)
         hg_fp_resolve_deps(dep->proto);
 
@@ -8843,11 +8868,8 @@ static void do_func_refs_from_data(void)
     strcpy(fp_s.name, hg_refs[i]);
     fp = bsearch(&fp_s, hg_fp, hg_fp_cnt,
       sizeof(hg_fp[0]), hg_fp_cmp_name);
-    if (fp == NULL)
-      continue;
-
-    if (fp->argc_stack != 0 && (fp->regmask_dep & (mxCX | mxDX)))
-      fp->regmask_dep |= mxCX | mxDX;
+    if (fp != NULL)
+      fp->ptr_taken = 1;
   }
 }
 
@@ -8897,6 +8919,12 @@ static void output_hdr_fp(FILE *fout, const struct func_prototype *fp,
 
     regmask_dep = fp->regmask_dep;
     argc_normal = fp->argc_stack;
+    if (fp->ptr_taken && regmask_dep
+        && (regmask_dep & ~(mxCX|mxDX)) == 0)
+    {
+      if ((regmask_dep & mxDX) || fp->argc_stack > 0)
+        regmask_dep |= mxCX | mxDX;
+    }
 
     fprintf(fout, "%-5s",
       fp->pp ? fp->pp->ret_type.name :
@@ -9441,6 +9469,8 @@ int main(int argc, char *argv[])
       g_allow_regfunc = 1;
     else if (IS(argv[arg], "-uc"))
       g_allow_user_icall = 1;
+    else if (IS(argv[arg], "-wu"))
+      g_nowarn_reguse = 1;
     else if (IS(argv[arg], "-m"))
       multi_seg = 1;
     else if (IS(argv[arg], "-hdr"))
@@ -9450,13 +9480,14 @@ int main(int argc, char *argv[])
   }
 
   if (argc < arg + 3) {
-    printf("usage:\n%s [-v] [-rf] [-m] <.c> <.asm> <hdr.h> [rlist]*\n"
+    printf("usage:\n%s [options] <.c> <.asm> <hdr.h> [rlist]*\n"
            "%s -hdr <out.h> <.asm> <seed.h> [rlist]*\n"
            "options:\n"
            "  -hdr - header generation mode\n"
            "  -rf  - allow unannotated indirect calls\n"
            "  -uc  - allow ind. calls/refs to __usercall\n"
            "  -m   - allow multiple .text sections\n"
+           "  -wu  - don't warn about bad reg use\n"
            "[rlist] is a file with function names to skip,"
            " one per line\n",
       argv[0], argv[0]);
