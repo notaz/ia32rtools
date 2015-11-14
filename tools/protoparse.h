@@ -33,7 +33,7 @@ struct parsed_proto {
 		struct parsed_type ret_type;
 		struct parsed_type type;
 	};
-	struct parsed_proto_arg arg[16];
+	struct parsed_proto_arg arg[32];
 	int argc;
 	int argc_stack;
 	int argc_reg;
@@ -637,6 +637,12 @@ static int parse_protostr(char *protostr, struct parsed_proto *pp)
 				break;
 			}
 			printf("%s:%d:%zd: ')' expected\n",
+				hdrfn, hdrfline, (p - protostr) + 1);
+			return -1;
+		}
+
+		if (xarg >= ARRAY_SIZE(pp->arg)) {
+			printf("%s:%d:%zd: too many args\n",
 				hdrfn, hdrfline, (p - protostr) + 1);
 			return -1;
 		}

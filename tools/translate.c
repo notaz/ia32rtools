@@ -4232,7 +4232,7 @@ static void check_simple_sequence(int opcnt, int *fsz)
   }
 
   // unlike pushes after sub esp,
-  // IDA treats pushed like this as part of var area
+  // IDA treats pushes like this as part of var area
   *fsz += seq_len * 4;
 }
 
@@ -4255,7 +4255,11 @@ static int scan_prologue(int i, int opcnt, int *ecx_push, int *esp_sub)
   for (; i < opcnt; i++) {
     if (i > 0 && g_labels[i] != NULL)
       break;
-    if (ops[i].op == OP_PUSH || (ops[i].flags & (OPF_JMP|OPF_TAIL)))
+    if (ops[i].flags & (OPF_JMP|OPF_TAIL))
+      break;
+    if (ops[i].flags & OPF_DONE)
+      continue;
+    if (ops[i].op == OP_PUSH)
       break;
     if (ops[i].op == OP_SUB && ops[i].operand[0].reg == xSP
       && ops[i].operand[1].type == OPT_CONST)
@@ -4293,8 +4297,8 @@ static int scan_prologue(int i, int opcnt, int *ecx_push, int *esp_sub)
         ops[j].flags |= OPF_RMD | OPF_DONE | OPF_NOREGS;
         i = j + 1;
         *esp_sub = 1;
+        break;
       }
-      break;
     }
   }
 
@@ -4488,10 +4492,12 @@ static void scan_prologue_epilogue(int opcnt, int *stack_align)
         for (; j >= 0; j--) {
           if (ops[j].op != OP_MOV)
             break;
-          if (ops[j].operand[0].type != OPT_REGMEM)
-            break;
-          if (strstr(ops[j].operand[0].name, "arg_") == NULL)
-            break;
+          if (ops[j].operand[0].type == OPT_REGMEM
+              && strstr(ops[j].operand[0].name, "arg_") != NULL)
+            continue;
+          if (ops[j].operand[0].type == OPT_REG)
+            continue; // assume arg-reg mov
+          break;
         }
       }
 
@@ -5655,6 +5661,14 @@ static int collect_call_args(struct parsed_op *po, int i,
   if (ret < 0)
     return ret;
 
+  if (pp->is_unresolved) {
+    pp->argc += ret;
+    pp->argc_stack += ret;
+    for (a = 0; a < pp->argc; a++)
+      if (pp->arg[a].type.name == NULL)
+        pp->arg[a].type.name = strdup("int");
+  }
+
   if (arg_grp != 0) {
     // propagate arg_grp
     for (a = 0; a < pp->argc; a++) {
@@ -5667,14 +5681,6 @@ static int collect_call_args(struct parsed_op *po, int i,
         po_tmp = po_tmp->p_argnext >= 0 ? &ops[po_tmp->p_argnext] : NULL;
       }
     }
-  }
-
-  if (pp->is_unresolved) {
-    pp->argc += ret;
-    pp->argc_stack += ret;
-    for (a = 0; a < pp->argc; a++)
-      if (pp->arg[a].type.name == NULL)
-        pp->arg[a].type.name = strdup("int");
   }
 
   return ret;
@@ -6329,11 +6335,16 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
             regmask_stack |= 1 << tmp_op->operand[0].reg;
         }
 
-        if (!((regmask_stack & (1 << xCX))
-          && (regmask_stack & (1 << xDX))))
+        // quick dumb check for potential reg-args
+        for (j = i - 1; j >= 0 && ops[j].op == OP_MOV; j--)
+          if (ops[j].operand[0].type == OPT_REG)
+            regmask_stack &= ~(1 << ops[j].operand[0].reg);
+
+        if ((regmask_stack & (mxCX|mxDX)) != (mxCX|mxDX)
+            && ((regmask | regmask_arg) & (mxCX|mxDX)))
         {
           if (pp->argc_stack != 0
-           || ((regmask | regmask_arg) & ((1 << xCX)|(1 << xDX))))
+              || ((regmask | regmask_arg) & (mxCX|mxDX)))
           {
             pp_insert_reg_arg(pp, "ecx");
             pp->is_fastcall = 1;
@@ -6341,7 +6352,7 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
             regmask |= 1 << xCX;
           }
           if (pp->argc_stack != 0
-           || ((regmask | regmask_arg) & (1 << xDX)))
+              || ((regmask | regmask_arg) & mxDX))
           {
             pp_insert_reg_arg(pp, "edx");
             regmask_init |= 1 << xDX;
@@ -6462,8 +6473,15 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
     default:
       break;
     }
+  }
 
-    // this might need it's own pass...
+  // pass8: final adjustments
+  for (i = 0; i < opcnt; i++)
+  {
+    po = &ops[i];
+    if (po->flags & (OPF_RMD|OPF_DONE))
+      continue;
+
     if (po->op != OP_FST && po->p_argnum > 0)
       save_arg_vars[po->p_arggrp] |= 1 << (po->p_argnum - 1);
 
