@@ -1,6 +1,6 @@
 /*
  * ia32rtools
- * (C) notaz, 2013,2014
+ * (C) notaz, 2013-2015
  *
  * This work is licensed under the terms of 3-clause BSD license.
  * See COPYING file in the top-level directory.
@@ -77,6 +77,29 @@ static int is_name_reserved(const char *name)
   int i;
   for (i = 0; i < ARRAY_SIZE(reserved_names); i++)
     if (strcasecmp(name, reserved_names[i]) == 0)
+      return 1;
+
+  return 0;
+}
+
+/* these tend to cause linker conflicts */
+static const char *useless_names[] = {
+  "target", "addend", "lpMem", "Locale", "lpfn",
+  "CodePage", "uNumber", "Caption", "Default", "SubKey",
+  "ValueName", "OutputString", "LibFileName", "AppName",
+  "Buffer", "ClassName", "dwProcessId", "FileName",
+  "aExp", "aLog10", "aDelete", "aFont",
+  "lpCriticalSection", "CriticalSection", "lpAddress",
+  "lpBuffer", "lpClassName", "lpName",
+  "hHeap", "hEvent", "hHandle", "hObject",
+  "hLibModule", "hInstance",
+};
+
+static int is_name_useless(const char *name)
+{
+  int i;
+  for (i = 0; i < ARRAY_SIZE(useless_names); i++)
+    if (strcasecmp(name, useless_names[i]) == 0)
       return 1;
 
   return 0;
@@ -495,18 +518,42 @@ static void idaapi run(int /*arg*/)
   }
 
   // check namelist for reserved names and
-  // matching names with different case (nasm ignores case)
+  // matching names with different case (masm ignores case)
   n = get_nlist_size();
   for (i = 0; i < n; i++) {
+    int need_rename = 0;
+
     ea = get_nlist_ea(i);
+    ea_flags = get_flags_novalue(ea);
     name = get_nlist_name(i);
     if (name == NULL) {
       msg("%x: null name?\n", ea);
       continue;
     }
+
     qsnprintf(buf, sizeof(buf), "%s", name);
 
-    int need_rename = is_name_reserved(name);
+    // for short names, give them a postfix to solve link dupe problem
+    if (!isCode(ea_flags) && strlen(name) <= 4) {
+      qsnprintf(buf, sizeof(buf), "%s_%06X", name, ea);
+      need_rename = 1;
+    }
+    else {
+      qsnprintf(buf2, sizeof(buf2), "%s", name);
+      if ((p = strchr(buf2, '_')))
+        *p = 0;
+      if (is_name_useless(buf2)) {
+        msg("%x: removing name '%s'\n", ea, name);
+        ret = set_name(ea, "", SN_AUTO);
+        if (ret) {
+          n = get_nlist_size();
+          i--;
+          continue;
+        }
+      }
+    }
+
+    need_rename |= is_name_reserved(name);
     if (!need_rename) {
       p = buf;
       pp = (char **)bsearch(&p, name_cache, name_cache_size,
@@ -524,12 +571,11 @@ static void idaapi run(int /*arg*/)
 
     // rename vars with '?@' (funcs are ok)
     int change_qat = 0;
-    ea_flags = get_flags_novalue(ea);
     if (!isCode(ea_flags)) {
       if (IS_START(name, "__imp_"))
-        /* some import */;
+        need_rename = 0; /* some import */
       else if (name[0] == '?' && strstr(name, "@@"))
-        /* c++ import */;
+        need_rename = 0; /* c++ import */
       else if (strchr(name, '?'))
         change_qat = 1;
       else if ((cp = strchr(name, '@'))) {
