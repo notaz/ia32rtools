@@ -3630,8 +3630,8 @@ static const struct parsed_proto *try_recover_pp(
 }
 
 static void scan_for_call_type(int i, const struct parsed_opr *opr,
-  int magic, const struct parsed_proto **pp_found, int *pp_i,
-  int *multi)
+  int magic, int is_call_op, const struct parsed_proto **pp_found,
+  int *pp_i, int *multi)
 {
   const struct parsed_proto *pp = NULL;
   struct parsed_op *po;
@@ -3644,7 +3644,8 @@ static void scan_for_call_type(int i, const struct parsed_opr *opr,
       lr = &g_label_refs[i];
       for (; lr != NULL; lr = lr->next) {
         check_i(&ops[i], lr->i);
-        scan_for_call_type(lr->i, opr, magic, pp_found, pp_i, multi);
+        scan_for_call_type(lr->i, opr, magic, is_call_op,
+          pp_found, pp_i, multi);
       }
       if (i > 0 && LAST_OP(i - 1))
         return;
@@ -3689,29 +3690,30 @@ static void scan_for_call_type(int i, const struct parsed_opr *opr,
     if (i == g_func_pp->argc)
       return;
     pp = g_func_pp->arg[i].pp;
-    if (pp == NULL)
-      ferr(po, "icall: arg%d (%s) is not a fptr?\n",
-        i + 1, g_func_pp->arg[i].reg);
+    if (pp == NULL) {
+      if (is_call_op)
+        ferr(po, "icall: arg%d (%s) is not a fptr?\n",
+          i + 1, g_func_pp->arg[i].reg);
+      return;
+    }
     check_func_pp(po, pp, "icall reg-arg");
   }
   else
-    pp = try_recover_pp(po, opr, 1, NULL);
+    pp = try_recover_pp(po, opr, is_call_op, NULL);
 
   if (*pp_found != NULL && pp != NULL && *pp_found != pp) {
-    if (!IS((*pp_found)->ret_type.name, pp->ret_type.name)
-      || (*pp_found)->is_stdcall != pp->is_stdcall
-      //|| (*pp_found)->is_fptr != pp->is_fptr
-      || (*pp_found)->argc != pp->argc
-      || (*pp_found)->argc_reg != pp->argc_reg
-      || (*pp_found)->argc_stack != pp->argc_stack)
-    {
+    if (pp_cmp_func(*pp_found, pp)) {
+      if (pp_i != NULL && *pp_i != -1)
+        fnote(&ops[*pp_i], "(other ref)\n");
       ferr(po, "icall: parsed_proto mismatch\n");
     }
-    *multi = 1;
+    if (multi != NULL)
+      *multi = 1;
   }
   if (pp != NULL) {
     *pp_found = pp;
-    *pp_i = po - ops;
+    if (pp_i != NULL)
+      *pp_i = po - ops;
   }
 }
 
@@ -4653,6 +4655,17 @@ static int resolve_origin(int i, const struct parsed_opr *opr,
   }
 }
 
+static int resolve_origin_reg(int i, int reg, int magic, int *op_i,
+  int *is_caller)
+{
+  struct parsed_opr opr = OPR_INIT(OPT_REG, OPLM_DWORD, reg);
+
+  *op_i = -1;
+  if (is_caller != NULL)
+    *is_caller = 0;
+  return resolve_origin(i, &opr, magic, op_i, is_caller);
+}
+
 // find an instruction that previously referenced opr
 // if multiple results are found - fail
 // *op_i must be set to -1 by the caller
@@ -4926,9 +4939,8 @@ static int resolve_used_bits(int i, int opcnt, int reg,
 }
 
 static const struct parsed_proto *resolve_deref(int i, int magic,
-  struct parsed_opr *opr, int level)
+  const struct parsed_opr *opr, int level)
 {
-  struct parsed_opr opr_s = OPR_INIT(OPT_REG, OPLM_DWORD, 0);
   const struct parsed_proto *pp = NULL;
   int from_caller = 0;
   char s_reg[4];
@@ -4950,8 +4962,7 @@ static const struct parsed_proto *resolve_deref(int i, int magic,
   if (reg < 0)
     return NULL;
 
-  opr_s.reg = reg;
-  ret = resolve_origin(i, &opr_s, i + magic, &j, NULL);
+  ret = resolve_origin_reg(i, reg, i + magic, &j, NULL);
   if (ret != 1)
     return NULL;
 
@@ -4966,8 +4977,7 @@ static const struct parsed_proto *resolve_deref(int i, int magic,
             ops[j].operand[1].name);
     if (reg < 0)
       return NULL;
-    opr_s.reg = reg;
-    ret = resolve_origin(j, &opr_s, j + magic, &k, NULL);
+    ret = resolve_origin_reg(j, reg, j + magic, &k, NULL);
     if (ret != 1)
       return NULL;
     j = k;
@@ -5017,32 +5027,34 @@ static const struct parsed_proto *resolve_deref(int i, int magic,
   return proto_lookup_struct(g_fhdr, pp->type.name, offset);
 }
 
-static const struct parsed_proto *resolve_icall(int i, int opcnt,
+static const struct parsed_proto *resolve_func_ptr(int i, int opcnt,
+  int is_call_op, const struct parsed_opr *opr,
   int *pp_i, int *multi_src)
 {
   const struct parsed_proto *pp = NULL;
   int search_advice = 0;
 
-  *multi_src = 0;
-  *pp_i = -1;
+  if (multi_src != NULL)
+    *multi_src = 0;
+  if (pp_i != NULL)
+    *pp_i = -1;
 
-  switch (ops[i].operand[0].type) {
+  switch (opr->type) {
   case OPT_REGMEM:
     // try to resolve struct member calls
-    pp = resolve_deref(i, i + opcnt * 19, &ops[i].operand[0], 0);
+    pp = resolve_deref(i, i + opcnt * 19, opr, 0);
     if (pp != NULL)
       break;
     // fallthrough
   case OPT_LABEL:
   case OPT_OFFSET:
-    pp = try_recover_pp(&ops[i], &ops[i].operand[0],
-           1, &search_advice);
+    pp = try_recover_pp(&ops[i], opr, is_call_op, &search_advice);
     if (!search_advice)
       break;
     // fallthrough
   default:
-    scan_for_call_type(i, &ops[i].operand[0], i + opcnt * 9, &pp,
-      pp_i, multi_src);
+    scan_for_call_type(i, opr, i + opcnt * 9, is_call_op,
+      &pp, pp_i, multi_src);
     break;
   }
 
@@ -5103,7 +5115,8 @@ static struct parsed_proto *process_call(int i, int opcnt)
   if (pp == NULL)
   {
     // indirect call
-    pp_c = resolve_icall(i, opcnt, &call_i, &multipath);
+    pp_c = resolve_func_ptr(i, opcnt, 1, &ops[i].operand[0],
+             &call_i, &multipath);
     if (pp_c != NULL) {
       if (!pp_c->is_func && !pp_c->is_fptr)
         ferr(po, "call to non-func: %s\n", pp_c->name);
@@ -5211,6 +5224,48 @@ out:
   return pp;
 }
 
+static void check_fptr_args(int i, int opcnt, struct parsed_proto *pp)
+{
+  struct parsed_opr s_opr = OPR_INIT(OPT_REG, OPLM_DWORD, 0);
+  const struct parsed_proto *pp_arg, *pp_cmp;
+  const struct parsed_op *po_a;
+  const char *s_reg;
+  int pp_cmp_i;
+  int arg, reg;
+
+  for (arg = 0; arg < pp->argc; arg++) {
+    pp_cmp = NULL;
+    pp_cmp_i = -1;
+
+    pp_arg = pp->arg[arg].pp;
+    if (pp_arg == NULL || !pp_arg->is_func)
+      continue;
+
+    s_reg = pp->arg[arg].reg;
+    if (s_reg != NULL) {
+      reg = char_array_i(regs_r32, ARRAY_SIZE(regs_r32), s_reg);
+      ferr_assert(&ops[i], reg >= 0);
+      s_opr.reg = reg;
+      scan_for_call_type(i, &s_opr, i + arg + opcnt * 28, 0,
+        &pp_cmp, &pp_cmp_i, NULL);
+    }
+    else {
+      po_a = pp->arg[arg].datap;
+      if (po_a != NULL && po_a->op == OP_PUSH)
+        pp_cmp = resolve_func_ptr(po_a - ops, opcnt, 0,
+                   &po_a->operand[0], &pp_cmp_i, NULL);
+      if (pp_cmp_i < 0)
+        pp_cmp_i = po_a - ops;
+    }
+
+    if (pp_cmp != NULL && !pp_compatible_func(pp_arg, pp_cmp)) {
+      if (pp_cmp_i >= 0)
+        fnote(&ops[pp_cmp_i], "(referenced here)\n");
+      ferr(&ops[i], "incompatible fptr arg %d\n", arg + 1);
+    }
+  }
+}
+
 static void mark_float_arg(struct parsed_op *po,
   struct parsed_proto *pp, int arg, int *regmask_ffca)
 {
@@ -5297,8 +5352,8 @@ static int collect_call_args_no_push(int i, struct parsed_proto *pp,
   return 0;
 }
 
-static int collect_call_args_early(int i, struct parsed_proto *pp,
-  int *regmask, int *regmask_ffca)
+static int collect_call_args_early(int i, int opcnt,
+  struct parsed_proto *pp, int *regmask, int *regmask_ffca)
 {
   struct parsed_op *po;
   int arg, ret;
@@ -5399,6 +5454,9 @@ static int collect_call_args_early(int i, struct parsed_proto *pp,
           break;
     }
   }
+
+  if (!g_header_mode)
+    check_fptr_args(i, opcnt, pp);
 
   return 0;
 }
@@ -5664,7 +5722,7 @@ static int collect_call_args_r(struct parsed_op *po, int i,
   return arg;
 }
 
-static int collect_call_args(struct parsed_op *po, int i,
+static int collect_call_args(struct parsed_op *po, int i, int opcnt,
   struct parsed_proto *pp, int *regmask, int magic)
 {
   // arg group is for cases when pushes for
@@ -5700,6 +5758,9 @@ static int collect_call_args(struct parsed_op *po, int i,
       }
     }
   }
+
+  if (!g_header_mode)
+    check_fptr_args(i, opcnt, pp);
 
   return ret;
 }
@@ -6137,7 +6198,8 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
       if (pp != NULL) {
         if (!(po->flags & OPF_ATAIL)) {
           // since we know the args, try to collect them
-          ret = collect_call_args_early(i, pp, &regmask, &regmask_ffca);
+          ret = collect_call_args_early(i, opcnt, pp,
+                  &regmask, &regmask_ffca);
           if (ret != 0)
             pp = NULL;
         }
@@ -6182,7 +6244,7 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
 
         if (!pp->is_unresolved && !(po->flags & OPF_ATAIL)) {
           // since we know the args, collect them
-          collect_call_args(po, i, pp, &regmask, i + opcnt * 2);
+          collect_call_args(po, i, opcnt, pp, &regmask, i + opcnt * 2);
         }
         // for unresolved, collect after other passes
       }
@@ -6342,7 +6404,7 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
 
       if (pp->is_unresolved) {
         int regmask_stack = 0;
-        collect_call_args(po, i, pp, &regmask, i + opcnt * 2);
+        collect_call_args(po, i, opcnt, pp, &regmask, i + opcnt * 2);
 
         // this is pretty rough guess:
         // see ecx and edx were pushed (and not their saved versions)
@@ -8586,10 +8648,9 @@ static void gen_hdr_dep_pass(int i, int opcnt, unsigned char *cbits,
         ret = 1;
       }
       else {
-        struct parsed_opr opr = OPR_INIT(OPT_REG, OPLM_DWORD, xAX);
         j = -1;
         from_caller = 0;
-        ret = resolve_origin(i, &opr, i + opcnt * 4, &j, &from_caller);
+        ret = resolve_origin_reg(i, xAX, i + opcnt * 4, &j, &from_caller);
       }
 
       if (ret != 1 && from_caller) {
@@ -8740,7 +8801,7 @@ static void gen_hdr(const char *funcn, int opcnt)
       if (pp != NULL) {
         if (!(po->flags & OPF_ATAIL))
           // since we know the args, try to collect them
-          if (collect_call_args_early(i, pp, NULL, NULL) != 0)
+          if (collect_call_args_early(i, opcnt, pp, NULL, NULL) != 0)
             pp = NULL;
       }
 
@@ -8785,7 +8846,7 @@ static void gen_hdr(const char *funcn, int opcnt)
 
       if (!pp->is_unresolved && !(po->flags & OPF_ATAIL)) {
         // since we know the args, collect them
-        ret = collect_call_args(po, i, pp, &regmask_dummy,
+        ret = collect_call_args(po, i, opcnt, pp, &regmask_dummy,
                 i + opcnt * 1);
       }
       if (!(po->flags & OPF_TAIL)

@@ -999,18 +999,39 @@ static inline int pp_cmp_func(const struct parsed_proto *pp1,
 
   if (pp1->argc != pp2->argc || pp1->argc_reg != pp2->argc_reg)
     return 1;
-  else {
-    for (i = 0; i < pp1->argc; i++) {
-      if ((pp1->arg[i].reg != NULL) != (pp2->arg[i].reg != NULL))
-        return 1;
+  if (pp1->is_stdcall != pp2->is_stdcall)
+    return 1;
 
-      if ((pp1->arg[i].reg != NULL)
-        && !IS(pp1->arg[i].reg, pp2->arg[i].reg))
-      {
-        return 1;
-      }
+  // because of poor void return detection, return is not
+  // checked for now to avoid heaps of false positives
+
+  for (i = 0; i < pp1->argc; i++) {
+    if ((pp1->arg[i].reg != NULL) != (pp2->arg[i].reg != NULL))
+      return 1;
+
+    if ((pp1->arg[i].reg != NULL)
+      && !IS(pp1->arg[i].reg, pp2->arg[i].reg))
+    {
+      return 1;
     }
   }
+
+  return 0;
+}
+
+static inline int pp_compatible_func(
+  const struct parsed_proto *pp_site,
+  const struct parsed_proto *pp_callee)
+{
+  if (pp_cmp_func(pp_site, pp_callee) == 0)
+    return 1;
+
+  if (pp_site->argc_stack == 0 && pp_site->is_fastcall
+      && pp_callee->argc_stack == 0
+      && (pp_callee->is_fastcall || pp_callee->argc_reg == 0)
+      && pp_site->argc_reg > pp_callee->argc_reg)
+    /* fascall compatible callee doesn't use all args -> ok */
+    return 1;
 
   return 0;
 }
