@@ -18,6 +18,7 @@
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
+#include <stddef.h>
 #include <string.h>
 #include <math.h>
 #include <errno.h>
@@ -140,6 +141,7 @@ enum op_op {
   OP_FLDc,
   OP_FST,
   OP_FIST,
+  OP_FABS,
   OP_FADD,
   OP_FDIV,
   OP_FMUL,
@@ -1112,6 +1114,7 @@ static const struct {
   { "fstp",   OP_FST,    1, 1, OPF_FPOP },
   { "fist",   OP_FIST,   1, 1, OPF_FINT },
   { "fistp",  OP_FIST,   1, 1, OPF_FPOP|OPF_FINT },
+  { "fabs",   OP_FABS,   0, 0, 0 },
   { "fadd",   OP_FADD,   0, 2, 0 },
   { "faddp",  OP_FADD,   0, 2, OPF_FPOP },
   { "fdiv",   OP_FDIV,   0, 2, 0 },
@@ -1506,6 +1509,7 @@ static void parse_op(struct parsed_op *op, char words[16][256], int wordc)
   case OP_FISUB:
   case OP_FIDIVR:
   case OP_FISUBR:
+  case OP_FABS:
   case OP_FCHS:
   case OP_FCOS:
   case OP_FSIN:
@@ -1935,6 +1939,9 @@ static int parse_stack_esp_offset(struct parsed_op *po,
   return 0;
 }
 
+// returns g_func_pp arg number if arg is accessed
+// -1 otherwise (stack vars, va_list)
+// note: 'popr' must be from 'po', not some other op
 static int stack_frame_access(struct parsed_op *po,
   struct parsed_opr *popr, char *buf, size_t buf_size,
   const char *name, const char *cast, int is_src, int is_lea)
@@ -1965,13 +1972,15 @@ static int stack_frame_access(struct parsed_op *po,
     arg_i = (offset - stack_ra - 4) / 4;
     if (arg_i < 0 || arg_i >= g_func_pp->argc_stack)
     {
-      if (g_func_pp->is_vararg
-          && arg_i == g_func_pp->argc_stack && is_lea)
-      {
-        // should be va_list
-        if (cast[0] == 0)
-          cast = "(u32)";
-        snprintf(buf, buf_size, "%sap", cast);
+      if (g_func_pp->is_vararg && arg_i == g_func_pp->argc_stack) {
+        if (is_lea) {
+          // should be va_list
+          if (cast[0] == 0)
+            cast = "(u32)";
+          snprintf(buf, buf_size, "%sap", cast);
+        }
+        else
+          snprintf(buf, buf_size, "%sva_arg(ap, u32)", cast);
         return -1;
       }
       ferr(po, "offset 0x%x (%s,%d) doesn't map to any arg\n",
@@ -3917,7 +3926,8 @@ static void resolve_branches_parse_calls(int opcnt)
           po->operand_cnt = 0;
           po->regmask_src = pseudo_ops[l].regmask_src;
           po->regmask_dst = pseudo_ops[l].regmask_dst;
-          po->flags = pseudo_ops[l].flags;
+          po->flags &= OPF_TAIL;
+          po->flags |= pseudo_ops[l].flags;
           po->flags |= po->regmask_dst ? OPF_DATA : 0;
           break;
         }
@@ -3978,7 +3988,8 @@ static void resolve_branches_parse_calls(int opcnt)
     if (po->bt_i != -1 || (po->flags & OPF_RMD))
       continue;
 
-    if (po->operand[0].type == OPT_LABEL)
+    if (po->operand[0].type == OPT_LABEL
+        || po->operand[0].type == OPT_REG)
       // assume tail call
       goto tailcall;
 
@@ -4256,20 +4267,72 @@ static void check_simple_sequence(int opcnt, int *fsz)
   *fsz += seq_len * 4;
 }
 
+static int scan_prologue_ecx(int i, int opcnt, int flags_set,
+  int limit, int *ecx_push_out)
+{
+  const struct parsed_proto *pp;
+  int ecx_push = 0, other_push = 0;
+  int ret;
+
+  while (limit > 0 && ops[i].op == OP_PUSH
+         && IS(opr_name(&ops[i], 0), "ecx"))
+  {
+    ops[i].flags |= flags_set;
+    ecx_push++;
+    i++;
+    limit--;
+  }
+
+  ret = i;
+  if (ecx_push == 0 || flags_set != 0)
+    goto out;
+
+  // check if some of the pushes aren't really call args
+  for (; i < opcnt; i++) {
+    if (i > 0 && g_labels[i] != NULL)
+      break;
+    if (ops[i].flags & (OPF_JMP|OPF_TAIL))
+      break;
+    if (ops[i].op == OP_PUSH)
+      other_push++;
+  }
+
+  if (ops[i].op != OP_CALL)
+    goto out;
+
+  pp = ops[i].pp;
+  if (pp == NULL && ops[i].operand[0].type == OPT_LABEL)
+    pp = proto_parse(g_fhdr, opr_name(&ops[i], 0), 1);
+  if (pp == NULL)
+    goto out;
+
+  ferr_assert(&ops[i], ecx_push + other_push >= pp->argc_stack);
+  if (other_push < pp->argc_stack)
+    ecx_push -= pp->argc_stack - other_push;
+
+out:
+  if (ecx_push_out != NULL)
+    *ecx_push_out = ecx_push;
+  return ret;
+}
+
 static int scan_prologue(int i, int opcnt, int *ecx_push, int *esp_sub)
 {
   const char *name;
   int j, len, ret;
+  int ecx_tmp = 0;
 
   for (; i < opcnt; i++)
     if (!(ops[i].flags & OPF_DONE))
       break;
 
-  while (ops[i].op == OP_PUSH && IS(opr_name(&ops[i], 0), "ecx")) {
-    ops[i].flags |= OPF_RMD | OPF_DONE | OPF_NOREGS;
-    g_stack_fsz += 4;
-    (*ecx_push)++;
-    i++;
+  ret = scan_prologue_ecx(i, opcnt, 0, 4, &ecx_tmp);
+  if (ecx_tmp > 0) {
+    scan_prologue_ecx(i, opcnt, OPF_RMD | OPF_DONE | OPF_NOREGS,
+      ecx_tmp, NULL);
+    g_stack_fsz += 4 * ecx_tmp;
+    *ecx_push += ecx_tmp;
+    i = ret;
   }
 
   for (; i < opcnt; i++) {
@@ -4456,39 +4519,6 @@ static void scan_prologue_epilogue(int opcnt, int *stack_align)
   // non-bp frame
   check_simple_sequence(opcnt, &push_fsz);
   i = scan_prologue(0, opcnt, &ecx_push, &esp_sub);
-
-  if (ecx_push && !esp_sub) {
-    // could actually be args for a call..
-    for (; i < opcnt; i++)
-      if (ops[i].op != OP_PUSH)
-        break;
-
-    if (ops[i].op == OP_CALL && ops[i].operand[0].type == OPT_LABEL) {
-      const struct parsed_proto *pp;
-      pp = proto_parse(g_fhdr, opr_name(&ops[i], 0), 1);
-      j = pp ? pp->argc_stack : 0;
-      while (i > 0 && j > 0) {
-        i--;
-        if (ops[i].op == OP_PUSH) {
-          ops[i].flags &= ~(OPF_RMD | OPF_DONE | OPF_NOREGS);
-          j--;
-        }
-      }
-      if (j != 0)
-        ferr(&ops[i], "unhandled prologue\n");
-
-      // recheck
-      i = ecx_push = 0;
-      g_stack_fsz = g_seh_size;
-      while (ops[i].op == OP_PUSH && IS(opr_name(&ops[i], 0), "ecx")) {
-        if (!(ops[i].flags & OPF_RMD))
-          break;
-        g_stack_fsz += 4;
-        ecx_push++;
-        i++;
-      }
-    }
-  }
 
   found = 0;
   if (ecx_push || esp_sub)
@@ -6923,7 +6953,10 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
            || (tmp_op && (tmp_op->op == OP_AND || tmp_op->op == OP_OR))
            ))
       {
-        out_src_opr_u32(buf3, sizeof(buf3), po, last_arith_dst);
+        struct parsed_op *po_arith = (void *)((char *)last_arith_dst
+          - offsetof(struct parsed_op, operand[0]));
+        ferr_assert(po, &ops[po_arith - ops] == po_arith);
+        out_src_opr_u32(buf3, sizeof(buf3), po_arith, last_arith_dst);
         out_test_for_cc(buf1, sizeof(buf1), po, po->pfo, po->pfo_inv,
           last_arith_dst->lmod, buf3);
         is_delayed = 1;
@@ -7896,6 +7929,7 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
         break;
 
       case OP_RET:
+      do_tail:
         if (g_func_pp->is_vararg)
           fprintf(fout, "  va_end(ap);\n");
         if (g_func_pp->has_retreg) {
@@ -8098,6 +8132,11 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
             fprintf(fout, "  f_st0 = f_st1;");
         }
         strcat(g_comment, " fist");
+        break;
+
+      case OP_FABS:
+        fprintf(fout, "  %s = fabs%s(%s);", float_st0,
+          need_double ? "" : "f", float_st0);
         break;
 
       case OP_FADD:
@@ -8311,7 +8350,7 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
             fprintf(fout, " f_st0 = f_st1;");
         }
         strcat(g_comment, " ftol");
-        break;
+        goto tail_check;
 
       case OPP_CIPOW:
         if (need_float_stack) {
@@ -8324,7 +8363,7 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
             need_double ? "" : "f");
         }
         strcat(g_comment, " CIpow");
-        break;
+        goto tail_check;
 
       case OPP_ABORT:
         fprintf(fout, "  do_skip_code_abort();");
@@ -8333,6 +8372,14 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
       // mmx
       case OP_EMMS:
         fprintf(fout, "  do_emms();");
+        break;
+
+      tail_check:
+        if (po->flags & OPF_TAIL) {
+          fprintf(fout, "\n");
+          strcat(g_comment, " tail");
+          goto do_tail;
+        }
         break;
 
       default:
@@ -8631,6 +8678,9 @@ static void gen_hdr_dep_pass(int i, int opcnt, unsigned char *cbits,
         if (g_bp_frame && !(po->flags & OPF_EBP_S))
           dep->regmask_live |= 1 << xBP;
       }
+      if ((po->flags & OPF_TAIL) && po->pp != NULL
+          && po->pp->is_stdcall)
+        fp->is_stdcall = 1;
     }
     else if (po->op == OP_RET) {
       if (po->operand_cnt > 0) {
@@ -9033,9 +9083,7 @@ static void output_hdr_fp(FILE *fout, const struct func_prototype *fp,
       fp->pp ? fp->pp->ret_type.name :
       fp->has_ret64 ? "__int64" :
       fp->has_ret ? "int" : "void");
-    if (regmask_dep && (fp->is_stdcall || fp->argc_stack > 0)
-      && (regmask_dep & ~mxCX) == 0)
-    {
+    if (regmask_dep == mxCX && fp->is_stdcall && fp->argc_stack > 0) {
       fprintf(fout, "/*__thiscall*/  ");
       argc_normal++;
       regmask_dep = 0;
