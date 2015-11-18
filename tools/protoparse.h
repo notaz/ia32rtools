@@ -23,8 +23,9 @@ struct parsed_proto_arg {
 	char *reg;
 	struct parsed_type type;
 	struct parsed_proto *pp; // fptr or struct
-	void *datap;
 	unsigned int is_saved:1; // not set here, for tool use
+	void **push_refs;
+	int push_ref_cnt;
 };
 
 struct parsed_proto {
@@ -1063,12 +1064,10 @@ static inline void proto_release(struct parsed_proto *pp)
 	int i;
 
 	for (i = 0; i < pp->argc; i++) {
-		if (pp->arg[i].reg != NULL)
-			free(pp->arg[i].reg);
-		if (pp->arg[i].type.name != NULL)
-			free(pp->arg[i].type.name);
-		if (pp->arg[i].pp != NULL)
-			free(pp->arg[i].pp);
+		free(pp->arg[i].reg);
+		free(pp->arg[i].type.name);
+		free(pp->arg[i].pp);
+		free(pp->arg[i].push_refs);
 	}
 	if (pp->ret_type.name != NULL)
 		free(pp->ret_type.name);

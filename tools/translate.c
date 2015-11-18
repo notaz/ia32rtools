@@ -224,10 +224,10 @@ struct parsed_op {
   unsigned char pfo;
   unsigned char pfo_inv;
   unsigned char operand_cnt;
-  unsigned char p_argnum; // arg push: altered before call arg #
+  unsigned char p_argnum; // arg push: call's saved arg #
   unsigned char p_arggrp; // arg push: arg group # for above
   unsigned char p_argpass;// arg push: arg of host func
-  short         p_argnext;// arg push: same arg pushed elsewhere or -1
+  short pad;
   int regmask_src;        // all referensed regs
   int regmask_dst;
   int pfomask;            // flagop: parsed_flag_op that can't be delayed
@@ -310,7 +310,6 @@ enum segment {
   SEG_GS,
 };
 
-// note: limited to 32k due to p_argnext
 #define MAX_OPS     4096
 #define MAX_ARG_GRP 2
 
@@ -5262,6 +5261,8 @@ static void check_fptr_args(int i, int opcnt, struct parsed_proto *pp)
   const char *s_reg;
   int pp_cmp_i;
   int arg, reg;
+  int bad = 0;
+  int j;
 
   for (arg = 0; arg < pp->argc; arg++) {
     pp_cmp = NULL;
@@ -5278,31 +5279,51 @@ static void check_fptr_args(int i, int opcnt, struct parsed_proto *pp)
       s_opr.reg = reg;
       scan_for_call_type(i, &s_opr, i + arg + opcnt * 28, 0,
         &pp_cmp, &pp_cmp_i, NULL);
+      if (pp_cmp != NULL && !pp_compatible_func(pp_arg, pp_cmp)) {
+        bad = 1;
+        if (pp_cmp_i >= 0)
+          fnote(&ops[pp_cmp_i], "(referenced here)\n");
+      }
     }
     else {
-      po_a = pp->arg[arg].datap;
-      if (po_a != NULL && po_a->op == OP_PUSH)
+      for (j = 0; j < pp->arg[arg].push_ref_cnt; j++) {
+        po_a = pp->arg[arg].push_refs[j];
+        if (po_a == NULL || po_a->op != OP_PUSH)
+          continue;
         pp_cmp = resolve_func_ptr(po_a - ops, opcnt, 0,
                    &po_a->operand[0], &pp_cmp_i, NULL);
-      if (pp_cmp_i < 0)
-        pp_cmp_i = po_a - ops;
+        if (pp_cmp != NULL && !pp_compatible_func(pp_arg, pp_cmp)) {
+          bad = 1;
+          if (pp_cmp_i < 0)
+            pp_cmp_i = po_a - ops;
+          if (pp_cmp_i >= 0)
+            fnote(&ops[pp_cmp_i], "(referenced here)\n");
+        }
+      }
     }
 
-    if (pp_cmp != NULL && !pp_compatible_func(pp_arg, pp_cmp)) {
-      if (pp_cmp_i >= 0)
-        fnote(&ops[pp_cmp_i], "(referenced here)\n");
+    if (bad)
       ferr(&ops[i], "incompatible fptr arg %d\n", arg + 1);
-    }
   }
+}
+
+static void pp_add_push_ref(struct parsed_proto *pp,
+  int arg, struct parsed_op *po)
+{
+  pp->arg[arg].push_refs = realloc(pp->arg[arg].push_refs,
+                             (pp->arg[arg].push_ref_cnt + 1)
+                              * sizeof(pp->arg[arg].push_refs[0]));
+  ferr_assert(po, pp->arg[arg].push_refs != NULL);
+  pp->arg[arg].push_refs[pp->arg[arg].push_ref_cnt++] = po;
 }
 
 static void mark_float_arg(struct parsed_op *po,
   struct parsed_proto *pp, int arg, int *regmask_ffca)
 {
-  po->p_argnext = -1;
+  ferr_assert(po, pp->arg[arg].push_ref_cnt == 0);
+  pp_add_push_ref(pp, arg, po);
+
   po->p_argnum = arg + 1;
-  ferr_assert(po, pp->arg[arg].datap == NULL);
-  pp->arg[arg].datap = po;
   po->flags |= OPF_DONE | OPF_FARGNR | OPF_FARG;
   if (regmask_ffca != NULL)
     *regmask_ffca |= 1 << arg;
@@ -5372,9 +5393,9 @@ static int collect_call_args_no_push(int i, struct parsed_proto *pp,
 
   for (arg = base_arg; arg < pp->argc; arg++) {
     ferr_assert(&ops[i], pp->arg[arg].reg == NULL);
-    po = pp->arg[arg].datap;
-    if (po == NULL)
-      ferr(&ops[i], "arg %d/%d not found\n", arg, pp->argc);
+    if (pp->arg[arg].push_ref_cnt != 1)
+      ferr(&ops[i], "arg %d/%d not found or bad\n", arg, pp->argc);
+    po = pp->arg[arg].push_refs[0];
     if (po->operand[0].lmod == OPLM_QWORD)
       arg++;
   }
@@ -5454,8 +5475,7 @@ static int collect_call_args_early(int i, int opcnt,
 
     if (ops[j].op == OP_PUSH)
     {
-      ops[j].p_argnext = -1;
-      ferr_assert(&ops[j], pp->arg[arg].datap == NULL);
+      int ref_handled = 0;
 
       k = check_for_stp(j + 1, i);
       if (k != -1) {
@@ -5466,14 +5486,17 @@ static int collect_call_args_early(int i, int opcnt,
           if (!pp->arg[arg].type.is_float)
             ferr(&ops[i], "arg %d should be float\n", arg + 1);
           mark_float_arg(&ops[k], pp, arg, regmask_ffca);
+          ref_handled = 1;
         }
       }
 
-      if (pp->arg[arg].datap == NULL) {
-        pp->arg[arg].datap = &ops[j];
-        if (regmask != NULL && ops[j].operand[0].type == OPT_REG)
-          *regmask |= 1 << ops[j].operand[0].reg;
+      if (!ref_handled) {
+        ferr_assert(&ops[j], pp->arg[arg].push_ref_cnt == 0);
+        pp_add_push_ref(pp, arg, &ops[j]);
       }
+
+      if (regmask != NULL && ops[j].operand[0].type == OPT_REG)
+        *regmask |= 1 << ops[j].operand[0].reg;
 
       ops[j].flags |= OPF_RMD | OPF_DONE | OPF_FARGNR | OPF_FARG;
       ops[j].flags &= ~OPF_RSAVE;
@@ -5491,38 +5514,50 @@ static int collect_call_args_early(int i, int opcnt,
   return 0;
 }
 
-static int sync_argnum(struct parsed_op *po, int argnum)
+// ensure all s_a* numbers match for a given func arg in all branches
+// returns 1 if any changes were made, 0 if not
+static int sync_argnum(struct parsed_proto *pp, int arg,
+  int *argnum, int *arggrp)
 {
   struct parsed_op *po_tmp;
+  int changed = 0;
+  int i;
 
   // see if other branches don't have higher argnum
-  for (po_tmp = po; po_tmp != NULL; ) {
-    if (argnum < po_tmp->p_argnum)
-      argnum = po_tmp->p_argnum;
-    // note: p_argnext is active on current collect_call_args only
-    po_tmp = po_tmp->p_argnext >= 0 ? &ops[po_tmp->p_argnext] : NULL;
+  for (i = 0; i < pp->arg[arg].push_ref_cnt; i++) {
+    po_tmp = pp->arg[arg].push_refs[i];
+    if (*argnum < po_tmp->p_argnum)
+      *argnum = po_tmp->p_argnum;
+    if (*arggrp < po_tmp->p_arggrp)
+      *arggrp = po_tmp->p_arggrp;
   }
 
   // make all argnums consistent
-  for (po_tmp = po; po_tmp != NULL; ) {
-    if (po_tmp->p_argnum != 0)
-      po_tmp->p_argnum = argnum;
-    po_tmp = po_tmp->p_argnext >= 0 ? &ops[po_tmp->p_argnext] : NULL;
+  for (i = 0; i < pp->arg[arg].push_ref_cnt; i++) {
+    po_tmp = pp->arg[arg].push_refs[i];
+    if (po_tmp->p_argnum == 0)
+      continue;
+    if (po_tmp->p_argnum != *argnum || po_tmp->p_arggrp != *arggrp) {
+      po_tmp->p_argnum = *argnum;
+      po_tmp->p_arggrp = *arggrp;
+      changed = 1;
+    }
   }
 
-  return argnum;
+  return changed;
 }
 
 static int collect_call_args_r(struct parsed_op *po, int i,
-  struct parsed_proto *pp, int *regmask, int *arg_grp,
-  int arg, int argnum, int magic, int need_op_saving, int may_reuse)
+  struct parsed_proto *pp, int *regmask,
+  int arg, int argnum, int magic,
+  int skip, int need_op_saving, int may_reuse)
 {
   struct parsed_proto *pp_tmp;
-  struct parsed_op *po_tmp;
   struct label_ref *lr;
   int need_to_save_current;
   int arg_grp_current = 0;
   int save_args_seen = 0;
+  int dummy = 0;
   int ret = 0;
   int reg;
   char buf[32];
@@ -5559,8 +5594,8 @@ static int collect_call_args_r(struct parsed_op *po, int i,
         check_i(&ops[j], lr->i);
         if ((ops[lr->i].flags & (OPF_JMP|OPF_CJMP)) != OPF_JMP)
           may_reuse = 1;
-        ret = collect_call_args_r(po, lr->i, pp, regmask, arg_grp,
-                arg, argnum, magic, need_op_saving, may_reuse);
+        ret = collect_call_args_r(po, lr->i, pp, regmask,
+                arg, argnum, magic, skip, need_op_saving, may_reuse);
         if (ret < 0)
           return ret;
       }
@@ -5574,8 +5609,8 @@ static int collect_call_args_r(struct parsed_op *po, int i,
         continue;
       }
       need_op_saving = 1;
-      ret = collect_call_args_r(po, lr->i, pp, regmask, arg_grp,
-              arg, argnum, magic, need_op_saving, may_reuse);
+      ret = collect_call_args_r(po, lr->i, pp, regmask,
+              arg, argnum, magic, skip, need_op_saving, may_reuse);
       if (ret < 0)
         return ret;
     }
@@ -5593,6 +5628,8 @@ static int collect_call_args_r(struct parsed_op *po, int i,
       if (may_reuse && pp_tmp->argc_stack > 0)
         ferr(po, "arg collect %d/%d hit '%s' with %d stack args\n",
           arg, pp->argc, opr_name(&ops[j], 0), pp_tmp->argc_stack);
+      if (!pp_tmp->is_unresolved)
+        skip = pp_tmp->argc_stack;
     }
     // esp adjust of 0 means we collected it before
     else if (ops[j].op == OP_ADD && ops[j].operand[0].reg == xSP
@@ -5621,19 +5658,19 @@ static int collect_call_args_r(struct parsed_op *po, int i,
 
       may_reuse = 1;
     }
+    else if (ops[j].op == OP_PUSH && skip > 0) {
+      // XXX: might want to rm OPF_FARGNR and only use this
+      skip--;
+    }
     else if (ops[j].op == OP_PUSH
       && !(ops[j].flags & (OPF_FARGNR|OPF_DONE)))
     {
       if (pp->is_unresolved && (ops[j].flags & OPF_RMD))
         break;
 
-      ops[j].p_argnext = -1;
-      po_tmp = pp->arg[arg].datap;
-      if (po_tmp != NULL)
-        ops[j].p_argnext = po_tmp - ops;
-      pp->arg[arg].datap = &ops[j];
+      pp_add_push_ref(pp, arg, &ops[j]);
 
-      argnum = sync_argnum(&ops[j], argnum);
+      sync_argnum(pp, arg, &argnum, &dummy);
 
       need_to_save_current = 0;
       reg = -1;
@@ -5715,6 +5752,7 @@ static int collect_call_args_r(struct parsed_op *po, int i,
       if (pp->arg[arg].is_saved) {
         ops[j].flags &= ~OPF_RMD;
         ops[j].p_argnum = argnum;
+        ops[j].p_arggrp = arg_grp_current;
       }
 
       // tracking reg usage
@@ -5746,24 +5784,16 @@ static int collect_call_args_r(struct parsed_op *po, int i,
     return -1;
   }
 
-  if (arg_grp_current > *arg_grp)
-    *arg_grp = arg_grp_current;
-
   return arg;
 }
 
 static int collect_call_args(struct parsed_op *po, int i, int opcnt,
   struct parsed_proto *pp, int *regmask, int magic)
 {
-  // arg group is for cases when pushes for
-  // multiple funcs are going on
-  struct parsed_op *po_tmp;
-  int arg_grp = 0;
-  int ret;
-  int a;
+  int a, ret;
 
-  ret = collect_call_args_r(po, i, pp, regmask, &arg_grp,
-          0, 1, magic, 0, 0);
+  ret = collect_call_args_r(po, i, pp, regmask, 0, 1, magic,
+          0, 0, 0);
   if (ret < 0)
     return ret;
 
@@ -5775,19 +5805,9 @@ static int collect_call_args(struct parsed_op *po, int i, int opcnt,
         pp->arg[a].type.name = strdup("int");
   }
 
-  if (arg_grp != 0) {
-    // propagate arg_grp
-    for (a = 0; a < pp->argc; a++) {
-      if (pp->arg[a].reg != NULL)
-        continue;
-
-      po_tmp = pp->arg[a].datap;
-      while (po_tmp != NULL) {
-        po_tmp->p_arggrp = arg_grp;
-        po_tmp = po_tmp->p_argnext >= 0 ? &ops[po_tmp->p_argnext] : NULL;
-      }
-    }
-  }
+  // note: p_argnum, p_arggrp will be propagated in a later pass,
+  // look for sync_argnum() (p_arggrp is for cases when mixed pushes
+  // for multiple funcs are going on)
 
   if (!g_header_mode)
     check_fptr_args(i, opcnt, pp);
@@ -6442,9 +6462,9 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
           if (pp->arg[arg].reg != NULL && !pp->arg[arg].is_saved)
             continue;
 
-          tmp_op = pp->arg[arg].datap;
-          if (tmp_op == NULL)
+          if (pp->arg[arg].push_ref_cnt == 0)
             ferr(po, "parsed_op missing for arg%d\n", arg);
+          tmp_op = pp->arg[arg].push_refs[0];
           if (tmp_op->operand[0].type == OPT_REG)
             regmask_stack |= 1 << tmp_op->operand[0].reg;
         }
@@ -6589,7 +6609,41 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
     }
   }
 
-  // pass8: final adjustments
+  // pass8: sync all push arg numbers
+  // some calls share args and not all of them
+  // (there's only partial intersection)
+  do {
+    int changed, argnum, arggrp;
+
+    found = 0;
+    for (i = 0; i < opcnt; i++)
+    {
+      po = &ops[i];
+      if ((po->flags & (OPF_RMD|OPF_DONE)) || po->op != OP_CALL)
+        continue;
+
+      pp = po->pp;
+      arggrp = 0;
+      do {
+        changed = 0;
+        for (arg = argnum = 0; arg < pp->argc; arg++) {
+          if (pp->arg[arg].reg != NULL)
+            continue;
+          if (pp->arg[arg].is_saved)
+            changed |= sync_argnum(pp, arg, &argnum, &arggrp);
+          argnum++;
+        }
+        found |= changed;
+      }
+      while (changed);
+
+      if (argnum > 32)
+        ferr(po, "too many args or looping in graph\n");
+    }
+  }
+  while (found);
+
+  // pass9: final adjustments
   for (i = 0; i < opcnt; i++)
   {
     po = &ops[i];
@@ -7827,9 +7881,12 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
             }
 
             // stack arg
-            tmp_op = pp->arg[arg].datap;
-            if (tmp_op == NULL)
+            if (pp->arg[arg].push_ref_cnt == 0)
               ferr(po, "parsed_op missing for arg%d\n", arg);
+            if (pp->arg[arg].push_ref_cnt > 1)
+              ferr_assert(po, pp->arg[arg].is_saved);
+            tmp_op = pp->arg[arg].push_refs[0];
+            ferr_assert(po, tmp_op != NULL);
 
             if (tmp_op->flags & OPF_VAPUSH) {
               fprintf(fout, "ap");
@@ -7846,7 +7903,9 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
               ferr_assert(po, cast[0] == 0);
               out_src_opr(buf1, sizeof(buf1),
                 tmp_op, &tmp_op->operand[0], cast, 0);
-              tmp_op = pp->arg[++arg].datap;
+              arg++;
+              ferr_assert(po, pp->arg[arg].push_ref_cnt == 1);
+              tmp_op = pp->arg[arg].push_refs[0];
               ferr_assert(po, tmp_op != NULL);
               out_src_opr(buf2, sizeof(buf2),
                 tmp_op, &tmp_op->operand[0], cast, 0);
