@@ -2708,8 +2708,9 @@ static const char *op_to_c(struct parsed_op *po)
 
 // note: this skips over calls and rm'd stuff assuming they're handled
 // so it's intended to use at one of final passes
+// exception: doesn't skip OPF_RSAVE stuff
 static int scan_for_pop(int i, int opcnt, int magic, int reg,
-  int depth, int seen_noreturn, int flags_set)
+  int depth, int seen_noreturn, int save_level, int flags_set)
 {
   struct parsed_op *po;
   int relevant;
@@ -2723,18 +2724,28 @@ static int scan_for_pop(int i, int opcnt, int magic, int reg,
     po->cc_scratch = magic;
 
     if (po->flags & OPF_TAIL) {
-      if (po->op == OP_CALL) {
-        if (po->pp != NULL && po->pp->is_noreturn)
-          seen_noreturn = 1;
-        else
+      if (po->op == OP_CALL && po->pp != NULL && po->pp->is_noreturn) {
+        // msvc sometimes generates stack cleanup code after
+        // noreturn, set a flag and continue
+        seen_noreturn = 1;
+
+        // ... but stop if there is another path to next insn -
+        // if msvc skipped something stack tracking may mess up
+        if (i + 1 < opcnt && g_labels[i + 1] != NULL)
           goto out;
       }
       else
         goto out;
     }
 
-    if (po->flags & (OPF_RMD|OPF_DONE|OPF_FARG))
+    if (po->flags & OPF_FARG)
       continue;
+    if (po->flags & (OPF_RMD|OPF_DONE)) {
+      if (!(po->flags & OPF_RSAVE))
+        continue;
+      // reprocess, there might be another push in some "parallel"
+      // path that took a pop what we should also take
+    }
 
     if ((po->flags & OPF_JMP) && po->op != OP_CALL) {
       if (po->btj != NULL) {
@@ -2742,7 +2753,7 @@ static int scan_for_pop(int i, int opcnt, int magic, int reg,
         for (j = 0; j < po->btj->count; j++) {
           check_i(po, po->btj->d[j].bt_i);
           ret |= scan_for_pop(po->btj->d[j].bt_i, opcnt, magic, reg,
-                   depth, seen_noreturn, flags_set);
+                   depth, seen_noreturn, save_level, flags_set);
           if (ret < 0)
             return ret; // dead end
         }
@@ -2752,7 +2763,7 @@ static int scan_for_pop(int i, int opcnt, int magic, int reg,
       check_i(po, po->bt_i);
       if (po->flags & OPF_CJMP) {
         ret |= scan_for_pop(po->bt_i, opcnt, magic, reg,
-                 depth, seen_noreturn, flags_set);
+                 depth, seen_noreturn, save_level, flags_set);
         if (ret < 0)
           return ret; // dead end
       }
@@ -2774,6 +2785,13 @@ static int scan_for_pop(int i, int opcnt, int magic, int reg,
     }
     else if (po->op == OP_POP) {
       if (relevant && depth == 0) {
+        if (flags_set == 0 && save_level > 0) {
+          ret = scan_for_pop(i + 1, opcnt, magic, reg,
+                  depth, seen_noreturn, save_level - 1, flags_set);
+          if (ret != 1)
+            // no pop for other levels, current one must be false
+            return -1;
+        }
         po->flags |= flags_set;
         return 1;
       }
@@ -5733,6 +5751,8 @@ static void reg_use_pass(int i, int opcnt, unsigned char *cbits,
       && !g_func_pp->is_userstack
       && po->operand[0].type == OPT_REG)
     {
+      int save_level = 0;
+
       reg = po->operand[0].reg;
       ferr_assert(po, reg >= 0);
 
@@ -5741,12 +5761,14 @@ static void reg_use_pass(int i, int opcnt, unsigned char *cbits,
       if (regmask_now & (1 << reg)) {
         already_saved = regmask_save_now & (1 << reg);
         flags_set = OPF_RSAVE | OPF_DONE;
+        save_level++;
       }
 
-      ret = scan_for_pop(i + 1, opcnt, i + opcnt * 3, reg, 0, 0, 0);
+      ret = scan_for_pop(i + 1, opcnt, i + opcnt * 3,
+              reg, 0, 0, save_level, 0);
       if (ret == 1) {
         scan_for_pop(i + 1, opcnt, i + opcnt * 4,
-          reg, 0, 0, flags_set);
+          reg, 0, 0, save_level, flags_set);
       }
       else {
         ret = scan_for_pop_ret(i + 1, opcnt, po->operand[0].reg, 0);
@@ -8526,11 +8548,13 @@ static void gen_hdr_dep_pass(int i, int opcnt, unsigned char *cbits,
       if (po->flags & OPF_DONE)
         continue;
 
-      ret = scan_for_pop(i + 1, opcnt, i + opcnt * 2, reg, 0, 0, 0);
+      ret = scan_for_pop(i + 1, opcnt, i + opcnt * 2,
+              reg, 0, 0, 0, 0);
       if (ret == 1) {
         regmask_save |= 1 << reg;
         po->flags |= OPF_RMD;
-        scan_for_pop(i + 1, opcnt, i + opcnt * 3, reg, 0, 0, OPF_RMD);
+        scan_for_pop(i + 1, opcnt, i + opcnt * 3,
+          reg, 0, 0, 0, OPF_RMD);
         continue;
       }
     }
