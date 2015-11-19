@@ -216,6 +216,7 @@ static const char *known_ptr_types[] = {
 	"HRGN",
 	"HRSRC",
 	"HKEY",
+	"HKL",
 	"HMENU",
 	"HMONITOR",
 	"HWAVEOUT",
