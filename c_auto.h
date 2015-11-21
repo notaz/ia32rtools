@@ -66,4 +66,40 @@ static inline int do_parity(unsigned int v)
 #define barrier() \
   asm volatile("" ::: "memory")
 
+/* gcc always emits vldr/vstr which requires alignment,
+ * so in some cases these unaligned helpers are needed */
+#ifdef __ARM_NEON__
+
+static inline float float_load(u32 ptr)
+{
+	register float v asm("s0");
+
+	asm ("vld1.32  {d0[0]}, [%1]"
+		: "=t"(v) : "r"(ptr));
+
+	return v;
+}
+
+static inline void float_store(float v, u32 ptr)
+{
+	register float v1 asm("s0") = v;
+
+	asm ("vst1.32  {d0[0]}, [%1]"
+		: : "t"(v1), "r"(ptr) : "memory");
+}
+
+#else
+
+static inline float float_load(u32 ptr)
+{
+	return *(const float *)ptr;
+}
+
+static inline void float_store(float v, u32 ptr)
+{
+	*(float *)ptr = v;
+}
+
+#endif
+
 // vim:ts=2:sw=2:expandtab

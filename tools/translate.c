@@ -289,6 +289,7 @@ enum sct_func_attr {
   SCTFA_RM_REGS    = (1 << 2), // don't emit regs (mask)
   SCTFA_NOWARN     = (1 << 3), // don't try to detect problems
   SCTFA_ARGFRAME   = (1 << 4), // copy all args to a struct, in order
+  SCTFA_UA_FLOAT   = (1 << 5), // emit float i/o helpers for alignemnt
 };
 
 enum x87_const {
@@ -1949,7 +1950,7 @@ static int stack_frame_access(struct parsed_op *po,
   const char *prefix = "";
   const char *bp_arg = NULL;
   char ofs_reg[16] = { 0, };
-  char argname[8];
+  char argname[8], buf2[32];
   int i, arg_i, arg_s;
   int unaligned = 0;
   int stack_ra = 0;
@@ -1971,15 +1972,20 @@ static int stack_frame_access(struct parsed_op *po,
     arg_i = (offset - stack_ra - 4) / 4;
     if (arg_i < 0 || arg_i >= g_func_pp->argc_stack)
     {
-      if (g_func_pp->is_vararg && arg_i == g_func_pp->argc_stack) {
-        if (is_lea) {
+      if (g_func_pp->is_vararg && arg_i >= g_func_pp->argc_stack) {
+        // vararg access - messy and non-portable,
+        // but works with gcc on both x86 and ARM
+        if (arg_i == g_func_pp->argc_stack)
           // should be va_list
-          if (cast[0] == 0)
-            cast = "(u32)";
-          snprintf(buf, buf_size, "%sap", cast);
-        }
+          snprintf(buf2, sizeof(buf2), "*(u32 *)&ap");
         else
-          snprintf(buf, buf_size, "%sva_arg(ap, u32)", cast);
+          snprintf(buf2, sizeof(buf2), "(*(u32 *)&ap + %u)",
+            (arg_i - g_func_pp->argc_stack) * 4);
+
+        if (is_lea)
+          snprintf(buf, buf_size, "%s%s", cast, buf2);
+        else
+          snprintf(buf, buf_size, "%s*(u32 *)%s", cast, buf2);
         return -1;
       }
       ferr(po, "offset 0x%x (%s,%d) doesn't map to any arg\n",
@@ -2405,6 +2411,20 @@ static char *out_src_opr_u32(char *buf, size_t buf_size,
   return out_src_opr(buf, buf_size, po, popr, NULL, 0);
 }
 
+// do we need a helper func to perform a float i/o?
+static int float_opr_needs_helper(struct parsed_op *po,
+  struct parsed_opr *popr)
+{
+  if (!(g_sct_func_attr & SCTFA_UA_FLOAT))
+    return 0;
+  if (popr->type != OPT_REGMEM)
+    return 0;
+  if (is_stack_access(po, popr))
+    return 0;
+
+  return 1;
+}
+
 static char *out_opr_float(char *buf, size_t buf_size,
   struct parsed_op *po, struct parsed_opr *popr, int is_src,
   int need_float_stack)
@@ -2458,7 +2478,10 @@ static char *out_opr_float(char *buf, size_t buf_size,
       break;
     }
     out_src_opr(tmp, sizeof(tmp), po, popr, "", 1);
-    snprintf(buf, buf_size, "*(%s *)(%s)", cast, tmp);
+    if (is_src && float_opr_needs_helper(po, popr))
+      snprintf(buf, buf_size, "%s_load(%s)", cast, tmp);
+    else
+      snprintf(buf, buf_size, "*(%s *)(%s)", cast, tmp);
     break;
 
   case OPT_CONST:
@@ -5307,6 +5330,36 @@ static void check_fptr_args(int i, int opcnt, struct parsed_proto *pp)
   }
 }
 
+static void pp_insert_reg_arg(struct parsed_proto *pp, const char *reg)
+{
+  int i;
+
+  for (i = 0; i < pp->argc; i++)
+    if (pp->arg[i].reg == NULL)
+      break;
+
+  if (pp->argc_stack)
+    memmove(&pp->arg[i + 1], &pp->arg[i],
+      sizeof(pp->arg[0]) * pp->argc_stack);
+  memset(&pp->arg[i], 0, sizeof(pp->arg[i]));
+  pp->arg[i].reg = strdup(reg);
+  pp->arg[i].type.name = strdup("int");
+  pp->argc++;
+  pp->argc_reg++;
+}
+
+static void pp_insert_stack_args(struct parsed_proto *pp, int count)
+{
+  int a;
+
+  pp->argc += count;
+  pp->argc_stack += count;
+
+  for (a = 0; a < pp->argc; a++)
+    if (pp->arg[a].type.name == NULL)
+      pp->arg[a].type.name = strdup("int");
+}
+
 static void pp_add_push_ref(struct parsed_proto *pp,
   int arg, struct parsed_op *po)
 {
@@ -5790,20 +5843,15 @@ static int collect_call_args_r(struct parsed_op *po, int i,
 static int collect_call_args(struct parsed_op *po, int i, int opcnt,
   struct parsed_proto *pp, int *regmask, int magic)
 {
-  int a, ret;
+  int ret;
 
   ret = collect_call_args_r(po, i, pp, regmask, 0, 1, magic,
           0, 0, 0);
   if (ret < 0)
     return ret;
 
-  if (pp->is_unresolved) {
-    pp->argc += ret;
-    pp->argc_stack += ret;
-    for (a = 0; a < pp->argc; a++)
-      if (pp->arg[a].type.name == NULL)
-        pp->arg[a].type.name = strdup("int");
-  }
+  if (pp->is_unresolved)
+    pp_insert_stack_args(pp, ret);
 
   // note: p_argnum, p_arggrp will be propagated in a later pass,
   // look for sync_argnum() (p_arggrp is for cases when mixed pushes
@@ -6015,24 +6063,6 @@ static void reg_use_pass(int i, int opcnt, unsigned char *cbits,
         return;
     }
   }
-}
-
-static void pp_insert_reg_arg(struct parsed_proto *pp, const char *reg)
-{
-  int i;
-
-  for (i = 0; i < pp->argc; i++)
-    if (pp->arg[i].reg == NULL)
-      break;
-
-  if (pp->argc_stack)
-    memmove(&pp->arg[i + 1], &pp->arg[i],
-      sizeof(pp->arg[0]) * pp->argc_stack);
-  memset(&pp->arg[i], 0, sizeof(pp->arg[i]));
-  pp->arg[i].reg = strdup(reg);
-  pp->arg[i].type.name = strdup("int");
-  pp->argc++;
-  pp->argc_reg++;
 }
 
 static void output_std_flag_z(FILE *fout, struct parsed_op *po,
@@ -6454,19 +6484,24 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
 
       if (pp->is_unresolved) {
         int regmask_stack = 0;
-        collect_call_args(po, i, opcnt, pp, &regmask, i + opcnt * 2);
 
-        // this is pretty rough guess:
-        // see ecx and edx were pushed (and not their saved versions)
-        for (arg = 0; arg < pp->argc; arg++) {
-          if (pp->arg[arg].reg != NULL && !pp->arg[arg].is_saved)
-            continue;
+        if ((po->flags & OPF_TAIL) && g_func_pp->is_stdcall)
+          pp_insert_stack_args(pp, g_func_pp->argc_stack);
+        else {
+          collect_call_args(po, i, opcnt, pp, &regmask, i + opcnt * 2);
 
-          if (pp->arg[arg].push_ref_cnt == 0)
-            ferr(po, "parsed_op missing for arg%d\n", arg);
-          tmp_op = pp->arg[arg].push_refs[0];
-          if (tmp_op->operand[0].type == OPT_REG)
-            regmask_stack |= 1 << tmp_op->operand[0].reg;
+          // this is pretty rough guess:
+          // see ecx and edx were pushed (and not their saved versions)
+          for (arg = 0; arg < pp->argc; arg++) {
+            if (pp->arg[arg].reg != NULL && !pp->arg[arg].is_saved)
+              continue;
+
+            if (pp->arg[arg].push_ref_cnt == 0)
+              ferr(po, "parsed_op missing for arg%d\n", arg);
+            tmp_op = pp->arg[arg].push_refs[0];
+            if (tmp_op->operand[0].type == OPT_REG)
+              regmask_stack |= 1 << tmp_op->operand[0].reg;
+          }
         }
 
         // quick dumb check for potential reg-args
@@ -8155,19 +8190,27 @@ static void gen_func(FILE *fout, FILE *fhdr, const char *funcn, int opcnt)
         break;
 
       case OP_FST:
+        dead_dst = 0;
         if (po->flags & OPF_FARG) {
           // store to stack as func arg
-          snprintf(buf1, sizeof(buf1), "fs_%d", po->p_argnum);
-          dead_dst = 0;
+          fprintf(fout, "  fs_%d = %s;", po->p_argnum, float_st0);
+        }
+        else if (po->operand[0].type == OPT_REG
+                 && po->operand[0].reg == xST0)
+        {
+          dead_dst = 1;
+        }
+        else if (float_opr_needs_helper(po, &po->operand[0])) {
+          out_src_opr(buf1, sizeof(buf1), po, &po->operand[0], "", 1);
+          fprintf(fout, "  %s_store(%s, %s);",
+            po->operand[0].lmod == OPLM_QWORD ? "double" : "float",
+            float_st0, buf1);
         }
         else {
           out_dst_opr_float(buf1, sizeof(buf1), po, &po->operand[0],
             need_float_stack);
-          dead_dst = po->operand[0].type == OPT_REG
-            && po->operand[0].reg == xST0;
-        }
-        if (!dead_dst)
           fprintf(fout, "  %s = %s;", buf1, float_st0);
+        }
         if (po->flags & OPF_FSHIFT) {
           if (need_float_stack)
             fprintf(fout, "  f_stp++;");
@@ -9843,6 +9886,7 @@ int main(int argc, char *argv[])
           "rm_regmask",
           "nowarn",
           "argframe",
+          "align_float",
         };
 
         // parse manual attribute-list comment
