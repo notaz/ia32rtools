@@ -381,8 +381,11 @@ int main(int argc, char *argv[])
   FILE *fout, *fasm, *fhdr = NULL, *frlist;
   const struct parsed_proto *pp;
   int no_decorations = 0;
-  int in_export_table = 0;
-  int rm_labels_lines = 0;
+  int header_mode = 0;
+  int maybe_func_table;
+  int in_export_table;
+  int rm_labels_lines;
+  int is_zero_val;
   char comment_char = '#';
   char words[20][256];
   char word[256];
@@ -399,7 +402,6 @@ int main(int argc, char *argv[])
   char **rlist;
   int rlist_cnt = 0;
   int rlist_alloc;
-  int header_mode = 0;
   int is_ro = 0;
   int is_label;
   int is_bss;
@@ -489,9 +491,13 @@ int main(int argc, char *argv[])
   qsort(unwanted_syms, ARRAY_SIZE(unwanted_syms),
     sizeof(unwanted_syms[0]), cmpstringp);
 
-  last_sym[0] = 0;
-
   while (1) {
+    last_sym[0] = 0;
+    g_func_sym_pp = NULL;
+    maybe_func_table = 0;
+    in_export_table = 0;
+    rm_labels_lines = 0;
+
     next_section(fasm, line);
     if (feof(fasm))
       break;
@@ -516,6 +522,7 @@ int main(int argc, char *argv[])
 
     while (my_fgets(line, sizeof(line), fasm))
     {
+      is_zero_val = 0;
       sym = NULL;
       asmln++;
 
@@ -550,8 +557,10 @@ int main(int argc, char *argv[])
 
       if (*p == ';') {
         p = sskip(p + 1);
-        if (IS_START(p, "sctclrtype"))
+        if (IS_START(p, "sctclrtype")) {
+          maybe_func_table = 0;
           g_func_sym_pp = NULL;
+        }
       }
 
       if (wordc == 2 && IS(words[1], "ends"))
@@ -626,8 +635,12 @@ int main(int argc, char *argv[])
         }
 
         snprintf(last_sym, sizeof(last_sym), "%s", sym);
-        if (IS_START(sym, "__IMPORT_DESCRIPTOR_"))
+        maybe_func_table = type == DXT_DWORD;
+
+        if (IS_START(sym, "__IMPORT_DESCRIPTOR_")) {
           rm_labels_lines = 5;
+          maybe_func_table = 0;
+        }
 
         pp = proto_parse(fhdr, sym, 1);
         if (pp != NULL) {
@@ -801,7 +814,9 @@ int main(int argc, char *argv[])
             snprintf(g_comment, sizeof(g_comment), "%s", p);
           }
           else {
-            pp = check_var(fhdr, sym, p, in_export_table);
+            const char *f_sym = maybe_func_table ? last_sym : NULL;
+
+            pp = check_var(fhdr, f_sym, p, in_export_table);
             if (pp == NULL) {
               fprintf(fout, "%s%s",
                 (no_decorations || p[0] == '_') ? "" : "_", p);
@@ -820,12 +835,17 @@ int main(int argc, char *argv[])
             fprintf(fout, "%d", (int)val64);
           else
             fprintf(fout, "0x%" PRIx64, val64);
+
+          is_zero_val = val64 == 0;
         }
 
         first = 0;
       }
 
 fin:
+      if (!is_zero_val)
+        maybe_func_table = 0;
+
       if (rm_labels_lines > 0)
         rm_labels_lines--;
 

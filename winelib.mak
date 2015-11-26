@@ -7,6 +7,8 @@ ifndef DEBUG
 CFLAGS += -O2
 endif
 LDFLAGS += -g
+# uncomment to use wine's msvcrt as the C library instead of glibc
+# LDFLAGS += -mno-cygwin
 
 ifdef ARM
 CFLAGS += -mcpu=cortex-a8 -mtune=cortex-a8 -mfloat-abi=softfp -mfpu=neon

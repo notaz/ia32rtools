@@ -253,6 +253,7 @@ static const char *known_ptr_types[] = {
 
 static const char *ignored_keywords[] = {
 	"extern",
+	"static",
 	"WINBASEAPI",
 	"WINUSERAPI",
 	"WINGDIAPI",
